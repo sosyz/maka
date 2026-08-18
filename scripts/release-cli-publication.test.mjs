@@ -16,7 +16,9 @@ import {
 } from './release-cli-publication.mjs';
 
 const SOURCE_SHA = 'a'.repeat(40);
+const WORKFLOW_SHA = 'b'.repeat(40);
 const WORKFLOW_PATH = '.github/workflows/release-cli-stage.yml';
+const PRODUCT_TAG = 'v0.1.0-beta.1';
 
 test('release versions map prereleases and stable versions to distinct channels', () => {
   assert.deepEqual(parseCliReleaseVersion('0.1.0-beta.1'), {
@@ -77,7 +79,9 @@ test('stage records bind the checked candidate to one source workflow run', () =
     repoRoot: fixture.root,
     releaseDirectory: fixture.releaseDirectory,
     expectedVersion: fixture.version,
+    productTag: PRODUCT_TAG,
     sourceSha: SOURCE_SHA,
+    workflowSha: WORKFLOW_SHA,
     runId: '321',
     runAttempt: '1',
     repository: 'maka-agent/maka-agent',
@@ -85,7 +89,9 @@ test('stage records bind the checked candidate to one source workflow run', () =
   });
 
   assert.equal(prepared.record.sha256, fixture.sha256);
+  assert.equal(prepared.record.productTag, PRODUCT_TAG);
   assert.equal(prepared.record.source.commit, SOURCE_SHA);
+  assert.equal(prepared.record.source.workflowCommit, WORKFLOW_SHA);
   assert.equal(prepared.record.source.runId, '321');
   assert.equal(prepared.record.source.runAttempt, '1');
   assert.deepEqual(
@@ -102,7 +108,9 @@ test('stage preparation rejects confirmation and checksum drift', () => {
         repoRoot: fixture.root,
         releaseDirectory: fixture.releaseDirectory,
         expectedVersion: '0.1.0-beta.2',
+        productTag: PRODUCT_TAG,
         sourceSha: SOURCE_SHA,
+        workflowSha: WORKFLOW_SHA,
         runId: '321',
         runAttempt: '1',
         repository: 'maka-agent/maka-agent',
@@ -118,7 +126,9 @@ test('stage preparation rejects confirmation and checksum drift', () => {
         repoRoot: fixture.root,
         releaseDirectory: fixture.releaseDirectory,
         expectedVersion: fixture.version,
+        productTag: PRODUCT_TAG,
         sourceSha: SOURCE_SHA,
+        workflowSha: WORKFLOW_SHA,
         runId: '321',
         runAttempt: '1',
         repository: 'maka-agent/maka-agent',
@@ -136,7 +146,7 @@ test('finalization accepts only the exact successful main stage run', () => {
     path: WORKFLOW_PATH,
     event: 'workflow_dispatch',
     head_branch: 'main',
-    head_sha: SOURCE_SHA,
+    head_sha: WORKFLOW_SHA,
     conclusion: 'success',
     head_repository: { full_name: 'maka-agent/maka-agent' },
   };
@@ -155,7 +165,7 @@ test('finalization accepts only the exact successful main stage run', () => {
     { event: 'pull_request' },
     { head_branch: 'feature' },
     { conclusion: 'failure' },
-    { head_sha: 'b'.repeat(40) },
+    { head_sha: 'c'.repeat(40) },
     { run_attempt: 2 },
   ]) {
     assert.throws(
@@ -297,7 +307,9 @@ test('prepare-stage CLI emits only consumed GitHub Actions outputs', () => {
       'prepare-stage',
       fixture.releaseDirectory,
       fixture.version,
+      `v${fixture.version}`,
       SOURCE_SHA,
+      WORKFLOW_SHA,
       '321',
       '1',
       'maka-agent/maka-agent',
@@ -315,10 +327,9 @@ test('prepare-stage CLI emits only consumed GitHub Actions outputs', () => {
   ]);
 });
 
-test('validate-stage-run CLI emits the canonical cross-job release identity', () => {
+test('validate-stage-run CLI accepts the canonical staged release identity', () => {
   const fixture = createPreparedCandidate();
   const runPath = join(fixture.root, 'stage-run.json');
-  const output = join(fixture.root, 'github-output.txt');
   writeFileSync(
     runPath,
     JSON.stringify({
@@ -327,7 +338,7 @@ test('validate-stage-run CLI emits the canonical cross-job release identity', ()
       path: WORKFLOW_PATH,
       event: 'workflow_dispatch',
       head_branch: 'main',
-      head_sha: SOURCE_SHA,
+      head_sha: WORKFLOW_SHA,
       conclusion: 'success',
       head_repository: { full_name: 'maka-agent/maka-agent' },
     }),
@@ -341,18 +352,11 @@ test('validate-stage-run CLI emits the canonical cross-job release identity', ()
       fixture.releaseDirectory,
       runPath,
       fixture.version,
-      output,
     ],
     { encoding: 'utf8' },
   );
 
   assert.equal(result.status, 0, result.stderr);
-  assert.deepEqual(readFileSync(output, 'utf8').trim().split('\n'), [
-    `version=${fixture.version}`,
-    'dist_tag=next',
-    `source_sha=${SOURCE_SHA}`,
-    `tarball=${fixture.tarball}`,
-  ]);
 });
 
 function createPreparedCandidate() {
@@ -361,7 +365,9 @@ function createPreparedCandidate() {
     repoRoot: fixture.root,
     releaseDirectory: fixture.releaseDirectory,
     expectedVersion: fixture.version,
+    productTag: `v${fixture.version}`,
     sourceSha: SOURCE_SHA,
+    workflowSha: WORKFLOW_SHA,
     runId: '321',
     runAttempt: '1',
     repository: 'maka-agent/maka-agent',
