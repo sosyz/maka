@@ -1075,7 +1075,7 @@ const makaBridge = {
     start(input: DesktopRuntimeHostOnboardingInput): Promise<DesktopRuntimeHostOnboardingSnapshot> {
       return ipcRenderer.invoke('runtime-host-onboarding:start', input);
     },
-    cancel(): Promise<void> {
+    cancel(): Promise<boolean> {
       return ipcRenderer.invoke('runtime-host-onboarding:cancel');
     },
     reset(): Promise<void> {
