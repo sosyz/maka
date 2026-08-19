@@ -3656,7 +3656,7 @@ function AppShellContent({
         onRemoteHostAdded={(profileId) => {
           closeSettings();
           openNewTaskSurface();
-          void newTask.chooseProjectForProfile(profileId);
+          void newTask.chooseProjectForProfile(profileId).catch(() => undefined);
         }}
       />
     </div>
