@@ -282,6 +282,50 @@ test('invalidates a verified result when onboarding rotates only the credential'
   });
 });
 
+test('onboarding prunes declarations its new selection no longer keys', async () => {
+  await withFixture(async ({ stores }) => {
+    // Onboarding installs a new `enabledModelIds` authority over an existing
+    // row. `relayModelProfiles` is scoped to that selection — the canonical
+    // decoder rejects a table keyed by a model the selection dropped — and
+    // this write path bypasses the decoder, so carrying the old table across
+    // wrote a document that could not be read back.
+    const connection = await createConnection(stores, 0, {
+      ...connectionDraft('openai-compatible', 'openai-compatible'),
+      baseUrl: 'https://relay.example.test/v1',
+      enabledModelIds: ['kept-model', 'dropped-model'],
+      relayModelProfiles: {
+        'kept-model': { contextWindow: 128_000 },
+        'dropped-model': { contextWindow: 262_144 },
+      },
+    });
+    await setConnectionCredential(stores, connection, 'old-secret');
+    const coordinator = onboardingCoordinator(stores, () => undefined, 'kept-model');
+
+    assert.deepEqual(
+      await coordinator.handlers['connection.onboarding.save'](
+        {
+          providerType: 'openai-compatible',
+          apiKey: 'new-secret',
+          enabledModelIds: ['kept-model'],
+        },
+        context,
+      ),
+      { ok: true, result: { kind: 'saved' } },
+    );
+
+    const updated = (await stores.connectionCatalog.getSnapshot()).connections.find(
+      ({ connectionId }) => connectionId === connection.connectionId,
+    );
+    assert.deepEqual(updated?.enabledModelIds, ['kept-model']);
+    assert.deepEqual(updated?.relayModelProfiles, { 'kept-model': { contextWindow: 128_000 } });
+    // The real failure was on the next read, not on the write.
+    assert.deepEqual(
+      (await stores.connectionCatalog.getSnapshot()).connections.map(({ slug }) => slug),
+      ['openai-compatible'],
+    );
+  });
+});
+
 test('rejects an oversized final catalog before publishing a recovery intent', async () => {
   await withFixture(async ({ root, stores }) => {
     const existing = {

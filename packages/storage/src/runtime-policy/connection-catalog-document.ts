@@ -438,17 +438,27 @@ export class ConnectionCatalogDocumentOwner {
         'Onboarding enabled models must come from the discovered inventory',
       );
     }
+    // Onboarding installs a new enabledModelIds authority, so a profile keyed
+    // by a model it dropped would violate the subset invariant. Like the
+    // refresh path above, this one bypasses the canonical decoder, so pruning
+    // has to happen here or the document is un-loadable on next read.
+    const relayModelProfiles = previous
+      ? pruneRelayModelProfiles(previous.relayModelProfiles, changes.enabledModelIds)
+      : undefined;
+    const base: ConnectionCatalogEntry = previous ?? {
+      connectionId,
+      revision: 0,
+      slug,
+      name: definition.label,
+      providerType,
+      enabled: false,
+      enabledModelIds: [],
+      models: [],
+    };
+    const { relayModelProfiles: _staleProfiles, ...baseWithoutProfiles } = base;
     const finalized: ConnectionCatalogEntry = {
-      ...(previous ?? {
-        connectionId,
-        revision: 0,
-        slug,
-        name: definition.label,
-        providerType,
-        enabled: false,
-        enabledModelIds: [],
-        models: [],
-      }),
+      ...baseWithoutProfiles,
+      ...(relayModelProfiles ? { relayModelProfiles } : {}),
       revision: previous ? nextRevision(previous.revision) : 1,
       enabled: true,
       enabledModelIds: changes.enabledModelIds,
