@@ -150,6 +150,34 @@ async function readInstalledProductVersion(executablePath, { run = runCommand } 
   return stdout;
 }
 
+export async function stopInstalledProcessTrees(
+  installDirectory,
+  processes,
+  { run = runCommand, waitForExit = waitForInstalledProcessesToExit } = {},
+) {
+  const killErrors = [];
+  for (const processInfo of processes) {
+    try {
+      await run('taskkill', ['/PID', String(processInfo.processId), '/T', '/F'], {
+        timeoutMs: 30_000,
+      });
+    } catch (error) {
+      // taskkill reports failure when a process in the requested tree exits
+      // during traversal. The postcondition below is the authority: cleanup
+      // succeeded if no process remains under the installed application.
+      killErrors.push(error);
+    }
+  }
+  try {
+    await waitForExit(installDirectory);
+  } catch (error) {
+    if (killErrors.length > 0 && error instanceof Error && error.cause === undefined) {
+      error.cause = new AggregateError(killErrors, 'taskkill failed to stop installed processes.');
+    }
+    throw error;
+  }
+}
+
 /**
  * End-to-end Windows automatic-update verification.
  *
@@ -419,12 +447,7 @@ export async function verifyWindowsAutoupdate(
     // instance is observed (it exists, and the image on disk is the new
     // version) and then stopped before it can touch further state; the
     // environment it inherited still points at the isolated home.
-    for (const processInfo of relaunched) {
-      await run('taskkill', ['/PID', String(processInfo.processId), '/T', '/F'], {
-        timeoutMs: 30_000,
-      });
-    }
-    await waitForInstalledProcessesToExit(installDirectory);
+    await stopInstalledProcessTrees(installDirectory, relaunched, { run });
 
     step('running the full packaged smoke against the upgraded install');
     // The sandbox probe writes its manifest into workingDirectory before the
@@ -523,12 +546,7 @@ export async function verifyWindowsAutoupdate(
       let exited = false;
       try {
         const leftover = await listInstalledProcesses(installDirectory);
-        for (const processInfo of leftover) {
-          await run('taskkill', ['/PID', String(processInfo.processId), '/T', '/F'], {
-            timeoutMs: 30_000,
-          });
-        }
-        await waitForInstalledProcessesToExit(installDirectory);
+        await stopInstalledProcessTrees(installDirectory, leftover, { run });
         exited = true;
       } catch (error) {
         cleanupErrors.push(error);
