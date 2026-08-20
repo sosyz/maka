@@ -14,9 +14,21 @@
 // it is safe to repeat) redirecting to a file, then Read/Grep that file;
 // otherwise work from the kept window.
 //
-// Adapted from opencode's truncate.output() (packages/opencode/src/tool/
-// truncate.ts): same byte+line budget and head/tail windowing, minus the file
-// spill + retention machinery.
+// ATTRIBUTION: truncateToolOutput below is adapted from opencode's
+// truncate.output() (packages/opencode/src/tool/truncate.ts): same byte+line
+// budget and head/tail windowing, minus the file spill + retention machinery.
+// Maka adds byte-safe single-line slicing, trailing-newline handling, and the
+// recovery hint above.
+//
+//   Source:    https://github.com/anomalyco/opencode
+//   Revision:  fc80874f45a595ff6874a4d36b1090f6a64424d2
+//   License:   MIT
+//   Copyright: Copyright (c) 2025 opencode
+//
+// The notice covers that adapted material only; the rest of this file is Maka
+// source under the repository Apache-2.0 license, so this file carries no
+// whole-file SPDX identifier. The MIT permission notice for the adapted
+// material travels in the repository LICENSE under THIRD-PARTY COMPONENTS.
 
 export interface TruncateToolOutputOptions {
   /** Max retained lines before truncation kicks in. Default 2000. */
