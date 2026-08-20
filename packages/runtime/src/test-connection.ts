@@ -1,5 +1,6 @@
 import {
   PROVIDER_DEFAULTS,
+  classifyConnectionModelInventory,
   connectionEnabledModelIds,
   type ConnectionTestErrorClass,
   type ConnectionTestResult,
@@ -37,6 +38,11 @@ export interface ConnectionTestOptions extends ConnectionEffectFetchOptions {
  * Prefer an explicit model, then a still-live configured model. Legacy
  * connections without a discovered inventory keep the historical
  * default/fallback order.
+ *
+ * Only a `'live'` catalog filters the candidates. A snapshot listing the
+ * models this build shipped would otherwise silently redirect the test onto
+ * one of them, so a user testing an Ark plan connection would get a verdict
+ * about a model they never chose (#1584).
  */
 function resolveConnectionTestModel(
   connection: ConnectionEffectConnection,
@@ -46,12 +52,10 @@ function resolveConnectionTestModel(
   const explicitModel = model?.trim();
   if (explicitModel) return explicitModel;
 
-  const hasAuthoritativeInventory =
-    connection.modelSource === 'fetched' && Array.isArray(connection.models);
   const discoveredIds =
     connection.models?.map(({ id }) => id.trim()).filter((id) => id.length > 0) ?? [];
-  const discovered =
-    hasAuthoritativeInventory || discoveredIds.length > 0 ? new Set(discoveredIds) : undefined;
+  const allowlist =
+    classifyConnectionModelInventory(connection) === 'live' ? new Set(discoveredIds) : undefined;
   const candidates = [
     ...connectionEnabledModelIds(connection),
     ...fallbackModels,
@@ -59,7 +63,7 @@ function resolveConnectionTestModel(
   ];
   for (const candidate of candidates) {
     const id = candidate.trim();
-    if (!id || (discovered && !discovered.has(id))) continue;
+    if (!id || (allowlist && !allowlist.has(id))) continue;
     return id;
   }
   return undefined;

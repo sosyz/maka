@@ -175,6 +175,86 @@ export function connectionEnabledModelIds(connection: {
 }
 
 /**
+ * What `connection.models` IS, which is not the same question as where it was
+ * written from.
+ *
+ * `modelSource` records provenance: `'fallback'` for the array a connection was
+ * seeded with, `'fetched'` once a discovery run replaced it. For a provider
+ * whose `modelDiscovery.kind` is `'fallback'` that run replays the array this
+ * build shipped, so `'fetched'` is accurate and still describes a snapshot. The
+ * predicate for "a provider enumerated this account" is therefore a
+ * conjunction, and this is the only place it lives:
+ *
+ *   - `live` — a provider with a model-list endpoint enumerated this account.
+ *     Evidence, and an allowlist. An empty one is still evidence: it says the
+ *     credential reaches nothing, which is a fact about the account.
+ *   - `snapshot` — the array this build shipped, either as the seed a
+ *     connection was created with or replayed by a `kind: 'fallback'`
+ *     provider's discovery run. It describes the provider at release, not the
+ *     account, so it cannot rule on what a plan serves (#1584).
+ *   - `absent` — no catalog at all, and none asked for. A connection can be
+ *     created and used before its first discovery run (#2896).
+ *
+ * The split is by authority, not by how full the array is: "the provider
+ * listed nothing" and "nobody has asked yet" are opposite facts, and an empty
+ * array alone cannot tell them apart. `modelSource` can — the codec keeps it
+ * present exactly when a run has written this row.
+ */
+export type ConnectionModelInventory = 'absent' | 'live' | 'snapshot';
+
+/** The `LlmConnection` fields that decide what a connection may run. */
+export interface ConnectionModelAuthorityInput {
+  readonly providerType: ProviderType;
+  readonly enabledModelIds?: readonly string[];
+  readonly defaultModel?: string;
+  readonly models?: readonly ModelInfo[];
+  readonly modelSource?: ModelDiscoverySource;
+}
+
+export function classifyConnectionModelInventory(
+  connection: ConnectionModelAuthorityInput,
+): ConnectionModelInventory {
+  if (connection.models === undefined || connection.modelSource === undefined) return 'absent';
+  if (!providerSupportsModelDiscovery(connection.providerType)) return 'snapshot';
+  return connection.modelSource === 'fetched' ? 'live' : 'snapshot';
+}
+
+/**
+ * Whether this connection may run this model, and on what evidence.
+ *
+ * The authorization is `enabledModelIds` — the user writes it, and only through
+ * connection settings. A catalog overrules it in exactly one state: `live`,
+ * where a provider enumerated the account and absence is a fact about it.
+ *
+ * `inventory` rides along because callers legitimately differ on what an
+ * `'absent'` catalog means: sending a message needs something to send
+ * against, while resolving an id for execution does not (#2896). Each caller
+ * states its own policy on that; none of them restate the rest.
+ */
+export type ConnectionModelAuthorization =
+  | { authorized: true; inventory: ConnectionModelInventory; model: ModelInfo }
+  | { authorized: false; reason: 'model_not_enabled' | 'not_in_live_list' };
+
+export function authorizeConnectionModel(
+  connection: ConnectionModelAuthorityInput,
+  modelId: string,
+): ConnectionModelAuthorization {
+  const model = modelId.trim();
+  if (!model || !connectionEnabledModelIds(connection).includes(model)) {
+    return { authorized: false, reason: 'model_not_enabled' };
+  }
+  const inventory = classifyConnectionModelInventory(connection);
+  // The observed row wins wherever it exists: it carries wire metadata such as
+  // `apiProtocol`, and capabilities, which a synthesized entry cannot.
+  const observed = connection.models?.find((entry) => entry.id.trim() === model);
+  if (observed) return { authorized: true, inventory, model: observed };
+  if (inventory === 'live') return { authorized: false, reason: 'not_in_live_list' };
+  // Absent capabilities already mean "unknown", not "unsupported" — the honest
+  // answer for a model no source has described.
+  return { authorized: true, inventory, model: { id: model } };
+}
+
+/**
  * THE rule for a connection's model selection:
  * **`defaultModel` is either absent, or a member of `enabledModelIds`.**
  *

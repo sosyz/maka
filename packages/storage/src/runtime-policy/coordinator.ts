@@ -34,6 +34,7 @@ import {
 } from '@maka/core/runtime-policy';
 import { deriveProviderAuthContract, type ProviderAuthAction } from '@maka/core/provider-auth';
 import {
+  classifyConnectionModelInventory,
   deriveConnectionSlug,
   effectiveBaseUrl,
   PROVIDER_DEFAULTS,
@@ -1390,10 +1391,15 @@ function isCanonicalConnectionTestModel(
   modelId: string,
 ): boolean {
   const basis = connectionTestModelBasis(connection);
-  const inCanonicalModels = basis.models.some((model) => model.id === modelId);
-  return basis.modelSource === 'fetched'
-    ? inCanonicalModels
-    : inCanonicalModels || basis.enabledModelIds.includes(modelId);
+  // Wider than execution admission on purpose: testing a discovered model
+  // before enabling it is the point of the button.
+  if (basis.models.some((model) => model.id === modelId)) return true;
+  // A snapshot describes the provider at release, not what this account is
+  // entitled to, so it cannot veto the model the user chose (#1584).
+  return (
+    classifyConnectionModelInventory(connection) !== 'live' &&
+    basis.enabledModelIds.includes(modelId)
+  );
 }
 
 function canonicalEffectiveEndpoint(connection: ConnectionCatalogEntry): string {

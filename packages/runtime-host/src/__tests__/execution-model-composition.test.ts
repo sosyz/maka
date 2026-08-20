@@ -200,7 +200,9 @@ test('backend creation does not bypass a non-empty DeepSeek inventory', async ()
             slug: 'backend-creation-connection',
             providerType: 'deepseek',
             enabledModelIds: [modelId],
+            // A live list: DeepSeek has a model-list endpoint and this run reached it.
             models: [{ id: 'deepseek-chat' }],
+            modelSource: 'fetched' as const,
           },
           networkProxy: { enabled: false },
           secretMaterial: { connection: { secret: API_KEY } },
@@ -212,29 +214,35 @@ test('backend creation does not bypass a non-empty DeepSeek inventory', async ()
   );
 });
 
-test('backend creation does not treat aliased provider metadata as inventory', async () => {
+test('backend creation admits an enabled model a snapshot never listed', async () => {
+  // `opencode-free` has no model-list endpoint, so its discovery run replays
+  // the array this build shipped and records `modelSource: 'fallback'`. The
+  // user enabled this id; a release snapshot cannot rule on what an account
+  // serves (#1584). Until now the only id that could get through an absent
+  // inventory was a hardcoded `deepseek` / `deepseek-v4-flash` pair (#2896) —
+  // the same situation, conceded for one provider.
   const modelId = 'claude-opus-5';
-  await assert.rejects(
-    createHostAiSdkBackend(
-      backendCreationFixture({
-        abortSignal: new AbortController().signal,
-        modelId,
-        resolveExecutionConnection: async () => ({
-          kind: 'ready',
-          connection: {
-            slug: 'backend-creation-connection',
-            providerType: 'opencode-free',
-            enabledModelIds: [modelId],
-            models: [],
-          },
-          networkProxy: { enabled: false },
-          secretMaterial: {},
-        }),
-        readPricing: async () => ({ revision: 0, overrides: [] }),
+  const backend = await createHostAiSdkBackend(
+    backendCreationFixture({
+      abortSignal: new AbortController().signal,
+      modelId,
+      resolveExecutionConnection: async () => ({
+        kind: 'ready',
+        connection: {
+          slug: 'backend-creation-connection',
+          providerType: 'opencode-free',
+          enabledModelIds: [modelId],
+          models: [{ id: 'grok-code' }],
+          modelSource: 'fetched' as const,
+        },
+        networkProxy: { enabled: false },
+        secretMaterial: {},
       }),
-    ),
-    /Session model is not enabled/,
+      readPricing: async () => ({ revision: 0, overrides: [] }),
+    }),
   );
+
+  await backend.dispose();
 });
 
 test('provider dispatch fails closed when the Run Composition commit fails', async () => {

@@ -770,7 +770,7 @@ const providerRegistry = {
     modelDiscovery: {
       kind: 'fallback',
       reason:
-        'Agent Plan inference data plane does not expose a model-list endpoint for its dedicated API key',
+        'Agent Plan model discovery is a control-plane API that requires AK/SK signing; the plan API key reaches only the inference data plane',
     },
     category: 'domestic',
     catalogGroup: 'plans',

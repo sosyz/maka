@@ -1,4 +1,8 @@
-import { effectiveBaseUrl } from '@maka/core/llm-connections';
+import {
+  authorizeConnectionModel,
+  classifyConnectionModelInventory,
+  effectiveBaseUrl,
+} from '@maka/core/llm-connections';
 import { readRuntimeHostConnectionCatalog } from './catalog-reader.js';
 import type { RuntimeHostConnection } from './connection.js';
 import { abortable } from './wait-for-ready.js';
@@ -44,7 +48,14 @@ export async function configureHostedExecutionTarget(
     changed = true;
   }
 
-  if (endpointChanged || !target.models.some((model) => model.id === input.model)) {
+  // Refreshing only helps when a provider can actually enumerate the account.
+  // For one that replays this build's snapshot, discovery returns the same
+  // array it just failed to find the model in.
+  const snapshotOnly = classifyConnectionModelInventory(target) === 'snapshot';
+  if (
+    endpointChanged ||
+    (!snapshotOnly && !target.models.some((model) => model.id === input.model))
+  ) {
     const fetched = await abortable(
       () =>
         connection.request('connection.models.fetch', {
@@ -62,11 +73,12 @@ export async function configureHostedExecutionTarget(
   const configured = after.connections.find(
     (candidate) => candidate.connectionId === target.connectionId,
   );
+  // The authority already covers both halves: the model must be enabled, and
+  // a live list — not a snapshot — is what may veto it (#1584).
   if (
     !configured?.enabled ||
     canonicalBaseUrl(effectiveBaseUrl(configured)) !== baseUrl ||
-    !configured.enabledModelIds.includes(input.model) ||
-    !configured.models.some((model) => model.id === input.model)
+    !authorizeConnectionModel(configured, input.model).authorized
   ) {
     throw new Error('Runtime Host did not admit the requested model target');
   }

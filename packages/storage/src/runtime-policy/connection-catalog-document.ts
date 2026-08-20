@@ -405,10 +405,14 @@ export class ConnectionCatalogDocumentOwner {
       );
     }
     const result = decodeConnectionInput(() => normalizeConnectionModelDiscoveryResult(rawResult));
-    if (result.source !== 'fetched' || result.models.length === 0) {
+    // Non-empty is the requirement; `source` is write provenance, not a
+    // quality bar. A provider without a model-list endpoint runs discovery by
+    // replaying the array this build shipped, and that inventory onboards a
+    // connection exactly as well (#1584).
+    if (result.models.length === 0) {
       throw codecError(
         'invalid_connection_input',
-        'Onboarding requires a non-empty fetched model inventory',
+        'Onboarding requires a non-empty model inventory',
       );
     }
     const changes = decodeConnectionInput(() =>
@@ -431,7 +435,7 @@ export class ConnectionCatalogDocumentOwner {
     ) {
       throw codecError(
         'invalid_connection_input',
-        'Onboarding enabled models must come from the fetched inventory',
+        'Onboarding enabled models must come from the discovered inventory',
       );
     }
     const finalized: ConnectionCatalogEntry = {

@@ -75,16 +75,11 @@ test('stale provider inventory warns without blocking sends', () => {
   assert.deepEqual(verdict(input), { ok: true });
 });
 
-test('fallback missing choices agree with the connection readiness gate', () => {
-  const input = {
-    providerType: 'openai-compatible' as const,
-    defaultModel: 'custom-default',
-    models: [{ id: 'relay-static-model' }],
-    modelSource: 'fallback' as const,
-  };
-  assert.equal(buildModelCatalogEntries(input)[0]?.canUseAsChatDefault, false);
-  assert.deepEqual(verdict(input), { ok: false, reason: 'not_in_live_list' });
-  assert.deepEqual(
+test('the catalog and the readiness gate answer "is there a live list" alike', () => {
+  // One fact, one authority: `modelSource`. Whatever the catalog decides about
+  // a model absent from `models`, readiness must decide the same way, or the
+  // picker offers a model the send gate refuses (or hides one it would accept).
+  const readiness = (modelSource: 'fetched' | 'fallback') =>
     isConnectionReady({
       connection: {
         slug: 'relay',
@@ -92,15 +87,29 @@ test('fallback missing choices agree with the connection readiness gate', () => 
         providerType: 'openai-compatible',
         defaultModel: 'custom-default',
         enabled: true,
-        models: input.models,
-        modelSource: 'fallback',
+        models: [{ id: 'relay-static-model' }],
+        modelSource,
         createdAt: 1,
         updatedAt: 1,
       },
       hasSecret: true,
-    }),
-    { ready: false, reason: 'model_not_enabled' },
-  );
+    });
+  const catalog = (modelSource: 'fetched' | 'fallback') => ({
+    providerType: 'openai-compatible' as const,
+    defaultModel: 'custom-default',
+    models: [{ id: 'relay-static-model' }],
+    modelSource,
+  });
+
+  // A live list is evidence, and both gates honour it.
+  assert.equal(buildModelCatalogEntries(catalog('fetched'))[0]?.canUseAsChatDefault, false);
+  assert.deepEqual(verdict(catalog('fetched')), { ok: false, reason: 'not_in_live_list' });
+  assert.deepEqual(readiness('fetched'), { ready: false, reason: 'model_not_enabled' });
+
+  // The array this build shipped is not, and both gates step aside (#1584).
+  assert.equal(buildModelCatalogEntries(catalog('fallback'))[0]?.canUseAsChatDefault, true);
+  assert.deepEqual(verdict(catalog('fallback')), { ok: true });
+  assert.deepEqual(readiness('fallback'), { ready: true, model: 'custom-default' });
 });
 
 test('connection catalogs preserve user-choice provenance without inventing availability', () => {
@@ -130,6 +139,31 @@ test('connection catalogs preserve user-choice provenance without inventing avai
   );
   assert.deepEqual(entries[0]?.provenance.sources?.userChoice, ['connection_default']);
   assert.deepEqual(entries[2]?.provenance.sources?.userChoice, ['session_model']);
+});
+
+test('every picker sees a model the user enabled but no catalog describes', () => {
+  // The projection lives in the builder, not in one caller: chat, Daily Review
+  // and the settings selectors all read it. `deepseek-v4-pro-beta` is enabled
+  // but absent from the snapshot this build shipped, and the entry it gets is
+  // selectable — that is the whole of #1584 seen from the picker side.
+  const entries = buildConnectionModelCatalogEntries({
+    connection: {
+      slug: 'ark-plan',
+      providerType: 'volcengine-agent-plan',
+      defaultModel: 'doubao-seed-2.1-turbo',
+      enabledModelIds: ['doubao-seed-2.1-turbo', 'deepseek-v4-pro-beta'],
+      models: [{ id: 'doubao-seed-2.1-turbo' }],
+      // `'fetched'` is the honest record here: a provider with no model-list
+      // endpoint still runs discovery, it just replays the array this build
+      // shipped. Provenance is not content, so the flag alone cannot say
+      // whether a provider enumerated this account.
+      modelSource: 'fetched',
+    },
+  });
+  const declared = entries.find(({ id }) => id === 'deepseek-v4-pro-beta');
+  assert.equal(declared?.canUseAsChatDefault, true);
+  assert.equal(declared?.unavailableReason, 'none');
+  assert.deepEqual(declared?.provenance.sources?.userChoice, ['saved_model']);
 });
 
 test('unknown persisted provider ids return an empty catalog', () => {

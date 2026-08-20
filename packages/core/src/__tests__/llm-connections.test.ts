@@ -203,6 +203,34 @@ test('the alias table is selected by provider and names only renames', () => {
   }
 });
 
+test('the model picker lists an enabled model a snapshot provider never listed', () => {
+  // Catalog projection reads `connection.models`, which for a provider without
+  // a model-list endpoint is the array this build shipped — recorded as
+  // `modelSource: 'fetched'`, because a discovery run did happen; it just had
+  // nothing to ask. Projecting the enabled ids as user choices is what keeps a
+  // model the user picked — one their Ark plan serves but Maka's snapshot
+  // predates — from vanishing out of every picker (#1584).
+  const choices = buildChatModelChoices([
+    {
+      slug: 'ark-plan',
+      name: 'Ark Agent Plan',
+      providerType: 'volcengine-agent-plan',
+      enabled: true,
+      defaultModel: 'doubao-seed-2.1-turbo',
+      enabledModelIds: ['doubao-seed-2.1-turbo', 'deepseek-v4-pro-beta'],
+      models: [{ id: 'doubao-seed-2.1-turbo' }],
+      modelSource: 'fetched',
+      createdAt: 1,
+      updatedAt: 1,
+    },
+  ]);
+
+  assert.deepEqual(choices.map(({ model }) => model).sort(), [
+    'deepseek-v4-pro-beta',
+    'doubao-seed-2.1-turbo',
+  ]);
+});
+
 test('provider recognition does not resolve inherited object members', () => {
   // `PROVIDER_DEFAULTS` is an object literal, so plain indexing answers truthy
   // for `__proto__` / `toString` / `constructor` and they would read as
