@@ -55,12 +55,17 @@ describe('CLI release file policy', () => {
   test('release manifests omit exports whose targets are excluded from Maka artifacts', () => {
     const repoRoot = resolve(import.meta.dirname, '..');
     for (const [directory, omitted] of Object.entries({
+      core: ['./test-only/async-primitives'],
       mcp: ['./test-only/stdio-server'],
       'runtime-host': [
         './test-only/client-capability-host',
         './test-only/execution-candidate-e2e-main',
       ],
-      runtime: ['./test-only/fake-backend', './test-only/observation-text-reader'],
+      runtime: [
+        './test-only/fake-backend',
+        './test-only/observation-text-reader',
+        './test-only/invocation-fixture',
+      ],
     })) {
       const manifestPath = join(repoRoot, 'packages', directory, 'package.json');
       const source = JSON.parse(readFileSync(manifestPath, 'utf8'));
@@ -148,18 +153,28 @@ describe('CLI release file policy', () => {
     }
   });
 
-  test('release file declarations reject directories other than dist', () => {
+  test('release file declarations accept a declared directory and reject non-regular entries', () => {
     const workspace = mkdtempSync(join(tmpdir(), 'maka-release-files-'));
     try {
       mkdirSync(join(workspace, 'dist'));
       mkdirSync(join(workspace, 'runtime-assets'));
+      writeFileSync(join(workspace, 'runtime-assets', 'profile.yml'), 'a: 1');
+      // A declared directory is allowed (the whole tree ships) ...
+      assert.deepEqual(
+        resolveWorkspaceReleaseFiles(workspace, {
+          name: '@maka/example',
+          releaseFiles: ['dist', 'runtime-assets'],
+        }),
+        ['dist', 'runtime-assets'],
+      );
+      // ... but a missing entry is still rejected.
       assert.throws(
         () =>
           resolveWorkspaceReleaseFiles(workspace, {
             name: '@maka/example',
-            releaseFiles: ['dist', 'runtime-assets'],
+            releaseFiles: ['dist', 'absent'],
           }),
-        /must be a regular file/u,
+        /release file is missing/u,
       );
     } finally {
       rmSync(workspace, { recursive: true, force: true });

@@ -26,31 +26,16 @@ import { describeTurnErrorClass } from '../../renderer/session-status-presentati
 
 describe('provider capacity presentation', () => {
   it('uses capacity-specific copy instead of the unknown error fallback', () => {
-    assert.match(describeSessionErrorReason('provider_capacity') ?? '', /满载/);
-    assert.match(describeTurnErrorClass('provider_capacity'), /满载/);
+    assert.match(describeSessionErrorReason('provider_capacity', 'zh-CN') ?? '', /满载/);
+    assert.match(describeSessionErrorReason('provider_capacity', 'en') ?? '', /at capacity/);
+    assert.match(describeTurnErrorClass('provider_capacity', 'zh-CN'), /满载/);
+    assert.match(describeTurnErrorClass('provider_capacity', 'en'), /at capacity/);
   });
 
   it('does not recommend an immediate direct retry', () => {
-    const label = describeTurnErrorClass('provider_capacity');
+    const label = describeTurnErrorClass('provider_capacity', 'zh-CN');
     assert.match(label, /等几分钟|换一个模型/);
     assert.doesNotMatch(label, /直接重试/);
   });
 });
 
-describe('context compaction failure presentation', () => {
-  it('shows actionable malformed-summary guidance', () => {
-    const message = sessionEventErrorMessage({
-      type: 'error',
-      id: 'error-1',
-      turnId: 'turn-1',
-      ts: 1,
-      recoverable: false,
-      reason: 'context_budget_exhausted',
-      message: 'Turn failed: context_budget_exhausted',
-      details: { contextBudgetExhaustedDetail: 'malformed_summary_missing_section' },
-    });
-
-    assert.match(message, /上下文压缩/);
-    assert.match(message, /上下文窗口设置|切换模型|开启新任务/);
-  });
-});

@@ -231,6 +231,9 @@ export class RuntimeHostConnectionSession {
         ...(this.#options.connection.authority.credentialId
           ? { credentialId: this.#options.connection.authority.credentialId }
           : {}),
+        ...(this.#options.connection.authority.clientInstanceId
+          ? { credentialClientInstanceId: this.#options.connection.authority.clientInstanceId }
+          : {}),
         acquireResidency: () => admission.acquireResidency(),
       });
       admission.seal();
@@ -284,6 +287,11 @@ export class RuntimeHostConnectionSession {
 
   #ensureClientCapabilities(): ClientCapabilityConnection | undefined {
     if (this.#closed || this.#inputClosed) return;
+    // Guests observe and submit approval requests; they cannot provide Client
+    // Capabilities or directly admit a Turn. In particular, their pending and
+    // finalized connections may overlap while the credential becomes bound to
+    // the Client. Neither connection owns a capability-provider registration.
+    if (this.#options.connection.authority.principalKind === 'session_guest') return;
     const service = this.#options.resolveClientCapabilities?.();
     if (!service) return;
     if (this.#clientCapabilityService && this.#clientCapabilityService !== service) {
@@ -296,7 +304,16 @@ export class RuntimeHostConnectionSession {
           connectionId: this.#options.connection.connectionId,
           principalId: this.#options.connection.authority.principalId,
           clientInstanceId: this.#options.connection.clientInstanceId,
+          ...(this.#options.connection.authority.clientInstanceId
+            ? {
+                credentialBoundClientInstanceId:
+                  this.#options.connection.authority.clientInstanceId,
+              }
+            : {}),
           principalKind: this.#options.connection.authority.principalKind,
+          ...(this.#options.connection.authority.capabilityOwner
+            ? { capabilityOwner: this.#options.connection.authority.capabilityOwner }
+            : {}),
         },
         {
           send: (frame) => {
@@ -345,6 +362,10 @@ export class RuntimeHostConnectionSession {
         configuration: hasRuntimeHostOperationGrant(
           this.#options.connection.authority,
           'runtime.policy.query',
+        ),
+        connectionCatalog: hasRuntimeHostOperationGrant(
+          this.#options.connection.authority,
+          'connection.catalog.query',
         ),
         projectCatalog: hasRuntimeHostOperationGrant(
           this.#options.connection.authority,

@@ -23,13 +23,17 @@ import type { ActiveInteractionRequestEvent } from '@maka/core/events';
 import { redactSecrets } from '@maka/core/redaction';
 import type { CreateSessionRequestInput } from '@maka/core/runtime-inputs';
 import { isSideConversationSession } from '@maka/core/side-conversation';
-import type { SessionChangedEvent, SessionChangedReason } from '@maka/core/session';
+import type {
+  SessionChangedEvent,
+  SessionChangedReason,
+} from '@maka/core/session';
 import type { BotRegistry } from '@maka/runtime/bots';
 import {
   type RuntimeHostSshOperatorActivationInput,
   connectOrSpawnRuntimeHost,
   connectRuntimeHostProfile,
   type RuntimeHostPeerClient,
+  type RuntimeHostConnectionPhase,
   type RuntimeHostSshInteraction,
   type RuntimeHostSshTunnel,
   type RuntimeHostSshTunnelInput,
@@ -51,6 +55,7 @@ import {
 import {
   INTERACTIVE_RUNTIME_HOST_COMPOSITION_ID,
   RUNTIME_HOST_PROTOCOL_VERSION,
+  type HostStatusResult,
   type WorkspaceTarget,
 } from "@maka/runtime-host/protocol";
 import type { AttachmentApprovalRegistry } from "./attachment-approval.js";
@@ -70,9 +75,7 @@ import {
   type DesktopNativeCapabilityProviderInput,
 } from "./runtime-host-native-capabilities.js";
 import {
-  registerRuntimeHostSharedSessionCatalogIpc,
   registerRuntimeHostSessionCatalogIpc,
-  toDesktopHostSharedSessionSummary,
 } from "./runtime-host-session-catalog-ipc-main.js";
 import { registerRuntimeHostWorkHubIpc } from "./runtime-host-workhub-ipc-main.js";
 import { registerRuntimeHostExternalSessionsIpc } from "./runtime-host-external-sessions-ipc-main.js";
@@ -141,6 +144,7 @@ export interface DesktopRuntimeHostCandidateDeps {
   readonly onError?: RuntimeHostSessionDomainsIpcDeps["onError"];
   readonly isTargetActive?: () => boolean;
   readonly isTargetValid?: () => boolean;
+  readonly onGuestSessionCatalogChanged?: () => void;
   readonly newId?: () => string;
   readonly now?: () => number;
   readonly openSshTunnel?: (
@@ -151,13 +155,16 @@ export interface DesktopRuntimeHostCandidateDeps {
   ) => Promise<RuntimeHostActivationResult>;
   readonly resolveLocalCollaborationConnectionTarget?: () =>
     Promise<DesktopCollaborationConnectionTarget>;
+  readonly resolveProfileCollaborationConnectionTarget?: (
+    profile: PersistedRuntimeHostProfile,
+  ) => Promise<DesktopCollaborationConnectionTarget>;
   readonly createSessionCopyCleanup: (input: {
     removeSession: (sessionId: string) => Promise<SessionCopyCleanupDisposition>;
     resumeSessionCopy: (input: {
       sessionId: string;
       kind: 'branch' | 'revision';
       sourceSessionId: string;
-      sourceTurnId: string;
+      sourceTurnId?: string;
       intent?: 'side_conversation';
     }) => Promise<void>;
   }) => SessionCopyCleanupAuthority;
@@ -199,6 +206,9 @@ export interface DesktopRuntimeHostCandidateStartInput
   readonly onExit?: (details: CandidateExitDetails) => void;
   readonly candidateLaunchBarrier?: RuntimeHostCandidateLaunchBarrier;
   readonly peerClient?: RuntimeHostPeerClient;
+  readonly refreshPeerRoutes?: boolean;
+  readonly onConnectionPhase?: (phase: RuntimeHostConnectionPhase) => void;
+  readonly onHostStatus?: (status: HostStatusResult) => void;
   readonly profileTarget?: {
     readonly profile: PersistedRuntimeHostProfile;
     readonly credential?: string;
@@ -432,6 +442,15 @@ async function startProfileDesktopRuntimeHostCandidate(
       : { handshakeTimeoutMs: input.handshakeTimeoutMs }),
     readyTimeoutMs: input.electionDeadlineMs ?? 45_000,
     ...(input.peerClient === undefined ? {} : { peerClient: input.peerClient }),
+    ...(input.refreshPeerRoutes === undefined
+      ? {}
+      : { refreshPeerRoutes: input.refreshPeerRoutes }),
+    ...(input.onConnectionPhase === undefined
+      ? {}
+      : { onConnectionPhase: input.onConnectionPhase }),
+    ...(input.onHostStatus === undefined
+      ? {}
+      : { onHostStatus: input.onHostStatus }),
     ...(profileTarget.sshInteraction === undefined
       ? {}
       : { sshInteraction: profileTarget.sshInteraction }),
@@ -454,11 +473,8 @@ async function startProfileDesktopRuntimeHostCandidate(
         runtimeHostProfileAccess(profileTarget.profile),
         undefined,
         undefined,
-        profileTarget.profile.kind === 'remote'
-          ? {
-              name: profileTarget.profile.name,
-              transport: profileTarget.profile.transport,
-            }
+        profileTarget.profile.kind === 'remote' && input.resolveProfileCollaborationConnectionTarget
+          ? () => input.resolveProfileCollaborationConnectionTarget!(profileTarget.profile)
           : undefined,
       ),
     };
@@ -477,7 +493,9 @@ export async function createDesktopRuntimeHostCandidate(
   targetAccess: RuntimeHostProfileAccess = 'owner',
   hostPid?: number,
   ownedProcess?: RuntimeHostSpawnedProcess,
-  collaborationConnectionTarget?: DesktopCollaborationConnectionTarget,
+  resolveCollaborationConnectionTarget?: () =>
+    | DesktopCollaborationConnectionTarget
+    | Promise<DesktopCollaborationConnectionTarget>,
 ): Promise<DesktopRuntimeHostCandidate> {
   const target: DesktopRuntimeHostTargetPolicy = {
     kind: targetKind,
@@ -573,6 +591,12 @@ export async function createDesktopRuntimeHostCandidate(
   let observationsAttached = false;
   let capabilitiesRegistered = false;
   try {
+    const onGuestSessionCatalogChanged = target.access === 'session_guest'
+      ? deps.onGuestSessionCatalogChanged
+      : undefined;
+    if (target.access === 'session_guest' && !onGuestSessionCatalogChanged) {
+      throw new Error('A Session Guest candidate requires a catalog-change authority');
+    }
     let domains: RuntimeHostSessionDomainsIpcHandle | undefined;
     const emitActiveInteractionsChanged = (
       sessionId: string,
@@ -677,11 +701,14 @@ export async function createDesktopRuntimeHostCandidate(
         once: target.once.bind(target),
         off: target.off.bind(target),
       }),
+      (missingSessionId) => emitSessionsChanged("deleted", missingSessionId),
     );
     const restoredSessionIdSet = new Set(restoredSessionIds);
-    const failedSessionIds = observedSessionIds.filter(
-      (sessionId) => !restoredSessionIdSet.has(sessionId),
-    );
+    // Attach forgets Sessions the Host no longer serves, so only Sessions
+    // that are still registered but failed to restore count as failures.
+    const failedSessionIds = sessionObservations
+      .observedSessionIds()
+      .filter((sessionId) => !restoredSessionIdSet.has(sessionId));
     if (failedSessionIds.length > 0) {
       throw new Error(
         `Failed to restore Session observations: ${failedSessionIds.join(', ')}`,
@@ -718,6 +745,7 @@ export async function createDesktopRuntimeHostCandidate(
           onComputerUseTurnUsed: watchComputerUseTurn,
           isTargetValid: deps.isTargetValid,
           onClosed: () => providers.delete(provider),
+          onDiagnostic: logLocalRuntimeHostProcessDiagnostic,
         },
       );
       providers.add(provider);
@@ -762,7 +790,7 @@ export async function createDesktopRuntimeHostCandidate(
             await client.copySession(kind, {
               sourceSessionId,
               targetSessionId: sessionId,
-              sourceTurnId,
+              ...(sourceTurnId === undefined ? {} : { sourceTurnId }),
               ...(intent ? { intent } : {}),
             });
           },
@@ -779,23 +807,12 @@ export async function createDesktopRuntimeHostCandidate(
         )
       : undefined;
     disposeClientIpc = target.access === 'session_guest'
-      ? client.subscribeSessionCatalogChanges(({ sessionId }) =>
-          emitSessionsChanged('updated', sessionId),
-        )
+      ? client.subscribeSessionCatalogChanges(() => onGuestSessionCatalogChanged!())
       : typeof registeredClientIpc === 'function'
         ? registeredClientIpc
         : undefined;
     if (target.access === 'session_guest') {
       registerRuntimeHostAttachmentPreviewIpc({ ipcMain: ipc, client });
-      registerRuntimeHostSharedSessionCatalogIpc(
-        {
-          getSession: async () => {
-            const session = await client.getSharedSession();
-            return session ? toDesktopHostSharedSessionSummary(session) : null;
-          },
-        },
-        ipc,
-      );
     } else {
       if (!sessionCopyCleanup) throw new Error('Owner Session copy authority is unavailable');
       registerRuntimeHostSessionCatalogIpc(
@@ -812,7 +829,7 @@ export async function createDesktopRuntimeHostCandidate(
       );
     }
     registerRuntimeHostCollaborationIpc(client, ipc, async () => {
-      if (collaborationConnectionTarget) return collaborationConnectionTarget;
+      if (resolveCollaborationConnectionTarget) return resolveCollaborationConnectionTarget();
       if (target.kind === 'local' && deps.resolveLocalCollaborationConnectionTarget) {
         return deps.resolveLocalCollaborationConnectionTarget();
       }
@@ -932,6 +949,7 @@ function connectInput(
       : { handshakeTimeoutMs: input.handshakeTimeoutMs }),
     ...(input.signal === undefined ? {} : { signal: input.signal }),
     ...(input.onExit === undefined ? {} : { onExit: input.onExit }),
+    closeOnLauncherExit: true,
   };
 }
 
