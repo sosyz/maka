@@ -21,10 +21,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { canonicalToolArgsHash } from '@maka/core/tool-args-identity';
 import type { RuntimeEvent } from '@maka/core/runtime-event';
-import {
-  buildInterruptedCodeModeOutcomeCommits,
-  resolveRuntimeRecovery,
-} from '../recovery-resolver.js';
+import { resolveRuntimeRecovery } from '../recovery-resolver.js';
 
 describe('RecoveryResolver', () => {
   it('proves a new-protocol call without dispatch was never dispatched', () => {
@@ -43,10 +40,9 @@ describe('RecoveryResolver', () => {
       },
     ]);
     assert.equal(resolution.hasCorruption, false);
-    assert.equal(resolution.requiresReconciliation, false);
   });
 
-  it('requires reconciliation after dispatch when no response was committed', () => {
+  it('keeps the outcome unknown after dispatch when no response was committed', () => {
     const resolution = resolveRuntimeRecovery([
       initialEvent('t1_after_preflight_v1'),
       functionCallEvent(),
@@ -65,10 +61,9 @@ describe('RecoveryResolver', () => {
       },
     ]);
     assert.equal(resolution.hasCorruption, false);
-    assert.equal(resolution.requiresReconciliation, true);
   });
 
-  it('builds an interrupted outcome only for the outer exec operation', () => {
+  it('keeps dispatched operations unresolved instead of inventing durable tool results', () => {
     const outerCall = event({
       id: 'outer-call',
       role: 'model',
@@ -111,62 +106,42 @@ describe('RecoveryResolver', () => {
       parentToolCallId: 'exec-1',
     });
 
-    const commits = buildInterruptedCodeModeOutcomeCommits(
-      [initialEvent('t1_after_preflight_v1'), outerCall, outerDispatch, nestedCall, nestedDispatch],
-      50,
-      'code_mode',
-    );
+    const events = [
+      initialEvent('t1_after_preflight_v1'),
+      outerCall,
+      outerDispatch,
+      nestedCall,
+      nestedDispatch,
+    ];
+    const resolution = resolveRuntimeRecovery(events);
 
-    assert.equal(commits.length, 1);
-    assert.equal(commits[0]?.operationId, 'outer-op');
-    assert.equal(commits[0]?.runtimeEvent.content?.kind, 'function_response');
-    assert.equal(
-      commits[0]?.runtimeEvent.content?.kind === 'function_response'
-        ? commits[0].runtimeEvent.content.isError
-        : false,
-      true,
-    );
     assert.deepEqual(
-      commits[0]?.runtimeEvent.content?.kind === 'function_response'
-        ? commits[0].runtimeEvent.content.result
-        : undefined,
-      {
-        kind: 'json',
-        value: {
-          kind: 'code_mode',
-          status: 'interrupted',
-          message: 'Code Mode execution was interrupted by runtime recovery.',
-        },
-      },
+      resolution.decisions.map(({ toolCallId, status, reason }) => ({
+        toolCallId,
+        status,
+        reason,
+      })),
+      [
+        { toolCallId: 'exec-1', status: 'indeterminate', reason: 'dispatch_without_response' },
+        { toolCallId: 'nested-1', status: 'indeterminate', reason: 'dispatch_without_response' },
+      ],
+    );
+    assert.equal(
+      events.some((candidate) => candidate.content?.kind === 'function_response'),
+      false,
     );
   });
 
-  it('does not infer Code Mode recovery from a custom direct exec name', () => {
-    const commits = buildInterruptedCodeModeOutcomeCommits(
-      [
-        initialEvent('t1_after_preflight_v1'),
-        event({
-          id: 'direct-exec-call',
-          role: 'model',
-          author: 'agent',
-          origin: 'provider',
-          modelVisibility: 'visible',
-          content: { kind: 'function_call', id: 'exec-1', name: 'exec', args: {} },
-          refs: { operationId: 'direct-exec-op', toolCallId: 'exec-1' },
-        }),
-        dispatchFor({
-          id: 'direct-exec-dispatch',
-          operationId: 'direct-exec-op',
-          toolCallId: 'exec-1',
-          toolName: 'exec',
-          args: {},
-        }),
-      ],
-      50,
-      'direct',
-    );
+  it('a terminal invocation does not turn a dispatched operation into a settled tool result', () => {
+    const resolution = resolveRuntimeRecovery([
+      initialEvent('t1_after_preflight_v1'),
+      functionCallEvent(),
+      toolDispatchEvent(),
+      event({ id: 'terminal-1', status: 'failed', actions: { endInvocation: true } }),
+    ]);
 
-    assert.deepEqual(commits, []);
+    assert.equal(resolution.decisions[0]?.status, 'indeterminate');
+    assert.equal(resolution.decisions[0]?.reason, 'dispatch_without_response');
   });
 
   it('treats a matching response without dispatch as a completed pre-T1 result', () => {
@@ -188,7 +163,6 @@ describe('RecoveryResolver', () => {
         settlementOrigin: 'pre_t1_synthetic',
       },
     ]);
-    assert.equal(resolution.requiresReconciliation, false);
   });
 
   it('classifies a dispatch without its canonical function call as corruption', () => {
@@ -208,7 +182,6 @@ describe('RecoveryResolver', () => {
       },
     ]);
     assert.equal(resolution.hasCorruption, true);
-    assert.equal(resolution.requiresReconciliation, false);
   });
 
   it('classifies a response without its canonical function call as corruption', () => {
@@ -271,7 +244,6 @@ describe('RecoveryResolver', () => {
       },
     ]);
     assert.equal(resolution.hasCorruption, true);
-    assert.equal(resolution.requiresReconciliation, false);
   });
 
   it('classifies repeated response for one operation as corruption', () => {
@@ -297,7 +269,6 @@ describe('RecoveryResolver', () => {
       },
     ]);
     assert.equal(resolution.hasCorruption, true);
-    assert.equal(resolution.requiresReconciliation, false);
   });
 
   it('rejects a protocol marker added after the first canonical event', () => {
@@ -335,7 +306,6 @@ describe('RecoveryResolver', () => {
     assert.equal(resolution.decisions[0]?.status, 'indeterminate');
     assert.equal(resolution.decisions[0]?.reason, 'legacy_dispatch_unknown');
     assert.equal(resolution.hasCorruption, true);
-    assert.equal(resolution.requiresReconciliation, false);
   });
 
   it('classifies a response linked to a different operation as corruption', () => {
@@ -399,6 +369,7 @@ function dispatchFor(input: {
   modelVisibility?: 'visible' | 'hidden';
   parentOperationId?: string;
   parentToolCallId?: string;
+  resultProjectionVersion?: 1;
 }): RuntimeEvent {
   return event({
     id: input.id,
@@ -412,6 +383,9 @@ function dispatchFor(input: {
         toolName: input.toolName,
         canonicalArgsHash: canonicalToolArgsHash(input.toolName, input.args),
         recoveryMode: 'never_auto_retry',
+        ...(input.resultProjectionVersion !== undefined
+          ? { resultProjectionVersion: input.resultProjectionVersion }
+          : {}),
       },
     },
     refs: {

@@ -19,29 +19,32 @@
 
 /* Sidebar — SideNav shell, session rows, footer update chip.
  * Session rows are Astryx SideNavItem; this file only owns product-only chrome. */
+/* Justified: the Agents shell reuses shared sidebar/session-panel primitives,
+   but this surface must read as a transparent rail. Keep these `!important`
+   resets until the primitive chrome is split from layout. */
+.agents-sidebar {
+  background: transparent !important;
+  contain: layout paint style;
+  flex-shrink: 0;
+}
+
+.agents-sidebar[data-resizing="true"] {
+  box-shadow: none !important;
+}
+
+.agents-layout-root aside[data-settings-nav-column].agents-sidebar > div {
+  background: transparent;
+}
+
+.maka-session-panel.agents-sidebar {
+  background: transparent !important;
+  contain: layout paint style;
+}
+
 .maka-session-panel {
   min-width: 0;
   min-height: 0;
   height: 100%;
-}
-
-/*
- * Astryx 0.2.0 ResizeHandle: when pillPlacement is not "center", hitAreaOffsetX
- * applies translateY(-50%) without a matching top: 50%. The grab zone then only
- * covers the top half of the handle, so a pointer drag at the vertical center
- * (where the pill sits) hits the handle root — which has no pointerdown — and
- * no-ops. SideNav uses pillPlacement="end" (sub-pixel X bias) and mounts the
- * handle as a sibling of <nav.maka-session-panel>, not a descendant — target the
- * handle test id. Remove once Astryx fixes hitAreaOffsetX.
- *
- * e2e/sidebar-geometry.spec.ts drags the handle from its vertical centre — the
- * half this fix restores — and asserts the column resizes, so removing this
- * before Astryx is fixed fails loudly instead of silently killing the grab.
- */
-[data-testid="astryx-sidenav-resize-handle"] > div:not(.astryx-resize-handle-pill) {
-  /* !important: Astryx StyleX injects the bad transform unlayered, which
-     otherwise beats every rule in @layer maka.legacy. */
-  transform: none !important;
 }
 
 .maka-session-list {
@@ -65,11 +68,10 @@
  * stay in step and an upgrade that restructures the header keeps working.
  *
  * Bound on the header, NOT on the section root. SideNavSection wraps the whole
- * list body — every row, badge, and timestamp — in the same element as its title
+ * list body — every row and timestamp — in the same element as its title
  * (session-history-list.tsx), and custom properties inherit, so a rebind on the
- * root reaches all of it: measured live, the project session-count Badge went
- * 12px → 14px. The header is SideNavSection's first child and holds exactly the
- * title and subtitle.
+ * root would also resize the task content. The header is SideNavSection's first
+ * child and holds exactly the title and subtitle.
  *
  * Both halves of the tier move together. Size alone would leave the supporting
  * leading multiplier on a larger font and land the line box at 23.33px, off the
@@ -114,8 +116,8 @@
  */
 /* Visual System 2.0 (T2): consume the border ladder instead of a hand-rolled
  * 5% ink mix. `--border-soft` (6%) is DESIGN.md §4's "quiet separation inside a
- * plate — rails, row dividers that fills can't carry", which is exactly this
- * line's job. The 1-point alpha change is the cost of having one authority for
+ * plate — rails, and the dividers between records in a record list that fills
+ * can't carry", and a rail is exactly this line's job. The 1-point alpha change is the cost of having one authority for
  * quiet lines; a private 5% is indistinguishable from the tier it was drifting
  * from and only made the ladder unenforceable. */
 .maka-session-panel {
@@ -228,18 +230,39 @@
   -webkit-app-region: no-drag;
 }
 
+.maka-project-row[data-host-kind="remote"] > div > .astryx-side-nav-item .lucide-globe {
+  color: var(--color-text-blue);
+}
+
+/*
+ * A project row receiving a dragged task. Drawn on the row's own box rather
+ * than on the nested SideNavItem so the whole target — the heading and any
+ * expanded children — reads as one zone. An inset outline, not a border or
+ * padding: it costs no layout, so nothing under the pointer shifts as the ring
+ * appears.
+ */
+.maka-project-row[data-drop-target="true"] {
+  border-radius: var(--radius-control);
+  outline: 2px solid var(--accent-solid);
+  outline-offset: -2px;
+}
+
 /*
  * Grouping switch (session-list-panel.tsx): the last row of the sticky top
  * region, above the scrolling history it governs.
  *
- * Block padding only. The zone already insets its content to the same two
- * vertical lines the nav rows' boxes sit on, so the control spans exactly the
- * 新任务 row's width and the top region reads as one stack; an inline padding
- * here would inset it a second time. `layout="fill"` handles the rest — each
- * segment takes exactly half.
+ * A heading row: 任务 on the left, the content-width switch at the trailing
+ * edge. The zone already insets its content to the nav rows' box edges, so
+ * the switch's right edge meets the 新任务 row's; the heading takes the nav
+ * items' own text inset (spacing-2) so it sits on the list headings' x below.
  */
 .maka-session-grouping-switch {
-  padding-block: var(--spacing-1) var(--spacing-2);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--spacing-2);
+  padding-block: var(--spacing-2) var(--spacing-1);
+  padding-inline-start: var(--spacing-2);
 }
 
 /*
@@ -259,20 +282,98 @@
 }
 
 /*
- * Project groups are a parent-child hierarchy. SideNav always nests children
- * by spacing-6; that is a fixed inset, not a title-alignment rule. Project
- * rows lead with a 16px folder, session rows with an 8px StatusDot, so the
- * default 24px inset puts session titles 16px right of the project name.
- * Product intent: keep an 8px hierarchical inset (spacing-2) so titles share
- * one x. The whole session button, including hover/selected fill, moves with
- * that inset; the right edge stays on the rail. Pin the value because StyleX
+ * Project groups are a parent-child hierarchy, and SideNav indents children by
+ * spacing-6 by default. That inset shifted the whole session button — its
+ * hover/selected fill included — 24px right of the project row, so the two
+ * fills began on different x. Zero it: session rows sit on the project row's
+ * left edge, and the title inset below keeps titles on the project name's x.
+ * Pin the value because StyleX
  * owns the unlayered default. Child combinator only — do not use a descendant
  * selector that would indent deeper nest levels twice if any appear later.
  * DOM: .maka-project-row > SideNavItem root > [role=group] > childrenInner
  */
 .maka-project-row > div > [role="group"] > div {
   /* !important: StyleX childrenInner paddingInlineStart is unlayered. */
-  padding-inline-start: var(--spacing-2) !important;
+  padding-inline-start: 0 !important;
+}
+
+/* A task has no leading icon, so under a project its title is pushed past the
+   project row's 1rem folder icon and the gap after it. */
+.maka-project-row .maka-session-row > div > .astryx-side-nav-item {
+  padding-inline-start: calc(var(--spacing-2) + 1rem + var(--spacing-2));
+}
+
+/*
+ * Project/task hover details. Astryx owns the floating surface, top-layer
+ * positioning, radius, padding, shadow, and open/close motion. This content
+ * only defines the reading hierarchy inside that established component.
+ */
+.maka-sidebar-hover-card {
+  font: var(--maka-text-supporting);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1-5);
+  width: min(304px, calc(100vw - var(--space-6)));
+  min-width: 248px;
+  text-align: start;
+}
+
+.maka-sidebar-hover-card-title {
+  font: var(--maka-text-heading-4);
+  min-width: 0;
+  color: var(--foreground);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.maka-sidebar-hover-card-preview {
+  color: var(--muted-foreground);
+  line-height: var(--leading-relaxed);
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+
+.maka-sidebar-hover-card-preview[data-empty="true"],
+.maka-sidebar-hover-card-updated {
+  color: var(--muted-foreground);
+}
+
+.maka-sidebar-hover-card-meta {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-0-5) var(--space-1);
+  color: var(--muted-foreground);
+}
+
+.maka-sidebar-hover-card-path {
+  font: var(--maka-text-code);
+}
+
+.maka-sidebar-hover-card-path,
+.maka-sidebar-hover-card-location,
+.maka-sidebar-hover-card-project {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted-foreground);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.maka-sidebar-hover-card-updated {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--space-0-5);
+}
+
+.maka-sidebar-hover-card-updated small {
+  font: inherit;
 }
 
 .maka-session-row-end,
@@ -284,9 +385,28 @@
   flex-shrink: 0;
 }
 
-/* Fixed trailing column so StatusDot ↔ MoreMenu swaps do not reflow the label
- * (hover used to steal ~28px and shove the title left). Project rows only; task
- * rows use .maka-session-row-time below. */
+.maka-session-row-host-badge,
+.maka-session-row-executor-badge {
+  display: inline-flex;
+  min-width: 0;
+  max-width: 88px;
+}
+
+.maka-session-row-attention-badge {
+  display: inline-flex;
+  flex: none;
+}
+
+.maka-session-row-host-badge > span,
+.maka-session-row-executor-badge > span {
+  overflow: hidden;
+  max-width: 100%;
+  text-overflow: ellipsis;
+}
+
+/* Fixed trailing column so MoreMenu swaps do not reflow the label (hover used
+ * to steal ~28px and shove the title left). Project rows only; task rows use
+ * .maka-session-row-signal below. */
 .maka-session-row-trailing {
   display: inline-flex;
   align-items: center;
@@ -296,42 +416,43 @@
   min-height: var(--h-control-sm, 24px);
 }
 
-/*
- * Slot 1: the leading status gutter.
- *
- * Astryx's StatusDot is a fixed 8px box (StatusDot.tsx), so only the empty case
- * needs declaring: a row with no dot must still hold the column, or titles would
- * start at a different x depending on whether the task has a state. The dot is
- * present or absent; the gutter is not.
- */
-.maka-session-row .maka-session-row-signal-empty {
-  display: block;
-  width: 8px;
-  height: 8px;
-  flex: none;
+.maka-session-row-trailing[data-new-task="true"] {
+  width: calc(2 * var(--h-control-sm, 24px) + var(--space-2));
 }
 
 /*
- * Slot 2: the timestamp at rest, the ⋯ menu on hover or keyboard focus.
+ * The signal slot: the row's state at rest, or its timestamp when it has no
+ * state; the ⋯ menu on hover or keyboard focus.
  *
  * `visibility`, not `display`, and an absolutely positioned menu: the two never
  * occupy layout at the same time and neither can reflow the title. The menu used
  * to be mounted visible on every row, which is what made the trailing cluster
  * five things wide.
  *
- * :focus-within covers the keyboard: focus on the row's own button reveals the
- * menu. The native popover's own open state covers the pointer handoff into the
- * top layer: once the pointer leaves the row, :hover drops before the item can
+ * :focus-visible, not :focus-within: a mouse click leaves focus on the row, and
+ * the row it just opened would otherwise keep its state covered by ⋯. The
+ * native popover's own open state covers the pointer handoff into the top
+ * layer: once the pointer leaves the row, :hover drops before the item can
  * receive its click, and pointer-events: none on this ancestor otherwise makes
  * the page underneath the visible popover win hit testing.
  */
-.maka-session-row-time {
+.maka-session-row-signal {
   display: inline-flex;
   align-items: center;
+  /* The ring and the time end on the row's padding edge. */
   justify-content: flex-end;
   flex: none;
   min-width: var(--h-control-sm, 24px);
   min-height: var(--h-control-sm, 24px);
+}
+
+.maka-session-row {
+  /* The sm Spinner's box. The dot and the ⋯ center on the ring's axis. */
+  --_ring-box: 14px;
+}
+
+.maka-session-row-signal > [data-session-status]:not(.maka-running-indicator) {
+  margin-inline-end: calc((var(--_ring-box) - 8px) / 2);
 }
 
 .maka-session-row-time-label {
@@ -340,39 +461,36 @@
   white-space: nowrap;
 }
 
-/* `opacity`, not `display: none`, so the trigger keeps its place in the tab
-   order and in the accessibility tree — that is what makes the menu reachable
-   without a pointer. `pointer-events: none` goes with it: the button sits
-   absolutely over the trailing slot at `z-index: 1`, so while it is invisible
-   it would otherwise still swallow clicks meant for the row underneath. */
-.maka-session-row > .maka-session-row-action {
-  opacity: 0;
-  pointer-events: none;
-}
-
-.maka-session-row:hover > .maka-session-row-action,
-.maka-session-row:focus-within > .maka-session-row-action,
-.maka-session-row > .maka-session-row-action[data-menu-open="true"] {
-  opacity: 1;
-  pointer-events: auto;
-}
-
-.maka-session-row:hover .maka-session-row-time,
-.maka-session-row:focus-within .maka-session-row-time,
-.maka-session-row:has(> .maka-session-row-action[data-menu-open="true"]) .maka-session-row-time {
-  visibility: hidden;
-}
-
-/* Nothing here can reveal the menu later, so it takes the slot outright and the
-   timestamp yields. */
-@media (hover: none) {
+@media (hover: hover) {
+  /* `opacity`, not `display: none`, so the trigger keeps its place in the tab
+     order and in the accessibility tree — that is what makes the menu reachable
+     without a pointer. `pointer-events: none` goes with it: the button sits
+     absolutely over the trailing slot at `z-index: 1`, so while it is invisible
+     it would otherwise still swallow clicks meant for the row underneath. */
   .maka-session-row > .maka-session-row-action {
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  .maka-session-row:hover > .maka-session-row-action,
+  .maka-session-row:has(:focus-visible) > .maka-session-row-action,
+  .maka-session-row > .maka-session-row-action[data-menu-open="true"] {
     opacity: 1;
     pointer-events: auto;
   }
 
-  .maka-session-row .maka-session-row-time {
+  .maka-session-row[data-actionable="true"]:hover .maka-session-row-signal,
+  .maka-session-row[data-actionable="true"]:has(:focus-visible) .maka-session-row-signal,
+  .maka-session-row:has(> .maka-session-row-action[data-menu-open="true"]) .maka-session-row-signal {
     visibility: hidden;
+  }
+}
+
+/* Nothing here can reveal the menu later, so it stays up and the slot moves
+   aside to sit next to it. */
+@media (hover: none) {
+  .maka-session-row[data-actionable="true"] .maka-session-row-end {
+    margin-inline-end: calc((var(--h-control-sm, 24px) + var(--_ring-box)) / 2 + var(--space-1));
   }
 }
 
@@ -380,7 +498,8 @@
  * sibling slot instead of non-interactive endContent. Menus occupy a reserved
  * trailing slot visually, but stay siblings in the DOM so neither control
  * contains the other. */
-.maka-session-row-action {
+.maka-session-row-action,
+.maka-project-row-actions {
   position: absolute;
   inset-block-start: calc(
     (var(--size-element-md) - var(--size-element-sm)) / 2
@@ -390,17 +509,32 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
+}
+
+.maka-session-row-action {
   width: var(--h-control-sm, 24px);
 }
 
-/* A collapsible project keeps Astryx's 24px disclosure after endContent. Match
- * the placeholder's original slot immediately before that disclosure: row
- * gutter + disclosure + SideNavItem gap. Empty projects have no disclosure and
- * use the default trailing inset above. */
-.maka-project-row
+.maka-session-row > .maka-session-row-action {
+  inset-inline-end: calc(var(--space-2) - (var(--h-control-sm, 24px) - var(--_ring-box)) / 2);
+}
+
+.maka-project-row-actions {
+  gap: var(--space-2);
+}
+
+.maka-project-row-actions > .maka-session-row-action {
+  position: static;
+}
+
+/* Astryx's whole-row collapse control has a decorative trailing chevron but
+ * no hide-chevron prop. Keep its collapse behavior and aria-expanded while
+ * replacing that decoration with the project's sibling action controls. */
+.maka-project-row:has(> div > .maka-project-row-actions)
   > div
-  > .maka-session-row-action[data-position="before-disclosure"] {
-  inset-inline-end: calc(var(--space-2) + var(--space-6) + var(--space-2));
+  > .astryx-side-nav-item[aria-expanded]
+  > .astryx-icon:last-child {
+  display: none;
 }
 
 /* The sibling menu is visually part of the project header, but Astryx's
@@ -408,14 +542,14 @@
  * feedback only while the direct project action is targeted; a plain wrapper
  * :hover selector would also light the header over nested session rows. */
 @media (hover: hover) {
-  .maka-project-row:has(> div > .maka-session-row-action:hover)
+  .maka-project-row:has(> div > .maka-project-row-actions:hover)
     > div
     > .astryx-side-nav-item {
     background-color: var(--color-overlay-hover);
   }
 }
 
-.maka-project-row:has(> div > .maka-session-row-action button:active)
+.maka-project-row:has(> div > .maka-project-row-actions button:active)
   > div
   > .astryx-side-nav-item {
   background-color: var(--color-overlay-pressed);
@@ -440,13 +574,66 @@
   margin-left: auto;
   padding: 0;
   border: 0;
-  /* Same as .settingsAboutHero: un-chroming a <kbd>, not squaring a box. With
-     no padding, border, fill or shadow there is nothing for a radius to act
-     on. */
+  /* Un-chroming a <kbd>, not squaring a box. With no padding, border, fill or
+     shadow there is nothing for a radius to act on. */
   border-radius: 0;
   background: transparent;
   box-shadow: none;
   color: var(--muted-foreground);
   letter-spacing: var(--tracking-wide);
   white-space: nowrap;
+}
+
+/*
+ * Selection is the ground alone. Astryx's selected item also steps up to
+ * medium weight, which re-sets the title's glyphs and moves its ellipsis the
+ * instant a row is opened.
+ */
+.maka-session-panel .astryx-side-nav-item[data-selected] {
+  font-weight: var(--font-weight-normal);
+}
+
+/*
+ * Multi-select.
+ *
+ * A picked row and the OPEN row share one ground, which is what Codex and
+ * Claude Desktop both do and what makes "the open task is the selection when it
+ * holds one row" true on screen rather than only in the model. The token is the
+ * one Astryx's own `SideNavItem` uses for `isSelected`, so the two states are
+ * the same paint and not a near-match maintained by hand.
+ *
+ * `isSelected` itself is spent on the open row alone: it renders
+ * `aria-current="page"`, and a set of picked rows is not a set of current
+ * pages. What a screen reader hears instead is in the row's description.
+ * A menu target shares this ground only while its menu is open; opening a
+ * menu does not make that row part of the persistent selection.
+ */
+.maka-session-row[data-picked='true'] .astryx-side-nav-item,
+.maka-session-row:has(> .maka-session-row-action[data-menu-open='true']) .astryx-side-nav-item {
+  background-color: var(--color-neutral);
+}
+
+/*
+ * Forced colors flatten `--color-neutral` away, which is why Astryx's own
+ * `isSelected` names a system color here instead. Picked rows have to say it
+ * too, or the state that carries the whole interaction is the one state high
+ * contrast cannot show. Same pair as `isSelected`, because it is the same
+ * ground — the two states stay one paint in both worlds.
+ */
+@media (forced-colors: active) {
+  .maka-session-row[data-picked='true'] .astryx-side-nav-item,
+  .maka-session-row:has(> .maka-session-row-action[data-menu-open='true']) .astryx-side-nav-item {
+    background-color: Highlight;
+    color: HighlightText;
+  }
+}
+
+/*
+ * Shift-click extends a text selection from wherever the last one was anchored,
+ * and in a list of titles that paints a blue smear across the rows the user is
+ * marking. It cannot be fixed from the click handler — the browser starts the
+ * selection on mousedown, before any click exists — so it is refused here.
+ */
+.maka-session-row {
+  user-select: none;
 }

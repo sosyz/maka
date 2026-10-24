@@ -89,6 +89,17 @@
   font-variant-numeric: tabular-nums;
 }
 
+.settingsUsageTokenTooltip,
+.settingsUsageTokenTooltip dd {
+  margin: 0;
+}
+
+.settingsUsageTokenTooltip > div {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
 /* Astryx Card establishes the table's surface and resets its container-bleed
    boundary. Astryx Table owns horizontal scrolling inside that boundary. */
 .settingsUsageTable {
@@ -112,6 +123,17 @@
 }
 
 .settingsUsageSessionCell span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Astryx Table no longer adds a title to truncated primitive cell values in
+   core 0.5.2. Keep the full provider/model/tool identity available at the
+   product seam while preserving the table's ellipsis layout. */
+.settingsUsageTargetCell {
+  display: block;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -198,7 +220,6 @@
    only the metric-strip density override. */
 .settingsMetricCard {
   min-height: 52px;
-  justify-content: center;
   gap: var(--space-0-5);
   padding: var(--space-1-5) var(--space-2-5);
 }

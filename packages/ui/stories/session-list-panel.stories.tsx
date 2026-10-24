@@ -17,9 +17,9 @@
  * under the License.
  */
 
-import { useEffect, useRef, type ReactNode } from 'react';
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import type { Meta, StoryObj } from '@storybook/react-vite';
-import { expect, waitFor, within } from 'storybook/test';
+import { expect, userEvent, waitFor, within } from 'storybook/test';
 import type { ProjectRecord } from '@maka/core/project';
 import type { SessionBlockedReason, SessionStatus, SessionSummary } from '@maka/core/session';
 import { SessionRail, type SessionRailStoryProps } from './session-rail-harness.js';
@@ -54,6 +54,9 @@ function makeSession(input: {
   hasUnread?: boolean;
   backend?: SessionSummary['backend'];
   llmConnectionSlug?: string;
+  projectId?: string | null;
+  cwd?: string;
+  lastMessagePreview?: string;
 }): SessionSummary {
   const status = input.status ?? 'active';
   return {
@@ -71,15 +74,18 @@ function makeSession(input: {
     connectionLocked: false,
     model: 'glm-4.7',
     permissionMode: 'ask',
+    ...(input.projectId !== undefined ? { projectId: input.projectId } : {}),
+    ...(input.cwd !== undefined ? { cwd: input.cwd } : {}),
+    ...(input.lastMessagePreview !== undefined
+      ? { lastMessagePreview: input.lastMessagePreview }
+      : {}),
   };
 }
 
 const rowActions: NonNullable<SessionListPanelProps['rowActions']> = {
   onToggleFlag: noop,
   onArchive: noop,
-  onUnarchive: noop,
   onRename: noop,
-  onDelete: noop,
 };
 
 function panelProps(input: {
@@ -93,6 +99,8 @@ function panelProps(input: {
   groups?: SessionListPanelProps['groups'];
   projectActions?: SessionListPanelProps['projectActions'];
   worktreeSessionIds?: SessionListPanelProps['worktreeSessionIds'];
+  sessionLocation?: SessionListPanelProps['sessionLocation'];
+  onSelectSession?: SessionListPanelProps['onSelectSession'];
 }): SessionListPanelProps {
   return {
     selection: input.selection ?? { section: 'sessions' },
@@ -107,7 +115,8 @@ function panelProps(input: {
     ...(input.groups ? { groups: input.groups } : {}),
     ...(input.projectActions ? { projectActions: input.projectActions } : {}),
     ...(input.worktreeSessionIds ? { worktreeSessionIds: input.worktreeSessionIds } : {}),
-    onSelectSession: noop,
+    ...(input.sessionLocation ? { sessionLocation: input.sessionLocation } : {}),
+    onSelectSession: input.onSelectSession ?? noop,
     onSelect: noop,
     onOpenSettings: noop,
     onNew: noop,
@@ -238,6 +247,40 @@ const longTitleSessions = [
   }),
 ];
 
+const renderBudgetSessions = Array.from({ length: 32 }, (_, index) =>
+  makeSession({
+    id: `render-budget-${index}`,
+    name: `Rail row ${index}`,
+    status: index % 5 === 0 ? 'running' : 'active',
+    lastMessageAt: NOW - index * 60_000,
+  }),
+);
+
+function RenderBudgetRail() {
+  const [activeId, setActiveId] = useState('render-budget-0');
+  const select = useCallback((sessionId: string) => setActiveId(sessionId), []);
+  return (
+    <StoryFrame height={800}>
+      <SessionRail
+        {...panelProps({
+          sessions: renderBudgetSessions,
+          activeId,
+          onSelectSession: select,
+        })}
+      />
+    </StoryFrame>
+  );
+}
+
+async function waitForRailMutationQuiet(counters: { delta: number }): Promise<void> {
+  let quiet = 0;
+  await waitFor(() => {
+    quiet = counters.delta === 0 ? quiet + 1 : 0;
+    counters.delta = 0;
+    expect(quiet).toBeGreaterThanOrEqual(3);
+  }, { timeout: 10_000, interval: 100 });
+}
+
 const liveRunAuthoritySessions: SessionSummary[] = [
   {
     ...makeSession({
@@ -297,6 +340,111 @@ export const ConversationStates: Story = {
       })} />
     </StoryFrame>
   ),
+  play: async ({ canvasElement }) => {
+    // The ring, every status dot and the ⋯ that replaces them on hover share
+    // one vertical axis.
+    const centerX = (element: Element | null) => {
+      if (!element) throw new Error('trailing element is missing');
+      const box = element.getBoundingClientRect();
+      return box.x + box.width / 2;
+    };
+    const axis = centerX(
+      canvasElement.querySelector('[data-session-id="status-running"] .maka-running-indicator'),
+    );
+    for (const row of canvasElement.querySelectorAll<HTMLElement>('.maka-session-row')) {
+      expect(Math.abs(centerX(row.querySelector('[data-session-status]')) - axis)).toBeLessThanOrEqual(1);
+      expect(
+        Math.abs(centerX(row.querySelector(':scope > .maka-session-row-action')) - axis),
+      ).toBeLessThanOrEqual(1);
+    }
+  },
+};
+
+// Real path: switching between two ordinary Sessions in a populated rail. The
+// controller unit test pins stable command identities; this real-layout story
+// pins the resulting DOM budget, so a different source of whole-rail rewrites
+// still fails without paying Electron startup cost.
+export const SessionSwitchRenderBudget: Story = {
+  render: () => <RenderBudgetRail />,
+  play: async ({ canvasElement }) => {
+    const counters = {
+      styleWrites: 0,
+      rowIds: new Set<string>(),
+      rowRemounts: 0,
+      selectedRowIds: [] as (string | null)[],
+      statusNodeChanges: 0,
+      delta: 0,
+    };
+    const selectedRowId = (): string | null =>
+      canvasElement
+        .querySelector('.maka-session-row button.astryx-side-nav-item.selected')
+        ?.closest('.maka-session-row')
+        ?.getAttribute('data-session-id') ?? null;
+    counters.selectedRowIds.push(selectedRowId());
+    const observer = new MutationObserver((records) => {
+      for (const record of records) {
+        if (record.type === 'childList') {
+          for (const node of record.addedNodes) {
+            const element = node as Element;
+            if (element.nodeType === 1 && element.classList?.contains('maka-session-row')) {
+              counters.rowRemounts += 1;
+            }
+          }
+          for (const node of [...record.addedNodes, ...record.removedNodes]) {
+            const element = node as Element;
+            if (
+              element.nodeType === 1 &&
+              (element.matches?.('[data-session-status]') ||
+                element.querySelector?.('[data-session-status]'))
+            ) {
+              counters.statusNodeChanges += 1;
+            }
+          }
+          continue;
+        }
+        const row = (record.target as Element).closest?.('.maka-session-row');
+        if (!row) continue;
+        counters.styleWrites += 1;
+        counters.delta += 1;
+        const rowId = row.getAttribute('data-session-id');
+        if (rowId) counters.rowIds.add(rowId);
+      }
+      const selected = selectedRowId();
+      if (selected !== counters.selectedRowIds.at(-1)) counters.selectedRowIds.push(selected);
+    });
+    observer.observe(canvasElement, {
+      subtree: true,
+      childList: true,
+      attributes: true,
+      attributeFilter: ['style'],
+    });
+
+    await waitForRailMutationQuiet(counters);
+    counters.styleWrites = 0;
+    counters.rowIds.clear();
+    counters.rowRemounts = 0;
+    counters.selectedRowIds = counters.selectedRowIds.slice(-1);
+    counters.statusNodeChanges = 0;
+
+    const target = canvasElement.querySelector<HTMLButtonElement>(
+      '.maka-session-row[data-session-id="render-budget-3"] button.astryx-side-nav-item',
+    );
+    await expect(target).not.toBeNull();
+    target!.click();
+    await waitFor(() => expect(target!).toHaveClass('selected'));
+    await waitForRailMutationQuiet(counters);
+    observer.disconnect();
+
+    expect(counters.rowIds.size).toBeLessThanOrEqual(2);
+    expect(counters.rowRemounts).toBe(0);
+    expect(counters.styleWrites).toBeGreaterThan(0);
+    // Storybook's focus handoff invokes one extra ref pair compared with the
+    // Electron fixture. The stronger two-row budget above still rejects any
+    // whole-rail rewrite regardless of the fixture size.
+    expect(counters.styleWrites).toBeLessThanOrEqual(10);
+    expect(counters.selectedRowIds.slice(1)).toEqual(['render-budget-3']);
+    expect(counters.statusNodeChanges).toBe(0);
+  },
 };
 
 // Real path: the active task row's overflow menu after its semantic trigger is
@@ -315,6 +463,8 @@ export const ActiveTaskActionsOpen: Story = {
     const page = within(canvasElement.ownerDocument.body);
     await waitFor(() => expect(page.getByRole('menu')).toBeVisible());
     expect(page.getByRole('menuitem', { name: '重命名' })).toBeVisible();
+    expect(page.getByRole('menuitem', { name: /^归档$/ })).toBeVisible();
+    expect(page.queryByRole('menuitem', { name: /删除/ })).toBeNull();
   },
 };
 
@@ -386,10 +536,25 @@ export const PinnedAndRecentSections: Story = {
       />
     </StoryFrame>
   ),
+  play: async ({ canvasElement }) => {
+    // The ring and the timestamps end on the row's padding edge, not on a
+    // centered column that leaves them floating inside the row.
+    for (const row of canvasElement.querySelectorAll<HTMLElement>('.maka-session-row')) {
+      const signal = row.querySelector('.maka-session-row-signal');
+      const content = signal?.firstElementChild;
+      if (!signal || !content) throw new Error(`${row.dataset.sessionId} has no signal`);
+      const item = row.querySelector('.astryx-side-nav-item');
+      if (!item) throw new Error('nav item is missing');
+      const paddingEdge =
+        item.getBoundingClientRect().right - Number.parseFloat(getComputedStyle(item).paddingRight);
+      expect(Math.abs(content.getBoundingClientRect().right - paddingEdge)).toBeLessThanOrEqual(1);
+    }
+  },
 };
 
-// Real path: group-by-project — collapsible project rows, sessions nested 8px
-// under the project so titles share one x, worktree mark + count badge.
+// Real path: group-by-project — collapsible project rows, sessions on the
+// project row's left edge so both titles and hover fills share one x, worktree
+// mark + project actions, with local, remote and WSL execution locations.
 export const ProjectGroups: Story = {
   render: () => {
     const maka = makeProject({
@@ -411,10 +576,16 @@ export const ProjectGroups: Story = {
       name: '旧版桌面端',
       available: false,
     });
+    const environment = makeProject({
+      id: 'project-environment',
+      name: 'Linux 工具',
+      preferredPath: '/home/user/linux-tools',
+    });
     const sessions = [
       makeSession({
         id: 'proj-main',
         name: '主仓会话',
+        isFlagged: true,
         lastMessageAt: NOW - 4 * 60 * 1000,
       }),
       makeSession({
@@ -422,11 +593,20 @@ export const ProjectGroups: Story = {
         name: 'worktree 上的修复',
         status: 'running',
         lastMessageAt: NOW - 1 * 60 * 1000,
+        projectId: maka.id,
+        cwd: '/workspace/maka-agent/.worktree/sidebar',
+        lastMessagePreview: '正在把侧栏交互契约迁移到浏览器 story。',
       }),
       makeSession({
         id: 'proj-docs',
         name: '文档站改版',
         lastMessageAt: NOW - 30 * 60 * 1000,
+      }),
+      makeSession({
+        id: 'proj-loose',
+        name: '未归属的临时任务',
+        projectId: null,
+        lastMessageAt: NOW - 45 * 60 * 1000,
       }),
     ];
     return (
@@ -438,24 +618,280 @@ export const ProjectGroups: Story = {
             streamingSessionIds: new Set(['proj-worktree']),
             viewMode: 'project',
             worktreeSessionIds: new Set(['proj-worktree']),
+            // The real selector only names a location for a project with more
+            // than one, so the fixture mirrors that: maka is the only one.
+            sessionLocation: (session) =>
+              maka.locations.some((location) => location.path === session.cwd)
+                ? session.cwd
+                : undefined,
             groups: [
               {
                 id: `project:${maka.id}`,
                 label: maka.name,
                 project: maka,
+                host: { kind: 'local', name: 'Local' },
                 sessions: [sessions[0]!, sessions[1]!],
               },
               {
                 id: `project:${docs.id}`,
                 label: docs.name,
                 project: docs,
+                host: { kind: 'remote', name: '开发服务器' },
                 sessions: [sessions[2]!],
               },
               {
                 id: `project:${missing.id}`,
                 label: missing.name,
                 project: missing,
+                host: { kind: 'local', name: 'Local' },
                 sessions: [],
+              },
+              {
+                id: `project:${environment.id}`,
+                label: environment.name,
+                project: environment,
+                host: { kind: 'environment', name: 'Ubuntu' },
+                sessions: [],
+              },
+              {
+                id: '__ungrouped__',
+                label: '未归属项目',
+                host: { kind: 'local', name: 'Local' },
+                sessions: [sessions[3]!],
+              },
+            ],
+            projectActions: {
+              onNew: noop,
+              onRename: noop,
+              onArchive: noop,
+              onRestore: noop,
+              onRelink: noop,
+            },
+          })}
+        />
+      </StoryFrame>
+    );
+  },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const page = within(canvasElement.ownerDocument.body);
+    const projectRow = canvasElement.querySelector<HTMLElement>(
+      '[data-project-id="project:project-maka"]',
+    );
+    if (!projectRow) throw new Error('project row is missing');
+    const navigation = projectRow.querySelector<HTMLElement>(
+      'button[aria-controls]:not([aria-haspopup="menu"])',
+    );
+    if (!navigation) throw new Error('project navigation is missing');
+    const action = within(projectRow).getByRole('button', {
+      name: 'maka-agent 项目操作',
+    });
+    const newTask = within(projectRow).getByRole('button', { name: 'maka-agent 新建任务' });
+    const groupId = navigation.getAttribute('aria-controls');
+    if (!groupId) throw new Error('project navigation does not own a group');
+    const group = canvasElement.ownerDocument.getElementById(groupId);
+    if (!group) throw new Error('project task group is missing');
+    const taskControl = group.querySelector<HTMLElement>('[data-session-id] button');
+    if (!taskControl) throw new Error('nested task control is missing');
+    const projectTitle = within(navigation).getByText('maka-agent', { exact: true });
+    const taskTitle = within(taskControl).getByText('worktree 上的修复', { exact: true });
+
+    expect(projectRow.querySelectorAll('button button')).toHaveLength(0);
+    const projectBox = navigation.getBoundingClientRect();
+    const taskBox = taskControl.getBoundingClientRect();
+    // The task row sits on the project row's left edge, so the two
+    // hover/selected fills start on the same x — not the 8px nest that used to
+    // offset only the task rows.
+    const sessionInset = taskBox.x - projectBox.x;
+    expect(Math.abs(sessionInset)).toBeLessThanOrEqual(1);
+    expect(Math.abs(
+      projectTitle.getBoundingClientRect().x - taskTitle.getBoundingClientRect().x,
+    )).toBeLessThanOrEqual(2);
+    const chevron = navigation.querySelector(':scope > .astryx-icon:last-child');
+    if (!chevron) throw new Error('project collapse decoration is missing');
+    await expect(chevron).not.toBeVisible();
+    expect(projectTitle.getBoundingClientRect().right).toBeLessThanOrEqual(
+      action.getBoundingClientRect().left,
+    );
+    expect(action.getBoundingClientRect().right).toBeLessThanOrEqual(
+      newTask.getBoundingClientRect().left,
+    );
+    expect(newTask.getBoundingClientRect().right).toBeLessThanOrEqual(projectBox.right);
+
+    navigation.focus();
+    await userEvent.tab();
+    await expect(action).toHaveFocus();
+    await userEvent.tab();
+    await expect(newTask).toHaveFocus();
+    await userEvent.keyboard('{Enter}');
+    await expect(navigation).toHaveAttribute('aria-expanded', 'true');
+    await userEvent.tab();
+    await expect(taskControl).toHaveFocus();
+
+    navigation.focus();
+    await userEvent.keyboard('{Enter}');
+    await expect(navigation).toHaveAttribute('aria-expanded', 'false');
+    await expect(group).toHaveAttribute('aria-hidden', 'true');
+    expect(group.getAttribute('inert')).not.toBeNull();
+    await userEvent.keyboard('{Enter}');
+    await expect(navigation).toHaveAttribute('aria-expanded', 'true');
+    await expect(group).toHaveAttribute('aria-hidden', 'false');
+    expect(group.getAttribute('inert')).toBeNull();
+
+    action.focus();
+    await userEvent.keyboard('{Enter}');
+    await expect(page.getByRole('menuitem', { name: '新建任务' })).toBeVisible();
+    await userEvent.keyboard('{Escape}');
+    await expect(action).toHaveFocus();
+    await userEvent.keyboard('{Enter}');
+    await userEvent.click(page.getByRole('menuitem', { name: '重命名' }));
+    await expect(await page.findByRole('dialog', { name: '重命名项目' })).toBeVisible();
+    await userEvent.click(page.getByRole('button', { name: '关闭' }));
+    await waitFor(() => expect(action).toHaveFocus());
+
+    await userEvent.hover(taskControl);
+    const taskCard = await page.findByText('正在把侧栏交互契约迁移到浏览器 story。');
+    const taskHoverCard = taskCard.closest<HTMLElement>(
+      '.maka-sidebar-hover-card[data-kind="session"]',
+    );
+    if (!taskHoverCard) throw new Error('task hover card is missing');
+    await expect(within(taskHoverCard).getByText('worktree 上的修复')).toBeVisible();
+    await expect(within(taskHoverCard).getByText(/glm-4\.7/)).toBeVisible();
+    // The visible location line, not just its accessible description: a task in
+    // a multi-location project says which working directory it actually uses.
+    const locationLine = within(taskHoverCard).getByText(
+      '/workspace/maka-agent/.worktree/sidebar',
+      { exact: true },
+    );
+    await expect(locationLine).toBeVisible();
+    expect(locationLine).toHaveAttribute(
+      'title',
+      '/workspace/maka-agent/.worktree/sidebar',
+    );
+
+    await userEvent.hover(navigation);
+    await waitFor(() => expect(
+      canvasElement.ownerDocument.querySelector<HTMLElement>(
+        '.maka-sidebar-hover-card[data-kind="project"]',
+      ),
+    ).toBeVisible());
+    const projectHoverCard = canvasElement.ownerDocument.querySelector<HTMLElement>(
+      '.maka-sidebar-hover-card[data-kind="project"]',
+    );
+    if (!projectHoverCard) throw new Error('project hover card is missing');
+    await expect(within(projectHoverCard).getByText('1 个任务')).toBeVisible();
+    await expect(within(projectHoverCard).getByText(/目录可用/)).toBeVisible();
+    await userEvent.unhover(navigation);
+    await waitFor(() => expect(projectHoverCard).not.toBeVisible());
+
+    const taskRow = taskControl.closest<HTMLElement>('[data-session-id]');
+    if (!taskRow) throw new Error('task row is missing');
+    const signal = taskRow.querySelector<HTMLElement>('.maka-session-row-signal');
+    const indicator = signal?.querySelector<HTMLElement>('.maka-running-indicator');
+    if (!signal || !indicator) throw new Error('task running indicator is missing');
+    const taskActionButton = within(taskRow).getByRole('button', { name: /任务操作$/ });
+    const centerX = (element: Element) => {
+      const box = element.getBoundingClientRect();
+      return box.x + box.width / 2;
+    };
+    expect(Math.abs(centerX(indicator) - centerX(taskActionButton))).toBeLessThanOrEqual(1);
+    taskActionButton.focus();
+    await userEvent.keyboard('{Enter}');
+    const renameTask = page.getByRole('menuitem', { name: '重命名' });
+    await expect(renameTask).toBeVisible();
+    const taskAction = taskRow.querySelector<HTMLElement>('.maka-session-row-action');
+    if (!taskAction) throw new Error('task action is missing');
+    await expect(taskAction).toHaveAttribute(
+      'data-menu-open',
+      'true',
+    );
+    await userEvent.hover(renameTask);
+    await expect(signal).toHaveStyle({ visibility: 'hidden' });
+    await userEvent.click(renameTask);
+    await expect(await page.findByRole('dialog', { name: '重命名任务' }, {
+      timeout: 5_000,
+    })).toBeVisible();
+    await userEvent.click(page.getByRole('button', { name: '关闭' }));
+
+    const ungroupedRow = canvasElement.querySelector<HTMLElement>(
+      '[data-project-id="__ungrouped__"]',
+    );
+    const ungroupedNavigation = ungroupedRow?.querySelector<HTMLElement>(
+      ':scope > div > .astryx-side-nav-item',
+    );
+    if (!ungroupedNavigation) throw new Error('ungrouped project row is missing');
+    ungroupedNavigation.focus();
+    await expect(await page.findByRole('dialog', {
+      name: '未归属项目 分组详情',
+    })).toBeVisible();
+  },
+};
+
+// Group-by-project where a project's only task is pinned, so the project row
+// has nothing left to show. What the row says about itself — disclosure,
+// action placement, the hover card's task count — has to follow what is
+// actually under it, and an archived project sits below the live ones.
+export const ProjectGroupsPinnedOnlyTask: Story = {
+  render: () => {
+    const solo = makeProject({
+      id: 'project-solo',
+      name: '独苗项目',
+      preferredPath: '/workspace/solo',
+    });
+    const docs = makeProject({
+      id: 'project-docs',
+      name: '产品文档',
+      preferredPath: '/workspace/docs',
+    });
+    const retired = makeProject({
+      id: 'project-retired',
+      name: '旧版桌面端',
+      preferredPath: '/workspace/legacy',
+      archivedAt: NOW - 30 * 24 * 60 * 60 * 1000,
+    });
+    const sessions = [
+      makeSession({
+        id: 'solo-only',
+        name: '唯一的任务',
+        isFlagged: true,
+        lastMessageAt: NOW - 6 * 60 * 1000,
+      }),
+      makeSession({
+        id: 'docs-a',
+        name: '文档站改版',
+        lastMessageAt: NOW - 30 * 60 * 1000,
+      }),
+      makeSession({
+        id: 'retired-a',
+        name: '旧版遗留任务',
+        lastMessageAt: NOW - 40 * 24 * 60 * 60 * 1000,
+      }),
+    ];
+    return (
+      <StoryFrame height={720}>
+        <SessionRail
+          {...panelProps({
+            sessions,
+            activeId: 'docs-a',
+            viewMode: 'project',
+            groups: [
+              {
+                id: `project:${solo.id}`,
+                label: solo.name,
+                project: solo,
+                sessions: [sessions[0]!],
+              },
+              {
+                id: `project:${docs.id}`,
+                label: docs.name,
+                project: docs,
+                sessions: [sessions[1]!],
+              },
+              {
+                id: `project:${retired.id}`,
+                label: retired.name,
+                project: retired,
+                sessions: [sessions[2]!],
               },
             ],
             projectActions: {

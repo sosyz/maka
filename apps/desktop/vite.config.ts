@@ -24,6 +24,7 @@ import react from '@vitejs/plugin-react';
 import { dependencyPatchesCachePlugin } from './vite-dependency-patches.js';
 import { bundledNpmPackagesPlugin } from './vite-bundled-packages.js';
 import { rendererEntryContractPlugin } from './scripts/vite-renderer-entry-contract.js';
+import { workspacePackagesPlugin } from './vite-workspace-packages.js';
 
 /**
  * PR-ICONS-FULL-REPLACE-0 (WAWQAQ msg `60064e2d` 2026-06-24): point the
@@ -46,20 +47,25 @@ export default defineConfig({
   plugins: [
     react(),
     dependencyPatchesCachePlugin(REPO_ROOT),
+    workspacePackagesPlugin(REPO_ROOT),
     bundledNpmPackagesPlugin(),
     rendererEntryContractPlugin(resolve(import.meta.dirname, 'src/renderer')),
   ],
   resolve: {
     dedupe: ['react', 'react-dom'],
     alias: [
+      { find: '@maka/ui/client-plugin-runtime', replacement: resolve(UI_SRC, 'client-plugin-runtime.tsx') },
+      { find: '@maka/ui/client-plugin', replacement: resolve(UI_SRC, 'client-plugin-slots.tsx') },
       { find: '@maka/ui/icons', replacement: resolve(UI_SRC, 'icons.tsx') },
       { find: '@maka/ui/artifact-preview-registry', replacement: resolve(UI_SRC, 'artifact-preview-registry.ts') },
-      { find: '@maka/ui/assistant-stream', replacement: resolve(UI_SRC, 'assistant-stream.ts') },
       { find: '@maka/ui/maka-uri', replacement: resolve(UI_SRC, 'maka-uri.ts') },
       { find: /^@maka\/ui$/, replacement: resolve(UI_SRC, 'index.ts') },
     ],
   },
   build: {
+    // Small KaTeX fonts must remain local files: the renderer CSP allows
+    // same-origin fonts, while Vite's default inlining produces blocked data URLs.
+    assetsInlineLimit: (filePath) => /\.(?:woff2?|ttf|otf)$/iu.test(filePath) ? false : undefined,
     // Renderer bundle lives in dist-renderer (sibling of dist), separate from
     // dist/renderer. dist/renderer holds tsc side-files that build:main emits
     // for helpers imported by main/__tests__; emptyOutDir:true clears only

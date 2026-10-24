@@ -18,7 +18,7 @@
  */
 
 import assert from 'node:assert/strict';
-import { execFile as execFileCallback } from 'node:child_process';
+import { execFile as execFileCallback, spawn } from 'node:child_process';
 import {
   mkdir,
   mkdtemp,
@@ -36,13 +36,17 @@ import { test } from 'node:test';
 import { promisify } from 'node:util';
 import {
   claimRuntimeHostManagedDeployment,
+  beginRuntimeHostManagedDeploymentTransition,
   decodeRuntimeHostSetupFrame,
   encodeRuntimeHostSetupFrame,
   resolveRuntimeHostManagedDeploymentConfigPath,
+  runtimeHostManagedOperatorCommand,
   RUNTIME_HOST_SETUP_FRAME_PREFIX,
   type RuntimeHostManagedDeploymentConfig,
 } from '@maka/runtime-host/operator';
+import { RuntimeHostOperationError } from '@maka/runtime-host/client';
 import {
+  STORAGE_ROOT_MARKER_FILE,
   resolveRootControlNamespace,
   resolveRootOwnershipNamespace,
   resolveStorageRoot,
@@ -52,22 +56,27 @@ import {
   acknowledgeRuntimeHostManagedDeploymentCleanup,
   assertRuntimeHostManagedOperatorDeployment,
   convergeRuntimeHostManagedOperator,
+  convergeRuntimeHostManagedWindowsTaskLauncher,
   prepareRuntimeHostManagedPackageDeployment,
   pruneRuntimeHostManagedPackages,
   readRuntimeHostManagedDeploymentCleanupReceipt,
   resolveRuntimeHostManagedControlRoot,
   resolveRuntimeHostManagedDeploymentRoot,
+  verifyRuntimeHostManagedWindowsTaskLauncher,
 } from '../runtime-host-managed-deployment.js';
+import {
+  resolvePackagedRuntimeHostWindowsTaskLauncherPath,
+  resolveRuntimeHostWindowsTaskLauncherPath,
+  runtimeHostManagedWindowsTaskLauncherPath,
+} from '../runtime-host-windows-task-launcher-artifact.js';
 import { runRuntimeHostSetupCli } from '../runtime-host-setup-command.js';
 import { RuntimeHostAccessUnavailableError } from '../runtime-host-access-command.js';
+import { replaceRuntimeHostLifecycle } from '../runtime-host-lifecycle-transaction.js';
 import { manageRuntimeHostManagedLifecycle } from '../runtime-host-managed-lifecycle-manager.js';
-import {
-  resolveRuntimeHostLifecycleProvider,
-  selectRuntimeHostLifecycleProvider,
-} from '../runtime-host-service-management-command.js';
+import { createOpenRcRuntimeHostLifecycleProvider } from '../runtime-host-openrc-service.js';
+import { resolveRuntimeHostLifecycleProvider } from '../runtime-host-service-management-command.js';
 import {
   resolveRuntimeHostManagedServiceId,
-  RuntimeHostServiceManagerError,
   type RuntimeHostServiceBackend,
 } from '../runtime-host-service-manager.js';
 
@@ -127,7 +136,6 @@ test('on-demand setup installs one exact deployment without a service backend', 
     version: '1.2.3',
     root: join(canonicalDataHome, 'Maka', 'runtime-host-services', serviceId),
     cliPath: '/verified/package/dist/cli.js',
-    operatorPath: '/opt/maka/operator',
     activate: async () => undefined,
     cleanup: async () => undefined,
     rollback: async () => undefined,
@@ -171,6 +179,13 @@ test('on-demand setup installs one exact deployment without a service backend', 
     replaceCredential: async () => {
       pairingAttempts += 1;
       if (pairingAttempts === 1) throw new RuntimeHostAccessUnavailableError('unavailable');
+      if (pairingAttempts === 2) {
+        throw new RuntimeHostOperationError(
+          'access.credential.replace',
+          'host_not_ready',
+          'Runtime Host is not ready',
+        );
+      }
       return {
         rootId,
         credential: 'secret-token',
@@ -188,30 +203,38 @@ test('on-demand setup installs one exact deployment without a service backend', 
     },
     writeOutput: (value) => outputs.push(value),
   } satisfies NonNullable<Parameters<typeof runRuntimeHostSetupCli>[1]>;
-  assert.equal(await runRuntimeHostSetupCli(options, overrides), 0);
-  assert.equal(pairingAttempts, 2);
+  assert.equal(
+    await runRuntimeHostSetupCli({ ...options, reuseExistingEnvironment: true }, overrides),
+    0,
+  );
+  assert.equal(pairingAttempts, 3);
   const complete = outputs
     .map(decodeRuntimeHostSetupFrame)
     .find((frame) => frame?.kind === 'complete');
   assert.ok(complete?.kind === 'complete');
+  assert.equal(complete.operator.kind, 'node');
+  if (complete.operator.kind !== 'node') assert.fail('Setup returned a legacy operator');
+  assert.equal(complete.operator.nodePath, process.execPath);
   const persisted = JSON.parse(
     await readFile(resolveRuntimeHostManagedDeploymentConfigPath(rootId), 'utf8'),
-  ) as {
-    deploymentRoot: string;
-    lifecycle: { mode: string };
-    listeners: { websocket: { port: number } };
-    reconciliation: { trigger: string };
-  };
+  ) as RuntimeHostManagedDeploymentConfig;
   assert.equal(
     persisted.deploymentRoot,
     join(canonicalDataHome, 'Maka', 'runtime-host-services', rootId),
   );
+  assert.equal(complete.operator.modulePath, join(persisted.deploymentRoot, 'operator.mjs'));
   assert.equal(projectedOperatorDeploymentRoot, persisted.deploymentRoot);
   assert.equal(persisted.lifecycle.mode, 'on_demand');
-  assert.equal(persisted.listeners.websocket.port, 0);
+  assert.equal(persisted.listeners.websocket!.port, 0);
   assert.equal(persisted.reconciliation.trigger, 'activation');
 
   const retryOutputs: string[] = [];
+  persisted.launch.nodePath =
+    process.platform === 'win32' ? 'C:\\Program Files\\nodejs\\node.exe' : '/opt/maka/node';
+  await writeFile(
+    resolveRuntimeHostManagedDeploymentConfigPath(rootId),
+    `${JSON.stringify(persisted)}\n`,
+  );
   projectedOperatorDeploymentRoot = '/stale/operator/projection';
   assert.equal(
     await runRuntimeHostSetupCli(options, {
@@ -227,6 +250,12 @@ test('on-demand setup installs one exact deployment without a service backend', 
   assert.equal(
     retryComplete?.kind === 'complete' ? retryComplete.deploymentId : undefined,
     complete.deploymentId,
+  );
+  assert.equal(
+    retryComplete?.kind === 'complete' && retryComplete.operator.kind === 'node'
+      ? retryComplete.operator.nodePath
+      : undefined,
+    persisted.launch.nodePath,
   );
   assert.deepEqual(
     JSON.parse(await readFile(resolveRuntimeHostManagedDeploymentConfigPath(rootId), 'utf8')),
@@ -248,6 +277,195 @@ test('on-demand setup installs one exact deployment without a service backend', 
   assert.equal(
     failure?.kind === 'error' ? failure.error.code : undefined,
     'unsupported_lifecycle_configuration',
+  );
+
+  // Discovery reuses canonical identity even when a newer/older Desktop selects
+  // another package, and never opens storage, activates, pairs, or changes settings.
+  const discoveryOwner = await tryAcquireStateRootOwner(
+    await resolveStorageRoot({ path: stateRoot, kind: 'interactive' }),
+  );
+  assert.ok(discoveryOwner);
+  t.after(() => discoveryOwner.close());
+  for (const version of ['1.2.2', '1.2.3', '1.2.4']) {
+    const discovery: string[] = [];
+    assert.equal(
+      await runRuntimeHostSetupCli(
+        { ...options, version, reuseExistingEnvironment: true },
+        {
+          ...overrides,
+          resolveRegistryCandidate: async () => assert.fail('discovery must not resolve a package'),
+          prepareDeployment: async () => assert.fail('discovery must not stage a package'),
+          replaceLifecycle: async () => assert.fail('discovery must not retire a Host'),
+          activateManaged: async () => assert.fail('discovery must not activate'),
+          replaceCredential: async () => assert.fail('local environment discovery must not pair'),
+          writeOutput: (value) => discovery.push(value),
+        },
+      ),
+      0,
+    );
+    const binding = discovery
+      .map(decodeRuntimeHostSetupFrame)
+      .find((frame) => frame?.kind === 'existing_environment');
+    assert.equal(binding?.kind, 'existing_environment');
+    assert.equal(
+      binding && 'deploymentId' in binding ? binding.deploymentId : undefined,
+      complete.deploymentId,
+    );
+    assert.deepEqual(
+      JSON.parse(await readFile(resolveRuntimeHostManagedDeploymentConfigPath(rootId), 'utf8')),
+      persisted,
+    );
+  }
+
+  await discoveryOwner.close();
+
+  await t.test(
+    'missing WSL Node repair preserves authority and retries interrupted transactions',
+    {
+      skip: process.platform === 'win32',
+    },
+    async () => {
+      const capability = await resolveStorageRoot({ path: stateRoot, kind: 'interactive' });
+      const path = resolveRuntimeHostManagedDeploymentConfigPath(rootId);
+      const source = {
+        ...persisted,
+        launch: { ...persisted.launch, nodePath: join(base, 'deleted-node') },
+      };
+      await writeFile(path, JSON.stringify(source));
+      await mkdir(source.deploymentRoot, { recursive: true });
+      const recovery = {
+        ...options,
+        reuseExistingEnvironment: true,
+        repairRootAfterRemount: true as const,
+        expectedExisting: { rootId, operator: runtimeHostManagedOperatorCommand(source, 'posix') },
+      };
+      const recoveredFrames: string[] = [];
+      const repair = () =>
+        runRuntimeHostSetupCli(recovery, {
+          ...overrides,
+          isWsl: async () => true,
+          convergeOperator: convergeRuntimeHostManagedOperator,
+          prepareDeployment: async () =>
+            assert.fail('Node repair must preserve the installed package'),
+          replaceCredential: async () => assert.fail('Node repair must preserve credentials'),
+          writeOutput: (value) => recoveredFrames.push(value),
+        });
+      const refused: string[] = [];
+      assert.equal(
+        await runRuntimeHostSetupCli(recovery, {
+          ...overrides,
+          isWsl: async () => false,
+          writeOutput: (value) => refused.push(value),
+        }),
+        1,
+      );
+      const refusal = refused
+        .map(decodeRuntimeHostSetupFrame)
+        .find((frame) => frame?.kind === 'error');
+      assert.ok(refusal?.kind === 'error');
+      assert.match(refusal.error.message, /only in WSL/u);
+      assert.equal(await readFile(path, 'utf8'), JSON.stringify(source));
+      assert.equal(
+        await runRuntimeHostSetupCli(
+          {
+            ...recovery,
+            expectedExisting: {
+              ...recovery.expectedExisting,
+              operator: {
+                ...recovery.expectedExisting.operator,
+                modulePath: '/another/operator.mjs',
+              },
+            },
+          },
+          { ...overrides, isWsl: async () => true, writeOutput: () => undefined },
+        ),
+        1,
+      );
+      assert.equal(await readFile(path, 'utf8'), JSON.stringify(source));
+      await writeFile(source.launch.nodePath, 'existing but unusable');
+      assert.equal(await repair(), 1);
+      await rm(source.launch.nodePath);
+      const owner = await tryAcquireStateRootOwner(capability);
+      assert.ok(owner);
+      assert.equal(await repair(), 1);
+      assert.equal(await readFile(path, 'utf8'), JSON.stringify(source));
+      await owner.close();
+      const markerPath = join(stateRoot, STORAGE_ROOT_MARKER_FILE);
+      const marker = JSON.parse(await readFile(markerPath, 'utf8'));
+      for (const mismatch of [
+        { ...marker, rootId: 'f'.repeat(64) },
+        {
+          ...marker,
+          rootIdentity: {
+            ...marker.rootIdentity,
+            ino: (BigInt(marker.rootIdentity.ino) + 1n).toString(),
+          },
+        },
+      ]) {
+        await writeFile(markerPath, JSON.stringify(mismatch));
+        assert.equal(await repair(), 1);
+        assert.equal(await readFile(path, 'utf8'), JSON.stringify(source));
+        assert.equal(await readFile(markerPath, 'utf8'), JSON.stringify(mismatch));
+      }
+      marker.rootIdentity.dev = (BigInt(marker.rootIdentity.dev) + 1n).toString();
+      await writeFile(markerPath, JSON.stringify(marker));
+      const desired = {
+        ...source,
+        configRevision: source.configRevision + 1,
+        launch: { ...source.launch, nodePath: await realpath(process.execPath) },
+      };
+      assert.equal(await repair(), 0, recoveredFrames.at(-1) ?? 'missing repair frame');
+      assert.deepEqual(JSON.parse(await readFile(path, 'utf8')), desired);
+      assert.equal(
+        (await readFile(recovery.expectedExisting.operator.modulePath, 'utf8')).includes(
+          JSON.stringify(desired.launch.nodePath),
+        ),
+        true,
+      );
+      assert.equal(await repair(), 0, recoveredFrames.at(-1) ?? 'missing repair frame');
+      assert.deepEqual(JSON.parse(await readFile(path, 'utf8')), desired);
+      assert.equal(
+        recoveredFrames.map(decodeRuntimeHostSetupFrame).at(-1)?.kind,
+        'existing_environment',
+      );
+      for (const partialProjection of [false, true]) {
+        await writeFile(path, JSON.stringify(source));
+        const lease = await tryAcquireStateRootOwner(capability);
+        assert.ok(lease);
+        await beginRuntimeHostManagedDeploymentTransition(lease, {
+          transactionId: '00000000-0000-4000-8000-000000000002',
+          operation: 'configure',
+          recovery: 'restore_from',
+          expected: source,
+          desired,
+        });
+        if (partialProjection) await convergeRuntimeHostManagedOperator(source, desired);
+        assert.equal(await repair(), 1);
+        await lease.close();
+        assert.equal(await repair(), 0, recoveredFrames.at(-1) ?? 'missing repair frame');
+        assert.deepEqual(JSON.parse(await readFile(path, 'utf8')), desired);
+      }
+      await writeFile(path, JSON.stringify(source));
+      const lease = await tryAcquireStateRootOwner(capability);
+      assert.ok(lease);
+      const changed = {
+        ...desired,
+        configRevision: desired.configRevision + 1,
+        launch: { ...desired.launch, package: { ...desired.launch.package, version: '9.9.9' } },
+      };
+      await beginRuntimeHostManagedDeploymentTransition(lease, {
+        transactionId: '00000000-0000-4000-8000-000000000003',
+        operation: 'configure',
+        recovery: 'restore_from',
+        expected: source,
+        desired: changed,
+      });
+      await lease.close();
+      const pending = await readFile(path, 'utf8');
+      assert.equal(await repair(), 1);
+      assert.equal(await readFile(path, 'utf8'), pending);
+      await writeFile(path, JSON.stringify(persisted));
+    },
   );
 
   const replacementIntegrity = `sha512-${Buffer.alloc(64, 9).toString('base64')}`;
@@ -276,7 +494,38 @@ test('on-demand setup installs one exact deployment without a service backend', 
     'version_change_requires_update',
   );
 
+  const beforeBusyUpdate = await readFile(
+    resolveRuntimeHostManagedDeploymentConfigPath(rootId),
+    'utf8',
+  );
+  const busyOutputs: string[] = [];
+  assert.equal(
+    await runRuntimeHostSetupCli(
+      { ...replacementOptions, updateExisting: true },
+      {
+        ...replacementPackage,
+        replaceLifecycle: async (input) => {
+          // Model the source Host refusing retirement while a TUI owns work.
+          assert.equal(input.allowInterruptActiveTasks, false);
+          return { kind: 'active_tasks' };
+        },
+        writeOutput: (value) => busyOutputs.push(value),
+      },
+    ),
+    1,
+  );
+  assert.equal(
+    await readFile(resolveRuntimeHostManagedDeploymentConfigPath(rootId), 'utf8'),
+    beforeBusyUpdate,
+  );
+  assert.ok(
+    busyOutputs
+      .map(decodeRuntimeHostSetupFrame)
+      .some((frame) => frame?.kind === 'error' && frame.error.code === 'active_tasks'),
+  );
+
   const replacementOutputs: string[] = [];
+  let replacementAllowedInterrupt: boolean | undefined;
   assert.equal(
     await runRuntimeHostSetupCli(
       { ...replacementOptions, updateExisting: true },
@@ -284,6 +533,10 @@ test('on-demand setup installs one exact deployment without a service backend', 
         ...replacementPackage,
         openDeployment: async () =>
           assert.fail('a changed exact package must be staged before replacement'),
+        replaceLifecycle: async (input) => {
+          replacementAllowedInterrupt = input.allowInterruptActiveTasks;
+          return replaceRuntimeHostLifecycle(input);
+        },
         writeOutput: (value) => replacementOutputs.push(value),
       },
     ),
@@ -294,6 +547,7 @@ test('on-demand setup installs one exact deployment without a service backend', 
   ) as RuntimeHostManagedDeploymentConfig;
   assert.equal(replaced.launch.package.version, '1.2.4');
   assert.equal(replaced.launch.package.integrity, replacementIntegrity);
+  assert.equal(replacementAllowedInterrupt, false);
   assert.equal(
     replacementOutputs.map(decodeRuntimeHostSetupFrame).some((frame) => frame?.kind === 'complete'),
     true,
@@ -320,6 +574,87 @@ test('on-demand setup installs one exact deployment without a service backend', 
   );
   assert.equal(uninstalled.action, 'uninstall');
   assert.equal(uninstalled.retirement.kind, 'stopped');
+});
+
+test('fresh supervised setup discovers its provider before constructing a legacy backend', async (t) => {
+  const base = await realpath(await mkdtemp(join(tmpdir(), 'maka-runtime-host-supervised-setup-')));
+  const stateRoot = join(base, 'state');
+  const clientDataRoot = join(base, 'client');
+  let rootId = '';
+  t.after(async () => {
+    await Promise.all([
+      rm(base, { recursive: true, force: true }),
+      rootId
+        ? rm(join(resolveRootControlNamespace(), rootId), { recursive: true, force: true })
+        : Promise.resolve(),
+      rootId
+        ? rm(join(resolveRootOwnershipNamespace(), `${rootId}.lock`), { force: true })
+        : Promise.resolve(),
+    ]);
+  });
+
+  const result = await runRuntimeHostSetupCli(
+    {
+      json: true,
+      lifecycle: 'supervised',
+      clientDataRoot,
+      defaultRootPath: stateRoot,
+      sourcePackageRoot: base,
+      version: '1.2.3',
+      principalId: 'desktop:client-1',
+      preset: 'desktop-client',
+    },
+    {
+      createBackend: () => assert.fail('a fresh canonical setup has no legacy backend'),
+      discoverLifecycleProvider: async (discoveredRootId) => {
+        rootId = discoveredRootId;
+        return {
+          provider: createOpenRcRuntimeHostLifecycleProvider(rootId, 'openrc_user'),
+          availability: 'session',
+        };
+      },
+      resolveRegistryCandidate: async () => ({
+        kind: 'npm_registry',
+        version: '1.2.3',
+        integrity: PACKAGE_INTEGRITY,
+      }),
+      withRegistryPackage: async (_candidate, use) => use('/verified/package'),
+      prepareDeployment: async ({ serviceId }) => ({
+        version: '1.2.3',
+        root: join(base, 'deployment'),
+        cliPath: '/verified/package/dist/cli.js',
+        operator: {
+          kind: 'node' as const,
+          platform: 'posix' as const,
+          nodePath: '/usr/bin/node',
+          modulePath: '/opt/maka/operator.mjs',
+        },
+        activate: async () => undefined,
+        cleanup: async () => undefined,
+        rollback: async () => undefined,
+      }),
+      allocateLoopbackPort: async () => 43_210,
+      replaceLifecycle: async ({ desired }) => {
+        assert.equal(desired.lifecycle.mode, 'supervised');
+        assert.equal(desired.lifecycle.provider, 'openrc_user');
+        return { kind: 'replaced', config: desired };
+      },
+      prunePackages: async () => undefined,
+      replaceCredential: async () => ({
+        rootId,
+        credential: 'secret-token',
+        credentialId: 'credential-1',
+        principalKind: 'remote_owner',
+        principalId: 'desktop:client-1',
+        operationGrants: [],
+        canPublishClientCapabilities: false,
+        canUseHostPaths: false,
+      }),
+      verifyCredential: async () => undefined,
+      writeOutput: () => undefined,
+    },
+  );
+  assert.equal(result, 0);
 });
 
 test('managed setup frames reject malformed machine output', () => {
@@ -351,22 +686,53 @@ test('managed setup frames reject malformed machine output', () => {
     ),
     undefined,
   );
+  assert.equal(
+    decodeRuntimeHostSetupFrame(
+      `${RUNTIME_HOST_SETUP_FRAME_PREFIX}${Buffer.from(
+        JSON.stringify({
+          schemaVersion: 1,
+          sequence: 1,
+          kind: 'complete',
+          version: '0.2.0',
+          serviceId: 'a'.repeat(64),
+          deploymentId: '00000000-0000-4000-8000-000000000001',
+          operator: {
+            kind: 'legacy_posix_executable',
+            executablePath: '/opt/maka/operator',
+          },
+          rootPath: '/workspaces/default',
+          rootId: 'a'.repeat(64),
+          endpoint: 'ws://127.0.0.1:4321/runtime-host',
+          credentialId: 'credential',
+          credential: 'secret',
+        }),
+      ).toString('base64url')}\n`,
+    ),
+    undefined,
+  );
 });
 
-test('lifecycle discovery records environment scope and persisted providers are never reselected', () => {
-  assert.deepEqual(
-    selectRuntimeHostLifecycleProvider({
-      platform: 'linux',
-      environment: { WSL_DISTRO_NAME: 'Ubuntu' },
-    }),
-    { provider: 'systemd_user', availability: 'environment' },
-  );
-  assert.throws(
-    () => resolveRuntimeHostLifecycleProvider('a'.repeat(64), 'openrc_user'),
-    (error: unknown) =>
-      error instanceof RuntimeHostServiceManagerError &&
-      error.code === 'service_manager_unavailable',
-  );
+test('persisted OpenRC providers resolve without reselecting the platform default', () => {
+  const rootId = 'a'.repeat(64);
+  const openRc = resolveRuntimeHostLifecycleProvider({
+    schemaVersion: 1,
+    state: 'active',
+    deploymentId: '00000000-0000-4000-8000-000000000001',
+    configRevision: 1,
+    deploymentRoot: '/opt/maka',
+    root: { id: rootId, path: '/srv/maka' },
+    projectDirectoryRoots: [],
+    launch: {
+      kind: 'exact_package',
+      nodePath: '/usr/bin/node',
+      package: { kind: 'npm_registry', version: '0.2.0', integrity: PACKAGE_INTEGRITY },
+    },
+    listeners: { localIpc: true },
+    lifecycle: { mode: 'supervised', provider: 'openrc_user', availability: 'session' },
+    reconciliation: { trigger: 'scheduled', provider: 'openrc_supervised_loop' },
+  });
+  assert.equal(openRc.supervisor.provider, 'openrc_user');
+  assert.equal(openRc.reconciliationTrigger.provider, 'openrc_supervised_loop');
 });
 
 test('registry package identity avoids local content and recovers an interrupted removal', async (t) => {
@@ -638,7 +1004,7 @@ test('registry package identity avoids local content and recovers an interrupted
   }
   await convergeRuntimeHostManagedOperator(undefined, currentConfig);
   assert.equal(
-    (await readFile(join(currentDeploymentRoot, 'operator'), 'utf8')).includes(
+    (await readFile(join(currentDeploymentRoot, 'operator.mjs'), 'utf8')).includes(
       join(currentDeploymentRoot, 'versions', basename(registryRoot), 'dist', 'cli.js'),
     ),
     true,
@@ -698,7 +1064,12 @@ test('managed operator binds its Client Data Root and routes deployment cleanup'
     lifecycle: { mode: 'on_demand', availability: 'activation' },
     reconciliation: { trigger: 'manual' },
   };
+  const legacyOperatorPath = join(deployment.root, 'operator');
+  await writeFile(legacyOperatorPath, '#!/bin/sh\nexit 99\n');
+  await deployment.activate();
+  assert.match(await readFile(legacyOperatorPath, 'utf8'), /operator\.mjs/u);
   await convergeRuntimeHostManagedOperator(undefined, config);
+  const operator = runtimeHostManagedOperatorCommand(config, 'posix');
   const authorityRoot = join(base, 'authority');
   await mkdir(authorityRoot);
   const authority = { authorityRoot, durabilityBoundary: authorityRoot };
@@ -725,7 +1096,7 @@ test('managed operator binds its Client Data Root and routes deployment cleanup'
     deployment.cliPath,
     `require('node:fs').writeFileSync(process.env.MAKA_TEST_OUTPUT, JSON.stringify(process.argv.slice(2)));\n`,
   );
-  await execFile(deployment.operatorPath, ['status'], {
+  await execFile(legacyOperatorPath, ['status'], {
     env: {
       ...process.env,
       XDG_CONFIG_HOME: join(base, 'different-config'),
@@ -745,8 +1116,8 @@ test('managed operator binds its Client Data Root and routes deployment cleanup'
   ]);
 
   await execFile(
-    deployment.operatorPath,
-    ['access', 'list', '--root', '/runtime-root', '--framed'],
+    operator.nodePath,
+    [operator.modulePath, 'access', 'list', '--root', '/runtime-root', '--framed'],
     {
       env: { ...process.env, MAKA_TEST_OUTPUT: invocationPath },
     },
@@ -760,9 +1131,11 @@ test('managed operator binds its Client Data Root and routes deployment cleanup'
     '--framed',
   ]);
 
-  await execFile(deployment.operatorPath, ['activate', '--framed', '--root-id', 'a'.repeat(64)], {
-    env: { ...process.env, MAKA_TEST_OUTPUT: invocationPath },
-  });
+  await execFile(
+    operator.nodePath,
+    [operator.modulePath, 'activate', '--framed', '--root-id', 'a'.repeat(64)],
+    { env: { ...process.env, MAKA_TEST_OUTPUT: invocationPath } },
+  );
   assert.deepEqual(JSON.parse(await readFile(invocationPath, 'utf8')), [
     'runtime-host',
     'activate',
@@ -771,9 +1144,11 @@ test('managed operator binds its Client Data Root and routes deployment cleanup'
     'a'.repeat(64),
   ]);
 
-  await execFile(deployment.operatorPath, ['connect', '--framed', '--root-id', 'a'.repeat(64)], {
-    env: { ...process.env, MAKA_TEST_OUTPUT: invocationPath },
-  });
+  await execFile(
+    operator.nodePath,
+    [operator.modulePath, 'connect', '--framed', '--root-id', 'a'.repeat(64)],
+    { env: { ...process.env, MAKA_TEST_OUTPUT: invocationPath } },
+  );
   assert.deepEqual(JSON.parse(await readFile(invocationPath, 'utf8')), [
     'runtime-host',
     'connect',
@@ -783,8 +1158,9 @@ test('managed operator binds its Client Data Root and routes deployment cleanup'
   ]);
 
   await execFile(
-    deployment.operatorPath,
+    operator.nodePath,
     [
+      operator.modulePath,
       '__cleanup-managed-deployment',
       '--expected-service-id',
       serviceId,
@@ -814,6 +1190,85 @@ test('managed operator binds its Client Data Root and routes deployment cleanup'
     '--operator-deployment-id',
     '00000000-0000-4000-8000-000000000001',
   ]);
+
+  await writeFile(deployment.cliPath, "process.kill(process.pid, 'SIGTERM');\n");
+  const signalExit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+    (resolve, reject) => {
+      const child = spawn(operator.nodePath, [operator.modulePath, 'status'], { stdio: 'ignore' });
+      child.once('error', reject);
+      child.once('exit', (code, signal) => resolve({ code, signal }));
+    },
+  );
+  assert.deepEqual(signalExit, { code: null, signal: 'SIGTERM' });
+});
+
+test('managed Windows task launcher is projected to a stable deployment path', async (t) => {
+  const base = await mkdtemp(join(tmpdir(), 'maka-runtime-host-windows-launcher-'));
+  t.after(() => rm(base, { recursive: true, force: true }));
+  const sourcePackageRoot = await createReleasePackage(base, '0.2.0');
+  const sourceLauncher = join(
+    sourcePackageRoot,
+    'native',
+    'runtime-host-windows-task-launcher',
+    'prebuilds',
+    'win32-x64',
+    'maka-runtime-host-task-launcher.exe',
+  );
+  await mkdir(dirname(sourceLauncher), { recursive: true });
+  await writeFile(sourceLauncher, 'launcher-v1');
+  const serviceId = 'a'.repeat(64);
+  const deployment = await prepareRuntimeHostManagedPackageDeployment(
+    {
+      serviceId,
+      clientDataRoot: join(base, 'client'),
+      sourcePackageRoot,
+      version: '0.2.0',
+      packageIntegrity: PACKAGE_INTEGRITY,
+    },
+    {
+      env: { XDG_DATA_HOME: join(base, 'data') },
+      homeDir: join(base, 'home'),
+      platform: 'linux',
+    },
+  );
+  const config: RuntimeHostManagedDeploymentConfig = {
+    schemaVersion: 1,
+    state: 'active',
+    deploymentId: '00000000-0000-4000-8000-000000000001',
+    configRevision: 1,
+    deploymentRoot: deployment.root,
+    root: { id: serviceId, path: join(base, 'state') },
+    projectDirectoryRoots: [],
+    launch: {
+      kind: 'exact_package',
+      nodePath: process.execPath,
+      package: { kind: 'npm_registry', version: '0.2.0', integrity: PACKAGE_INTEGRITY },
+    },
+    listeners: { localIpc: true },
+    lifecycle: { mode: 'supervised', provider: 'windows_task', availability: 'session' },
+    reconciliation: { trigger: 'scheduled', provider: 'windows_task_timer' },
+  };
+
+  await convergeRuntimeHostManagedWindowsTaskLauncher(config);
+  const projected = runtimeHostManagedWindowsTaskLauncherPath(
+    deployment.root,
+    Buffer.from('launcher-v1'),
+  );
+  assert.equal(await readFile(projected, 'utf8'), 'launcher-v1');
+  assert.equal(await resolveRuntimeHostWindowsTaskLauncherPath(deployment.cliPath), projected);
+
+  const packaged = await resolvePackagedRuntimeHostWindowsTaskLauncherPath(deployment.cliPath);
+  await writeFile(packaged, 'launcher-v2');
+  await assert.rejects(
+    verifyRuntimeHostManagedWindowsTaskLauncher(config),
+    /does not match its deployment/u,
+  );
+  await convergeRuntimeHostManagedWindowsTaskLauncher(config);
+  await verifyRuntimeHostManagedWindowsTaskLauncher(config);
+  assert.notEqual(
+    runtimeHostManagedWindowsTaskLauncherPath(deployment.root, Buffer.from('launcher-v2')),
+    projected,
+  );
 });
 
 async function createReleasePackage(base: string, version: string): Promise<string> {

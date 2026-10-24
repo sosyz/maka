@@ -18,18 +18,21 @@
  */
 
 import { Markdown, visibleWidth } from '@earendil-works/pi-tui';
+import { resolveReadInput } from '@maka/runtime/read-page';
 import type {
   ProviderRetryEvent,
   ProviderRetryScheduledEvent,
+  FormRequestEvent,
   SandboxBoundaryRequestEvent,
   UserQuestionRequestEvent,
   SessionEvent,
-  ShellRunSnapshotResult,
+  ShellRunStateResult,
   ToolOutputStream,
   ToolResultContent,
 } from '@maka/core/events';
 import {
   deriveTurnRecords,
+  isRuntimeSystemNoteKind,
   STEP_LIMIT_NOTICE_TEXT,
   type StoredMessage,
   type SystemNoteMessage,
@@ -37,7 +40,12 @@ import {
 import type { ContextBudgetDiagnostic } from '@maka/core/usage-stats/types';
 import { providerRetryDisplaySeconds } from '@maka/core/provider-retry-countdown';
 import type { ThinkingLevel } from '@maka/core/model-thinking';
-import type { UiLocale } from '@maka/core/ui-locale';
+import {
+  defineUiMessageCatalog,
+  resolveUiMessageCatalog,
+  type UiLocale,
+} from '@maka/core/ui-locale';
+import { TUI_COPY_RESOURCES } from './tui-copy-catalog.js';
 import { isActiveShellRunStatus } from '@maka/core/shell-run';
 import { mergeShellRunStateWithDiagnostics } from '@maka/core/shell-run-result';
 import { projectToolActivityArgs } from '@maka/core/tool-activity-args';
@@ -48,7 +56,7 @@ import {
 } from '@maka/core/tool-result-status';
 import { type ShellRunUpdate } from '@maka/core/events';
 import { homedir } from 'node:os';
-import { basename } from 'node:path';
+import { basename, isAbsolute, relative, sep } from 'node:path';
 import type { MakaSessionDriver, MakaSideConversationParentStatus } from './session-driver.js';
 import { BoundedChunkBuffer } from './bounded-chunk-buffer.js';
 import { ansi } from './tui-ansi.js';
@@ -117,7 +125,10 @@ export interface MakaPiTranscriptState {
   providerRetry?: ProviderRetryCountdown;
 }
 
-export type MakaPiPendingInteraction = SandboxBoundaryRequestEvent | UserQuestionRequestEvent;
+export type MakaPiPendingInteraction =
+  | SandboxBoundaryRequestEvent
+  | UserQuestionRequestEvent
+  | FormRequestEvent;
 
 /**
  * A provider retry event plus the CLIENT-local time it was applied. Counting
@@ -381,7 +392,7 @@ export function applyShellRunUpdateToTranscript(
 /** Adds a local-only card for a `!<command>` resource without creating a model turn. */
 export function appendUserCommandToTranscript(
   state: MakaPiTranscriptState,
-  input: { commandId: string; command: string; result: ShellRunSnapshotResult },
+  input: { commandId: string; command: string; result: ShellRunStateResult },
 ): void {
   state.entries.push({
     kind: 'tool',
@@ -859,7 +870,7 @@ export function applyMakaSessionEventToTranscript(
       }
       if (tool) {
         if (tool.suppressed) unsuppressToolAtTail(state, tool);
-        tool.callStatus = toolResultActivityStatus(event.isError, event.content);
+        tool.callStatus = toolResultActivityStatus(event.isError, event.content, event.outcome);
         if (shellRun) {
           if (tool.toolName === 'Bash') {
             applyShellRunResult(tool, shellRun);
@@ -887,7 +898,7 @@ export function applyMakaSessionEventToTranscript(
           ...(!event.contentOmitted ? { result: event.content } : {}),
           resultVersion: event.contentOmitted ? 0 : 1,
           durationMs: event.durationMs,
-          callStatus: toolResultActivityStatus(event.isError, event.content),
+          callStatus: toolResultActivityStatus(event.isError, event.content, event.outcome),
           expanded: state.expandAllTools,
         });
       }
@@ -931,6 +942,9 @@ export function applyMakaSessionEventToTranscript(
     case 'user_question_request':
       enqueuePendingInteraction(state, event);
       break;
+    case 'form_request':
+      enqueuePendingInteraction(state, event);
+      break;
 
     case 'sandbox_boundary_decision_ack':
       {
@@ -947,6 +961,10 @@ export function applyMakaSessionEventToTranscript(
       break;
 
     case 'user_question_answer_ack':
+      completePendingInteraction(state, event.requestId);
+      break;
+
+    case 'form_answer_ack':
       completePendingInteraction(state, event.requestId);
       break;
 
@@ -1049,14 +1067,22 @@ function storedMessagesToTranscriptEntries(
   messages: readonly StoredMessage[],
 ): MakaPiTranscriptEntry[] {
   const entries: MakaPiTranscriptEntry[] = [];
-  const resultsByToolUseId = new Map(
-    messages
-      .filter(
-        (message): message is Extract<StoredMessage, { type: 'tool_result' }> =>
-          message.type === 'tool_result',
-      )
-      .map((message) => [message.toolUseId, message]),
-  );
+  const latestCallsByUseId = new Map<string, Extract<StoredMessage, { type: 'tool_call' }>>();
+  const resultsByCall = new Map<
+    Extract<StoredMessage, { type: 'tool_call' }>,
+    Extract<StoredMessage, { type: 'tool_result' }>
+  >();
+  // Append order bounds an opaque ID's ownership: a result belongs to the latest
+  // preceding call, and a later call with that ID starts a new interval.
+  for (const message of messages) {
+    if (message.type === 'tool_call') {
+      latestCallsByUseId.set(message.id, message);
+      continue;
+    }
+    if (message.type !== 'tool_result') continue;
+    const call = latestCallsByUseId.get(message.toolUseId);
+    if (call) resultsByCall.set(call, message);
+  }
   const turnStatusById = new Map(
     deriveTurnRecords(messages).map((turn) => [turn.turnId, turn.status]),
   );
@@ -1094,7 +1120,7 @@ function storedMessagesToTranscriptEntries(
         entries.push(
           storedToolToTranscriptEntry(
             message,
-            resultsByToolUseId.get(message.id),
+            resultsByCall.get(message),
             turnStatusById.get(message.turnId),
           ),
         );
@@ -1131,7 +1157,7 @@ function storedToolToTranscriptEntry(
     resultVersion: result ? 1 : 0,
     ...(result?.durationMs !== undefined ? { durationMs: result.durationMs } : {}),
     callStatus: result
-      ? toolResultActivityStatus(result.isError, result.content)
+      ? toolResultActivityStatus(result.isError, result.content, result.outcome)
       : unfinishedToolActivityStatus(turnStatus),
     expanded: false,
   };
@@ -1328,24 +1354,55 @@ function tokenDelta(before: number | undefined, after: number | undefined): numb
 }
 
 function systemNoteText(message: SystemNoteMessage): string | undefined {
+  // Retired kinds are still decoded off legacy transcript rows, and none of
+  // them ever had a line here worth reading.
+  if (!isRuntimeSystemNoteKind(message.kind)) return undefined;
   switch (message.kind) {
-    case 'session_start':
-    case 'session_resume':
-      return undefined;
-    case 'mode_change':
-      return 'Permission mode changed.';
-    case 'model_change':
-      return 'Model changed.';
     case 'context_compacted':
       return 'Context compacted to keep this task within the model window.';
     case 'context_compaction_failed_open':
       return 'Context summary failed; the session continued without a new summary.';
+    case 'context_overflow_after_compaction':
+      return 'History was compacted and the provider still called this request too large. What remains also carries the system prompt, the tool schemas, the summary and the recent tail; shortening this message is the part you control.';
+    case 'context_reported_window_exceeded': {
+      const data = message.data as
+        | { usedTokens?: unknown; reportedContextWindow?: unknown }
+        | undefined;
+      const used = typeof data?.usedTokens === 'number' ? data.usedTokens : undefined;
+      const reported =
+        typeof data?.reportedContextWindow === 'number' ? data.reportedContextWindow : undefined;
+      if (used === undefined || reported === undefined) {
+        return 'This exchange ran past the context window this model reports, and the provider accepted it anyway.';
+      }
+      return `This exchange used about ${used} tokens, past the ${reported} this model reports, and the provider accepted it without complaint. Nothing is declared, so Maka does not compact on its own; declare a context window to have it compact first.`;
+    }
+    case 'context_window_overrun': {
+      const data = message.data as
+        | { usedTokens?: unknown; declaredContextWindow?: unknown }
+        | undefined;
+      const used = typeof data?.usedTokens === 'number' ? data.usedTokens : undefined;
+      const declared =
+        typeof data?.declaredContextWindow === 'number' ? data.declaredContextWindow : undefined;
+      if (used === undefined || declared === undefined) {
+        return 'This exchange ran past the context window declared for this model.';
+      }
+      return `This exchange used about ${used} tokens against the declared window of ${declared}: the reply needed more room than was left. Maka compacts before the next request; raise the window if the replies should stay whole.`;
+    }
+    case 'context_window_suggestion': {
+      const data = message.data as
+        | { suggestedContextWindow?: unknown; declaredContextWindow?: unknown }
+        | undefined;
+      const tokens =
+        typeof data?.suggestedContextWindow === 'number' ? data.suggestedContextWindow : undefined;
+      const declared =
+        typeof data?.declaredContextWindow === 'number' ? data.declaredContextWindow : undefined;
+      if (tokens === undefined) return 'The provider rejected this request as too large.';
+      return declared === undefined
+        ? `The provider rejected this request. No context window is declared for this model; the last accepted request was about ${tokens} tokens — declare that as the window so Maka compacts first.`
+        : `The provider rejected this request at about ${tokens} tokens, below the declared window of ${declared}. The declaration is likely larger than the provider's window; consider lowering it to ${tokens}.`;
+    }
     case 'step_limit':
       return STEP_LIMIT_NOTICE_TEXT;
-    case 'error':
-      return 'Session recorded an error.';
-    case 'abort':
-      return 'Session was stopped.';
   }
 }
 
@@ -1435,6 +1492,10 @@ export function activeUserQuestionRequest(
   return state.pendingInteraction?.type === 'user_question_request'
     ? state.pendingInteraction
     : undefined;
+}
+
+export function activeFormRequest(state: MakaPiTranscriptState): FormRequestEvent | undefined {
+  return state.pendingInteraction?.type === 'form_request' ? state.pendingInteraction : undefined;
 }
 
 function enqueuePendingInteraction(
@@ -1868,32 +1929,44 @@ function formatElapsedDuration(elapsedMs: number): string {
  * Pending-queue bar shown above the editor while messages are queued. Each
  * steering message reads `Steering: <text>` (injected into the running turn at
  * the next step boundary); each followup reads `Queued: <text>` (opens the next
- * turn). A trailing hint reminds the user that alt+↑ takes them back to edit.
+ * turn). A trailing hint reminds the user that Shift+← takes them back to edit.
  * Renders nothing when both queues are empty.
  */
+interface TuiPendingQueueCopy {
+  readonly steeringLabel: string;
+  readonly queuedLabel: string;
+  readonly requeueHint: string;
+}
+
+const TUI_PENDING_QUEUE_COPY = resolveUiMessageCatalog(
+  defineUiMessageCatalog<TuiPendingQueueCopy>()(TUI_COPY_RESOURCES['pending-queue']),
+);
+
 export function renderMakaPiPendingQueue(
   state: MakaPiTranscriptState,
   width: number,
-  platform: NodeJS.Platform = process.platform,
+  platform: NodeJS.Platform,
+  locale: UiLocale,
 ): string[] {
   if (state.steering.length === 0 && state.followup.length === 0) {
     return [];
   }
+  const copy = TUI_PENDING_QUEUE_COPY[locale];
   const safeWidth = Math.max(1, width);
   const steering = state.steering;
   const followup = state.followup;
   const lines: string[] = [];
   for (const text of steering) {
     lines.push(
-      fitLine(`${ansi.accent('Steering:')} ${ansi.dim(firstLinePreview(text))}`, safeWidth),
+      fitLine(`${ansi.accent(copy.steeringLabel)} ${ansi.dim(firstLinePreview(text))}`, safeWidth),
     );
   }
   for (const text of followup) {
-    lines.push(fitLine(`${ansi.dim('Queued:')} ${ansi.dim(firstLinePreview(text))}`, safeWidth));
+    lines.push(
+      fitLine(`${ansi.dim(copy.queuedLabel)} ${ansi.dim(firstLinePreview(text))}`, safeWidth),
+    );
   }
-  lines.push(
-    fitLine(ansi.dim(renderTuiShortcutCopy('Alt+↑ 取回队列以重新编辑', platform)), safeWidth),
-  );
+  lines.push(fitLine(ansi.dim(renderTuiShortcutCopy(copy.requeueHint, platform)), safeWidth));
   return lines;
 }
 
@@ -1921,12 +1994,19 @@ function firstLinePreview(text: string): string {
  * Shorten an absolute path to a `~`-relative form for the statusline.
  * `/Users/alice/workspace/project` → `~/workspace/project`.
  * Falls back to the original path if it is not under the home directory.
+ * Comparison runs through `path.relative`, so Windows profile paths and
+ * case-only differences shorten as well; the remainder keeps its native
+ * separators (`~/Videos\Clips` on Windows).
  */
-function shortenCwd(cwd: string, homeDir?: string): string {
+export function shortenCwd(cwd: string, homeDir?: string): string {
   const home = homeDir ?? homedir();
-  if (home && cwd.startsWith(home + '/')) return `~${cwd.slice(home.length)}`;
-  if (home && cwd === home) return '~';
-  return cwd;
+  if (!home) return cwd;
+  const rel = relative(home, cwd);
+  if (rel === '') return '~';
+  if (isAbsolute(rel) || rel === '..' || rel.startsWith(`..${sep}`)) {
+    return cwd;
+  }
+  return `~/${rel}`;
 }
 
 function formatCost(costUsd: number): string {
@@ -2058,8 +2138,15 @@ function findShellRunParent(
 /** The runtime-resource ref a tool call is aimed at, when the args carry one. */
 function readArgsRef(args: unknown): string | undefined {
   const ref =
-    args !== null && typeof args === 'object' ? (args as { ref?: unknown }).ref : undefined;
-  return typeof ref === 'string' && ref.length > 0 ? ref : undefined;
+    args !== null && typeof args === 'object'
+      ? ((args as { path?: unknown }).path ?? (args as { ref?: unknown }).ref)
+      : undefined;
+  if (typeof ref !== 'string' || !ref) return undefined;
+  try {
+    return resolveReadInput({ path: ref }).path;
+  } catch {
+    return undefined;
+  }
 }
 
 /**

@@ -17,6 +17,7 @@
  * under the License.
  */
 
+import { deferred } from '@maka/core/test-only/async-primitives';
 import assert from 'node:assert/strict';
 import { afterEach, test } from 'node:test';
 import { act, createElement } from 'react';
@@ -31,17 +32,6 @@ import {
   type ScheduledTasksToastApi,
 } from '../../renderer/features/module-hub/testing.js';
 import { cleanupFakeDom, installReactRenderer } from './fake-dom.js';
-
-function deferred<T>() {
-  let resolve!: (value: T) => void;
-  let reject!: (reason?: unknown) => void;
-  const promise = new Promise<T>((settle, fail) => {
-    resolve = settle;
-    reject = fail;
-  });
-  return { promise, reject, resolve };
-}
-
 function task(id: string, title = id): ScheduledTask {
   return {
     id,
@@ -491,4 +481,50 @@ test('subscriptions refresh, due navigation action is live, disposers run, and n
 afterEach(() => {
   latest = undefined;
   cleanupFakeDom();
+});
+
+test('Scheduled Tasks refresh failures stay silent while the default Host is unavailable', async () => {
+  const { root } = installReactRenderer();
+  const records: ToastRecord[] = [];
+  const host = { profileId: 'profile-a', hostId: 'host-a' };
+  let defaultHost: typeof host | undefined;
+  const defaults = createFakeModuleHubServices();
+  const services = createFakeModuleHubServices({
+    runtimeHosts: {
+      ...defaults.runtimeHosts,
+      getDefault: async () => {
+        if (!defaultHost) throw new Error('identity is unavailable');
+        return defaultHost;
+      },
+    },
+    scheduledTasks: {
+      ...defaults.scheduledTasks,
+      list: async () => [task('ready-task')],
+    },
+  });
+  await act(async () =>
+    renderController(root, services, {
+      selection: activeSelection,
+      selectModule: () => undefined,
+      toastApi: toastRecorder(records),
+    }),
+  );
+
+  await act(async () => controller().refresh());
+  assert.deepEqual(records, []);
+  assert.deepEqual(controller().scheduledTasks, []);
+
+  defaultHost = host;
+  await act(async () => controller().refresh());
+  assert.deepEqual(
+    controller().scheduledTasks.map(({ id }) => id),
+    ['ready-task'],
+  );
+  assert.deepEqual(records, []);
+
+  services.scheduledTasks.list = async () => {
+    throw new Error('list failed');
+  };
+  await act(async () => controller().refresh());
+  assert.equal(records.filter(({ kind }) => kind === 'error').length, 1);
 });

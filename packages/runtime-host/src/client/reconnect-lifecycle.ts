@@ -49,8 +49,9 @@ export interface RuntimeHostReconnectLifecycle<T extends RuntimeHostReconnectRes
   readonly current: T | undefined;
   waitForCurrent(previous?: T, signal?: AbortSignal): Promise<T>;
   subscribe(listener: (current: T | undefined) => void): () => void;
+  wake(): void;
   suspend(): Promise<RuntimeHostReconnectSuspension<T>>;
-  quiesce(): Promise<RuntimeHostReconnectQuiescence<T>>;
+  quiesce(signal?: AbortSignal): Promise<RuntimeHostReconnectQuiescence<T>>;
   close(): Promise<void>;
 }
 
@@ -71,16 +72,31 @@ export class RuntimeHostPermanentReconnectError extends Error {
   }
 }
 
-export async function startRuntimeHostReconnectLifecycle<
-  T extends RuntimeHostReconnectResource,
->(input: {
+export interface RuntimeHostReconnectLifecycleInput<T extends RuntimeHostReconnectResource> {
   readonly initial?: T;
   readonly connect: (signal: AbortSignal) => Promise<T>;
+  /** A predicate applies until the first successful connection, not to later reconnects. */
+  readonly retryInitialFailure?: boolean | ((error: Error) => boolean);
+  readonly initialSignal?: AbortSignal;
   readonly onReconnectError?: (error: Error) => void;
   readonly onFatalError?: (error: Error) => void;
   readonly backoff?: RuntimeHostReconnectBackoff;
-}): Promise<RuntimeHostReconnectLifecycle<T>> {
-  const lifecycle = new RuntimeHostReconnectLifecycleImpl(input);
+}
+
+/**
+ * A lifecycle that exists before its first connection. `waitForCurrent` parks
+ * until `start()` installs one and rejects if the start fails permanently.
+ */
+export function createRuntimeHostReconnectLifecycle<T extends RuntimeHostReconnectResource>(
+  input: RuntimeHostReconnectLifecycleInput<T>,
+): RuntimeHostReconnectLifecycle<T> & { start(): Promise<void> } {
+  return new RuntimeHostReconnectLifecycleImpl(input);
+}
+
+export async function startRuntimeHostReconnectLifecycle<T extends RuntimeHostReconnectResource>(
+  input: RuntimeHostReconnectLifecycleInput<T>,
+): Promise<RuntimeHostReconnectLifecycle<T>> {
+  const lifecycle = createRuntimeHostReconnectLifecycle(input);
   await lifecycle.start();
   return lifecycle;
 }
@@ -96,8 +112,11 @@ class RuntimeHostReconnectLifecycleImpl<T extends RuntimeHostReconnectResource>
   implements RuntimeHostReconnectLifecycle<T>
 {
   readonly closed: Promise<void>;
-  readonly #initial: T | undefined;
+  #initial: T | undefined;
   readonly #connect: (signal: AbortSignal) => Promise<T>;
+  readonly #retryInitialFailure: boolean | ((error: Error) => boolean);
+  #connectedOnce = false;
+  readonly #initialSignal: AbortSignal | undefined;
   readonly #onReconnectError: ((error: Error) => void) | undefined;
   readonly #onFatalError: ((error: Error) => void) | undefined;
   readonly #minMs: number;
@@ -116,21 +135,20 @@ class RuntimeHostReconnectLifecycleImpl<T extends RuntimeHostReconnectResource>
   #closed = false;
   #quiesced = false;
   #terminalError: Error | undefined;
+  #startTask: Promise<void> | undefined;
   #reconnectTask: Promise<void> | undefined;
   #reconnectAbort: AbortController | undefined;
   #discardTask: Promise<void> = Promise.resolve();
   #closeTask: Promise<void> | undefined;
   #resolveClosed!: () => void;
+  #wakeDelay: (() => void) | undefined;
+  #wakeGeneration = 0;
 
-  constructor(input: {
-    readonly initial?: T;
-    readonly connect: (signal: AbortSignal) => Promise<T>;
-    readonly onReconnectError?: (error: Error) => void;
-    readonly onFatalError?: (error: Error) => void;
-    readonly backoff?: RuntimeHostReconnectBackoff;
-  }) {
+  constructor(input: RuntimeHostReconnectLifecycleInput<T>) {
     this.#connect = input.connect;
     this.#initial = input.initial;
+    this.#retryInitialFailure = input.retryInitialFailure ?? false;
+    this.#initialSignal = input.initialSignal;
     this.#onReconnectError = input.onReconnectError;
     this.#onFatalError = input.onFatalError;
     this.#minMs = requireDelay(input.backoff?.minMs ?? DEFAULT_BACKOFF_MIN_MS, 'minMs');
@@ -160,11 +178,47 @@ class RuntimeHostReconnectLifecycleImpl<T extends RuntimeHostReconnectResource>
     return this.#current;
   }
 
-  async start(): Promise<void> {
+  start(): Promise<void> {
+    if (this.#closed)
+      return Promise.reject(new Error('Runtime Host reconnect lifecycle is closed'));
+    if (this.#startTask) return this.#startTask;
+    const task = deferredTask();
+    this.#startTask = task.promise;
+    void this.#start().then(task.resolve, task.reject);
+    return task.promise;
+  }
+
+  async #start(): Promise<void> {
     try {
-      this.#install(this.#initial ?? (await this.#connect(this.#abort.signal)));
+      const initial = this.#initial;
+      this.#initial = undefined;
+      if (initial) {
+        this.#install(initial);
+        return;
+      }
+      this.#initialSignal?.throwIfAborted();
+      const signal = this.#initialSignal
+        ? AbortSignal.any([this.#abort.signal, this.#initialSignal])
+        : this.#abort.signal;
+      this.#install(await this.#connect(signal));
     } catch (error) {
-      this.#failPermanently(asError(error));
+      if (this.#closed) throw error;
+      const failure = asError(error);
+      if (
+        (typeof this.#retryInitialFailure === 'function'
+          ? this.#retryInitialFailure(failure)
+          : this.#retryInitialFailure) &&
+        !this.#closed &&
+        !this.#abort.signal.aborted &&
+        !this.#initialSignal?.aborted &&
+        !(failure instanceof RuntimeHostPermanentReconnectError)
+      ) {
+        this.#failureCount += 1;
+        notifyError(this.#onReconnectError, failure);
+        this.#scheduleReconnect();
+        return;
+      }
+      this.#failPermanently(failure);
       throw error;
     }
   }
@@ -197,6 +251,13 @@ class RuntimeHostReconnectLifecycleImpl<T extends RuntimeHostReconnectResource>
     return () => this.#listeners.delete(listener);
   }
 
+  wake(): void {
+    this.#wakeGeneration += 1;
+    const wake = this.#wakeDelay;
+    this.#wakeDelay = undefined;
+    wake?.();
+  }
+
   async suspend(): Promise<RuntimeHostReconnectSuspension<T>> {
     if (this.#closed || this.#terminalError) {
       throw new Error('Runtime Host reconnect lifecycle is closed');
@@ -212,7 +273,8 @@ class RuntimeHostReconnectLifecycleImpl<T extends RuntimeHostReconnectResource>
     return this.#suspension(this.#current);
   }
 
-  async quiesce(): Promise<RuntimeHostReconnectQuiescence<T>> {
+  async quiesce(signal?: AbortSignal): Promise<RuntimeHostReconnectQuiescence<T>> {
+    signal?.throwIfAborted();
     while (!this.#current) {
       if (this.#closed || this.#terminalError) {
         throw new Error('Runtime Host reconnect lifecycle is closed');
@@ -220,8 +282,9 @@ class RuntimeHostReconnectLifecycleImpl<T extends RuntimeHostReconnectResource>
       if (this.#quiesced) {
         throw new Error('Runtime Host reconnect lifecycle is already quiesced');
       }
-      await this.waitForCurrent();
+      await this.waitForCurrent(undefined, signal);
     }
+    signal?.throwIfAborted();
     if (this.#closed || this.#terminalError) {
       throw new Error('Runtime Host reconnect lifecycle is closed');
     }
@@ -232,8 +295,11 @@ class RuntimeHostReconnectLifecycleImpl<T extends RuntimeHostReconnectResource>
   }
 
   close(): Promise<void> {
-    this.#closeTask ??= this.#close();
-    return this.#closeTask;
+    if (this.#closeTask) return this.#closeTask;
+    const task = deferredTask();
+    this.#closeTask = task.promise;
+    void this.#close().then(task.resolve, task.reject);
+    return task.promise;
   }
 
   async #close(): Promise<void> {
@@ -244,9 +310,11 @@ class RuntimeHostReconnectLifecycleImpl<T extends RuntimeHostReconnectResource>
     this.#abort.abort();
     const error = new Error('Runtime Host reconnect lifecycle is closed');
     this.#rejectWaiters(error);
-    const current = this.#current;
+    const current = this.#current ?? this.#initial;
+    this.#initial = undefined;
     this.#setCurrent(undefined);
     await current?.close().catch(() => undefined);
+    await this.#startTask?.catch(() => undefined);
     await this.#reconnectTask?.catch(() => undefined);
     await this.#discardTask;
     this.#resolveClosed();
@@ -258,6 +326,7 @@ class RuntimeHostReconnectLifecycleImpl<T extends RuntimeHostReconnectResource>
       return;
     }
     this.#installedAt = this.#now();
+    this.#connectedOnce = true;
     this.#setCurrent(resource);
     void resource.closed.then(
       () => this.#disconnected(resource),
@@ -287,20 +356,25 @@ class RuntimeHostReconnectLifecycleImpl<T extends RuntimeHostReconnectResource>
     )
       return;
     const reconnectAbort = new AbortController();
-    const task = this.#reconnect(AbortSignal.any([this.#abort.signal, reconnectAbort.signal]));
+    const task = deferredTask();
     this.#reconnectAbort = reconnectAbort;
-    this.#reconnectTask = task;
+    this.#reconnectTask = task.promise;
+    void this.#reconnect(AbortSignal.any([this.#abort.signal, reconnectAbort.signal])).then(
+      task.resolve,
+      task.reject,
+    );
     const finalize = () => {
-      if (this.#reconnectTask === task) {
+      if (this.#reconnectTask === task.promise) {
         this.#reconnectTask = undefined;
         this.#reconnectAbort = undefined;
       }
       this.#scheduleReconnect();
     };
-    void task.then(finalize, finalize);
+    void task.promise.then(finalize, finalize);
   }
 
   async #reconnect(signal: AbortSignal): Promise<void> {
+    let attemptedWakeGeneration = this.#wakeGeneration;
     while (!this.#closed && !this.#quiesced && !this.#terminalError && !this.#current) {
       const delayMs = reconnectDelayMs(
         this.#failureCount - 1,
@@ -309,20 +383,51 @@ class RuntimeHostReconnectLifecycleImpl<T extends RuntimeHostReconnectResource>
         this.#random,
         this.#unstableMaxMs,
       );
+      const wakeGeneration = this.#wakeGeneration;
       try {
-        if (delayMs > 0) await this.#wait(delayMs, signal);
+        if (delayMs > 0 && wakeGeneration === attemptedWakeGeneration) {
+          await this.#waitForReconnectDelay(delayMs, signal, wakeGeneration);
+        }
+        attemptedWakeGeneration = this.#wakeGeneration;
         const resource = await this.#connect(signal);
         this.#install(resource);
       } catch (error) {
         if (this.#closed || this.#quiesced || signal.aborted) return;
         const failure = asError(error);
-        if (failure instanceof RuntimeHostPermanentReconnectError) {
+        if (
+          failure instanceof RuntimeHostPermanentReconnectError ||
+          (!this.#connectedOnce &&
+            typeof this.#retryInitialFailure === 'function' &&
+            !this.#retryInitialFailure(failure))
+        ) {
           this.#failPermanently(failure);
           return;
         }
         this.#failureCount += 1;
         notifyError(this.#onReconnectError, failure);
       }
+    }
+  }
+
+  async #waitForReconnectDelay(
+    delayMs: number,
+    signal: AbortSignal,
+    observedWakeGeneration: number,
+  ): Promise<void> {
+    if (this.#wakeGeneration !== observedWakeGeneration) return;
+    let wake!: () => void;
+    const routeAvailable = new Promise<void>((resolve) => {
+      wake = resolve;
+    });
+    const delayAbort = new AbortController();
+    const delaySignal = AbortSignal.any([signal, delayAbort.signal]);
+    this.#wakeDelay = wake;
+    if (this.#wakeGeneration !== observedWakeGeneration) wake();
+    try {
+      await Promise.race([this.#wait(delayMs, delaySignal), routeAvailable]);
+    } finally {
+      if (this.#wakeDelay === wake) this.#wakeDelay = undefined;
+      delayAbort.abort();
     }
   }
 
@@ -361,12 +466,12 @@ class RuntimeHostReconnectLifecycleImpl<T extends RuntimeHostReconnectResource>
   }
 
   #failPermanently(error: Error): void {
-    if (this.#terminalError) return;
+    if (this.#closed || this.#terminalError) return;
     this.#terminalError = error;
-    this.#abort.abort();
     this.#rejectWaiters(error);
+    // Acquisition tasks must settle before close can finish joining them.
+    void this.close();
     notifyError(this.#onFatalError, error);
-    this.#resolveClosed();
   }
 
   #rejectWaiters(error: Error): void {
@@ -376,6 +481,20 @@ class RuntimeHostReconnectLifecycleImpl<T extends RuntimeHostReconnectResource>
     }
     this.#waiters.clear();
   }
+}
+
+function deferredTask(): {
+  promise: Promise<void>;
+  resolve: () => void;
+  reject: (error: unknown) => void;
+} {
+  let resolve!: () => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<void>((resolveTask, rejectTask) => {
+    resolve = resolveTask;
+    reject = rejectTask;
+  });
+  return { promise, resolve, reject };
 }
 
 function notifyError(listener: ((error: Error) => void) | undefined, error: Error): void {

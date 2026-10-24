@@ -24,7 +24,6 @@ import type { MakaTool } from '@maka/runtime/tool-runtime';
 const ACTIONS_WITHOUT_OBSERVATION_OWNERSHIP = new Set([
   'list_apps',
   'wait',
-  'cursor_position',
 ]);
 
 export interface ComputerUseRealModelPolicy {
@@ -110,12 +109,14 @@ export function applyComputerUseRealModelPolicy(
         totalActions += 1;
         if (totalActions > policy.maxTotalActions) {
           return {
+            outcome: 'error',
             text: 'maka_computer failed: total_action_budget_exceeded',
             error: 'total_action_budget_exceeded',
           };
         }
         if (!allowed.has(action)) {
           return {
+            outcome: 'error',
             text: `maka_computer.${action} failed: unsupported_action_policy`,
             error: 'unsupported_action_policy',
           };
@@ -126,6 +127,7 @@ export function applyComputerUseRealModelPolicy(
           && (typeof app !== 'string' || !allowedApps.has(app))
         ) {
           return {
+            outcome: 'error',
             text: `maka_computer.${action} failed: target_policy_mismatch`,
             error: 'target_policy_mismatch',
           };
@@ -143,6 +145,7 @@ export function applyComputerUseRealModelPolicy(
           )
         ) {
           return {
+            outcome: 'error',
             text: `maka_computer.${action} failed: target_policy_mismatch`,
             error: 'target_policy_mismatch',
           };
@@ -151,6 +154,7 @@ export function applyComputerUseRealModelPolicy(
         actionCounts.set(action, actionCount);
         if (actionCount > (policy.maxActionCounts[action] ?? 0)) {
           return {
+            outcome: 'error',
             text: `maka_computer.${action} failed: action_budget_exceeded`,
             error: 'action_budget_exceeded',
           };

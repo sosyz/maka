@@ -17,6 +17,7 @@
  * under the License.
  */
 
+import { withTimeout } from '@maka/core/test-only/async-primitives';
 import { defineInteractiveRuntimeHostComposition } from '../server/host-composition.js';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm } from 'node:fs/promises';
@@ -122,6 +123,7 @@ test('two Clients query and control one Agent graph through Session invalidation
       sessionId: ROOT_SESSION_ID,
       transcript: { kind: 'none' },
     });
+    await subscription.ready();
 
     const [desktopSnapshot, tuiSnapshot] = await Promise.all([
       desktop.request('agent.graph.query', { rootSessionId: ROOT_SESSION_ID }),
@@ -366,18 +368,4 @@ function canonical(hostEpoch: string): CanonicalSessionProjection {
     queue: { hostEpoch, queueRevision: 0, steering: [], followup: [] },
     interactions: { pending: [] },
   };
-}
-
-async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
-  let timer: NodeJS.Timeout | undefined;
-  try {
-    return await Promise.race([
-      promise,
-      new Promise<T>((_, reject) => {
-        timer = setTimeout(() => reject(new Error(message)), timeoutMs);
-      }),
-    ]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
 }

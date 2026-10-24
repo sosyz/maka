@@ -103,37 +103,44 @@ export class SessionTurnAccessRequestCoordinator {
       acquireResidency: this.#acquireResidency,
     };
     try {
-      let outcome: Awaited<ReturnType<OperationHandler<'turn.start'>>>;
-      for (;;) {
-        try {
-          outcome = await this.#startTurn(request.intent, context);
-        } catch {
-          this.#requestDrain();
-          return;
-        }
-        if (outcome.ok || outcome.error.code !== 'session_busy') break;
-        const whenIdle = this.#whenIdle(request.intent.sessionId);
-        if (whenIdle) {
-          try {
-            await whenIdle;
-          } catch {
-            this.#requestDrain();
-            return;
-          }
-        }
-        if (this.#draining) return;
-      }
-      if (this.#draining && !outcome.ok) return;
+      const admission = await this.#run(request, context);
+      if (!admission) return;
       try {
-        await this.#authority.completeTurnAccessRequest(
-          request.requestId,
-          outcome.ok ? outcome.result.kind : 'failed',
-        );
+        await this.#authority.completeTurnAccessRequest(request.requestId, admission);
       } catch {
         this.#requestDrain();
       }
     } finally {
       residency.release();
+    }
+  }
+
+  async #run(
+    request: SessionTurnAccessRequest,
+    context: ConnectionContext,
+  ): Promise<'started' | 'blocked' | 'failed' | undefined> {
+    for (;;) {
+      try {
+        if (!('content' in request.intent)) return 'failed';
+        const outcome = await this.#startTurn(request.intent, context);
+        if (outcome.ok) return outcome.result.kind;
+        if (outcome.error.code !== 'session_busy') {
+          return this.#draining ? undefined : 'failed';
+        }
+      } catch {
+        this.#requestDrain();
+        return undefined;
+      }
+      const whenIdle = this.#whenIdle(request.intent.sessionId);
+      if (whenIdle) {
+        try {
+          await whenIdle;
+        } catch {
+          this.#requestDrain();
+          return undefined;
+        }
+      }
+      if (this.#draining) return undefined;
     }
   }
 

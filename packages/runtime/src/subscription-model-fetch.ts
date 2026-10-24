@@ -17,7 +17,6 @@
  * under the License.
  */
 
-import { redactSecrets } from '@maka/core/redaction';
 import type { RuntimeExecutionConnection } from '@maka/core/llm-connections';
 import {
   GITHUB_COPILOT_API_VERSION,
@@ -30,8 +29,14 @@ export interface SubscriptionModelFetchInput {
   sessionId: string;
   modelId: string;
   fetchFn?: typeof fetch;
-  /** Force-refreshes a remotely invalidated OAuth token for one safe 401 replay. */
-  refreshOAuthAccessToken?: () => Promise<string | null>;
+  /**
+   * Force-refreshes a remotely invalidated OAuth token for one safe 401 replay.
+   *
+   * Receives the request's own signal: a caller who cancels during the refresh
+   * is released then, instead of waiting out the refresh timeout for a replay
+   * that will never be sent.
+   */
+  refreshOAuthAccessToken?: (signal?: AbortSignal | null) => Promise<string | null>;
 }
 
 export function buildSubscriptionModelFetch(
@@ -45,7 +50,12 @@ export function buildSubscriptionModelFetch(
     );
   }
   if (input.connection.providerType === 'github-copilot') {
-    return buildGitHubCopilotFetch(input.fetchFn ?? fetch);
+    const copilotFetch = buildGitHubCopilotFetch(input.fetchFn ?? fetch);
+    // The editor headers stay innermost so a replayed request carries them
+    // exactly as the first attempt did.
+    return input.refreshOAuthAccessToken
+      ? buildOAuth401ReplayFetch(copilotFetch, input.refreshOAuthAccessToken)
+      : copilotFetch;
   }
   if (input.connection.providerType === 'xai-oauth' && input.refreshOAuthAccessToken) {
     return buildOAuth401ReplayFetch(input.fetchFn ?? fetch, input.refreshOAuthAccessToken);
@@ -117,7 +127,7 @@ function containsGitHubCopilotImage(value: unknown): boolean {
 function buildOpenAiCodexFetch(
   sessionId: string,
   fetchFn: typeof fetch,
-  refreshOAuthAccessToken?: () => Promise<string | null>,
+  refreshOAuthAccessToken?: (signal?: AbortSignal | null) => Promise<string | null>,
 ): typeof fetch {
   return async (url: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
     const headers = new Headers(init?.headers);
@@ -143,14 +153,25 @@ function buildOpenAiCodexFetch(
       return checkedOpenAiCodexFetch(fetchFn, url, { ...init, headers }, refreshOAuthAccessToken);
     }
 
-    return checkedOpenAiCodexFetch(
+    // The Codex backend accepts only streamed requests and rejects
+    // `max_output_tokens`. Tool-free auxiliary calls (titles, goal evaluation,
+    // recap, Daily Review, prompt suggestions) go through `generateText`, so
+    // their request is streamed here and folded back into the one Responses
+    // body a non-streaming caller parses. Their output cap is an internal
+    // constant, so it is dropped. A streaming caller (a main turn) is sent as
+    // is: a cap it carries is the user's model setting and is not discarded
+    // here.
+    const foldStream = parsedBody.stream !== true;
+    const { max_output_tokens: _auxiliaryOutputCap, ...uncappedBody } = parsedBody;
+    const forwardedBody = foldStream ? { ...uncappedBody, stream: true } : parsedBody;
+    const response = await checkedOpenAiCodexFetch(
       fetchFn,
       url,
       {
         ...init,
         headers,
         body: JSON.stringify({
-          ...parsedBody,
+          ...forwardedBody,
           instructions: codexInstructionsFromBody(parsedBody),
           store: false,
           text: {
@@ -168,14 +189,90 @@ function buildOpenAiCodexFetch(
       },
       refreshOAuthAccessToken,
     );
+    return foldStream ? foldOpenAiCodexStream(response) : response;
   };
+}
+
+const OPENAI_CODEX_TERMINAL_EVENTS = new Set([
+  'response.completed',
+  'response.incomplete',
+  'response.failed',
+]);
+
+/**
+ * Folds a Codex Responses event stream into the single response body a
+ * non-streaming Responses caller expects. The backend's terminal event can
+ * carry an empty `output`; the items then arrive only as
+ * `response.output_item.done` events, so they are collected and restored.
+ */
+async function foldOpenAiCodexStream(response: Response): Promise<Response> {
+  // Decide by the body, not `content-type`: against the live backend the
+  // stream did not arrive here with an event-stream content type. A JSON body
+  // passes through unchanged.
+  const text = await response.text();
+  if (text.trimStart().startsWith('{')) {
+    return new Response(text, { status: response.status, headers: response.headers });
+  }
+  const doneItems: unknown[] = [];
+  let terminal: Record<string, unknown> | undefined;
+  let terminalType: string | undefined;
+  for (const block of text.split(/\r?\n\r?\n/)) {
+    const data = block
+      .split(/\r?\n/)
+      .filter((line) => line.startsWith('data:'))
+      .map((line) => line.slice(5).trimStart())
+      .join('\n');
+    if (!data || data === '[DONE]') continue;
+    let event: unknown;
+    try {
+      event = JSON.parse(data);
+    } catch {
+      continue;
+    }
+    if (event === null || typeof event !== 'object') continue;
+    const { type, item, response: eventResponse } = event as Record<string, unknown>;
+    if (type === 'response.output_item.done' && item !== undefined) doneItems.push(item);
+    if (
+      typeof type === 'string' &&
+      OPENAI_CODEX_TERMINAL_EVENTS.has(type) &&
+      eventResponse !== null &&
+      typeof eventResponse === 'object'
+    ) {
+      terminal = eventResponse as Record<string, unknown>;
+      terminalType = type;
+    }
+  }
+  if (!terminal) {
+    throw new Error('Codex OAuth request failed: the stream ended without a terminal response');
+  }
+  if (terminalType === 'response.failed') {
+    const error = terminal.error as { message?: unknown } | null | undefined;
+    throw new Error(
+      `Codex OAuth request failed: ${typeof error?.message === 'string' ? error.message : 'response.failed'}`,
+    );
+  }
+  // An incomplete response carries partial output (e.g. a content filter cut
+  // it off). Folded into a normal body, a caller would take the fragment as
+  // its result, so it is rejected like a failed one.
+  if (terminalType === 'response.incomplete') {
+    const details = terminal.incomplete_details as { reason?: unknown } | null | undefined;
+    throw new Error(
+      `Codex OAuth request incomplete: ${typeof details?.reason === 'string' ? details.reason : 'response.incomplete'}`,
+    );
+  }
+  const output =
+    Array.isArray(terminal.output) && terminal.output.length > 0 ? terminal.output : doneItems;
+  return new Response(JSON.stringify({ ...terminal, output }), {
+    status: response.status,
+    headers: { 'content-type': 'application/json' },
+  });
 }
 
 async function checkedOpenAiCodexFetch(
   fetchFn: typeof fetch,
   url: Parameters<typeof fetch>[0],
   init?: Parameters<typeof fetch>[1],
-  refreshOAuthAccessToken?: () => Promise<string | null>,
+  refreshOAuthAccessToken?: (signal?: AbortSignal | null) => Promise<string | null>,
 ): Promise<Response> {
   const edgeRetryDelaysMs = [2_000, 10_000, 30_000] as const;
   let authorizationReplayUsed = false;
@@ -184,10 +281,7 @@ async function checkedOpenAiCodexFetch(
   for (;;) {
     const response = await fetchFn(url, requestInit);
     if (response.ok) return response;
-    const detail = await response
-      .clone()
-      .text()
-      .catch(() => '');
+    const detail = await response.text().catch(() => '');
     if (
       response.status === 401 &&
       !authorizationReplayUsed &&
@@ -195,7 +289,17 @@ async function checkedOpenAiCodexFetch(
       isReplayableOpenAiCodexRequest(url, requestInit)
     ) {
       authorizationReplayUsed = true;
-      const accessToken = await refreshOAuthAccessToken().catch(() => null);
+      const refreshSignal = effectiveOpenAiCodexRequestSignal(url, requestInit);
+      let accessToken: string | null;
+      try {
+        accessToken = await refreshOAuthAccessToken(refreshSignal);
+      } catch (error) {
+        // Same rule as the shared replay path: an abandoned turn is cancelled,
+        // not reported as a provider rejection.
+        if (refreshSignal?.aborted) await abandonForCaller(response, refreshSignal);
+        accessToken = null;
+      }
+      if (refreshSignal?.aborted) await abandonForCaller(response, refreshSignal);
       if (accessToken) {
         await response.body?.cancel().catch(() => undefined);
         requestInit = withRefreshedOAuthAuthorization(requestInit, accessToken, true);
@@ -225,16 +329,39 @@ async function checkedOpenAiCodexFetch(
 
 function buildOAuth401ReplayFetch(
   fetchFn: typeof fetch,
-  refreshOAuthAccessToken: () => Promise<string | null>,
+  refreshOAuthAccessToken: (signal?: AbortSignal | null) => Promise<string | null>,
 ): typeof fetch {
   return async (url, init) => {
     const response = await fetchFn(url, init);
     if (response.status !== 401 || !isReplayableOpenAiCodexRequest(url, init)) return response;
-    const accessToken = await refreshOAuthAccessToken().catch(() => null);
+    const signal = effectiveOpenAiCodexRequestSignal(url, init);
+    // A caller who gave up is cancelled, not told their credential was
+    // rejected: once the turn is abandoned the 401 answers nothing, and
+    // reporting it would read as an auth failure the user has to act on.
+    if (signal?.aborted) await abandonForCaller(response, signal);
+    let accessToken: string | null;
+    try {
+      accessToken = await refreshOAuthAccessToken(signal);
+    } catch (error) {
+      if (signal?.aborted) await abandonForCaller(response, signal);
+      throw error;
+    }
+    if (signal?.aborted) await abandonForCaller(response, signal);
     if (!accessToken) return response;
     await response.body?.cancel().catch(() => undefined);
     return fetchFn(url, withRefreshedOAuthAuthorization(init, accessToken, false));
   };
+}
+
+/**
+ * Ends a request the caller abandoned: releases the provider body, then throws
+ * the abort reason so the turn settles as cancelled rather than as whatever
+ * status happened to be in flight.
+ */
+async function abandonForCaller(response: Response, signal: AbortSignal): Promise<never> {
+  await response.body?.cancel().catch(() => undefined);
+  signal.throwIfAborted();
+  throw new DOMException('Request aborted', 'AbortError');
 }
 
 function withRefreshedOAuthAuthorization(
@@ -337,7 +464,7 @@ function codexInstructionsFromBody(body: Record<string, unknown>): string {
 }
 
 function formatOpenAiCodexHttpError(statusCode: number, detail: string): string {
-  const compact = redactSecrets(detail).replace(/\s+/g, ' ').trim().slice(0, 240);
+  const compact = detail.replace(/\s+/g, ' ').trim().slice(0, 240);
   return compact
     ? `Codex OAuth request failed: HTTP ${statusCode} ${compact}`
     : `Codex OAuth request failed: HTTP ${statusCode}`;
@@ -352,7 +479,7 @@ function openAiCodexHttpError(
     ? 'openai_codex_edge_rejection'
     : openAiCodexProviderCode(detail);
   const rawRequestId = response.headers.get('x-request-id')?.trim();
-  const requestId = rawRequestId ? redactSecrets(rawRequestId).slice(0, 256) : undefined;
+  const requestId = rawRequestId ? rawRequestId.slice(0, 256) : undefined;
   return Object.assign(new Error(formatOpenAiCodexHttpError(response.status, detail)), {
     name: exhaustedEdgeRejection ? 'OpenAiCodexEdgeRejectionError' : 'OpenAiCodexHttpError',
     ...(exhaustedEdgeRejection ? { code: 'openai_codex_edge_rejection' } : {}),
@@ -373,7 +500,7 @@ function openAiCodexProviderCode(detail: string): string | undefined {
         : root;
     const value = error.code ?? error.type;
     if (typeof value !== 'string' && typeof value !== 'number') return undefined;
-    const normalized = redactSecrets(String(value).trim()).slice(0, 256);
+    const normalized = String(value).trim().slice(0, 256);
     return normalized || undefined;
   } catch {
     return undefined;

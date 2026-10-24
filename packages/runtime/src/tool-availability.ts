@@ -17,12 +17,14 @@
  * under the License.
  */
 
+import type { ToolCategory } from '@maka/core/permission';
 import type { ToolAvailabilityDiagnostic } from '@maka/core/usage-stats/types';
 import MiniSearch from 'minisearch';
 import { z } from 'zod';
 
 import { estimateTokens } from './context-budget-helpers.js';
 import { canonicalizeToolSet, stableHash, toolSchemaCharsForDiagnostics } from './request-shape.js';
+import { toolActivationKey } from './tool-activation-identity.js';
 import type { MakaTool, ToolGating } from './tool-runtime.js';
 
 /** Canonical name of Maka's provider-independent deferred-tool search connector. */
@@ -37,7 +39,6 @@ export const TOOL_SEARCH_MAX_SCHEMA_CHARS = 64 * 1024;
 const DIRECT_TOOL_NAMES: ReadonlySet<string> = new Set([
   'Bash',
   'Read',
-  'ArchiveRead',
   'Write',
   'Edit',
   'Glob',
@@ -45,12 +46,48 @@ const DIRECT_TOOL_NAMES: ReadonlySet<string> = new Set([
   'WebFetch',
   'AskUserQuestion',
   'StopBackgroundTask',
+  // An active execution owns these tools; their schema must be visible so the
+  // model can maintain the Plan state without a deferred-search hop.
+  'update_plan',
+  'cancel_plan',
   // Existing carve-out pending the separate skill-discovery decision.
   'Skill',
   'SkillSearch',
   // Provider-routed equivalent of the direct Write/Edit surface.
   'apply_patch',
 ]);
+
+/**
+ * Discovery capability-family derived from a tool's permission `categoryHint`.
+ *
+ * This reuses the existing permission taxonomy (`ToolCategory`) purely for
+ * *presentation* in the deferred-tool search inventory: it never loads a tool
+ * schema and never affects permission classification. Several permission
+ * categories intentionally collapse into one browsing family (e.g. every shell
+ * bucket → `shell`). `custom_tool` is deliberately `null` so our own
+ * session-scoped tools without a stronger hint keep falling back to `other`.
+ *
+ * The map is TOTAL over `ToolCategory` on purpose: adding a new category to the
+ * union forces an explicit decision here (family or `null`) at compile time,
+ * instead of silently collapsing the new category into `other`.
+ */
+const CATEGORY_FAMILY: Record<ToolCategory, { id: string; label: string } | null> = {
+  read: { id: 'filesystem', label: 'Filesystem & search' },
+  file_write: { id: 'filesystem', label: 'Filesystem & search' },
+  fs_destructive: { id: 'filesystem', label: 'Filesystem & search' },
+  shell_safe: { id: 'shell', label: 'Shell & processes' },
+  shell_unsafe: { id: 'shell', label: 'Shell & processes' },
+  privileged: { id: 'shell', label: 'Shell & processes' },
+  git_destructive: { id: 'shell', label: 'Shell & processes' },
+  web_read: { id: 'web', label: 'Web & network' },
+  network_send: { id: 'web', label: 'Web & network' },
+  browser: { id: 'browser', label: 'Browser automation' },
+  computer_use: { id: 'computer_use', label: 'Computer use' },
+  client_capability: { id: 'client_capability', label: 'Client capabilities' },
+  subagent: { id: 'agents', label: 'Agent orchestration' },
+  // null = intentionally ungrouped; falls back to the `other` bucket.
+  custom_tool: null,
+};
 
 /** Optional search metadata for a subset of the bound deferred tools. */
 export interface ToolGroup {
@@ -96,6 +133,26 @@ function compareExactString(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
+function searchableToolNames(
+  tools: readonly Pick<MakaTool, 'name' | 'discovery'>[],
+  config: ToolAvailabilityConfig | undefined,
+): Set<string> {
+  if (config === undefined) return new Set();
+  return new Set(
+    tools
+      .filter((tool) => !DIRECT_TOOL_NAMES.has(tool.name) && tool.discovery !== 'direct')
+      .map(({ name }) => name),
+  );
+}
+
+/** Returns the synthetic connector names injected by ToolAvailabilityRuntime. */
+export function toolAvailabilityConnectorNames(
+  tools: readonly Pick<MakaTool, 'name' | 'discovery'>[],
+  config: ToolAvailabilityConfig | undefined,
+): string[] {
+  return searchableToolNames(tools, config).size > 0 ? [TOOL_SEARCH_NAME] : [];
+}
+
 /** Everything the backend needs for one turn. */
 export interface ToolAvailabilityPlan {
   /** Full dispatch set (sorted bound tools + search connector + repair fallback). */
@@ -130,13 +187,14 @@ interface SearchDocument {
 /**
  * Immutable, backend-scoped bound-tool inventory and MiniSearch index.
  *
- * Mutable activation belongs to the per-send TurnScope and is passed to
- * prepare(). Constructing one AiSdkBackend therefore constructs one index; all
- * turns on that backend reuse it without sharing activation state.
+ * Mutable activation is passed into prepare(). One AiSdkBackend constructs one
+ * index; Turns on that backend share the Session activation map so later
+ * Turns keep previously activated schemas.
  */
 export class ToolAvailabilityRuntime {
   private readonly tools: readonly MakaTool[];
   private readonly toolsByName: ReadonlyMap<string, MakaTool>;
+  private readonly activationKeysByName: ReadonlyMap<string, `sha256:${string}`>;
   private readonly groups: readonly SearchGroup[];
   private readonly searchableNames: ReadonlySet<string>;
   private readonly directNames: ReadonlySet<string>;
@@ -155,12 +213,10 @@ export class ToolAvailabilityRuntime {
     }
     this.tools = [...tools];
     this.toolsByName = new Map(tools.map((tool) => [tool.name, tool]));
+    this.activationKeysByName = new Map(tools.map((tool) => [tool.name, toolActivationKey(tool)]));
 
     const known = new Set(this.toolsByName.keys());
-    const searchable =
-      config === undefined
-        ? new Set<string>()
-        : new Set([...known].filter((name) => !DIRECT_TOOL_NAMES.has(name)));
+    const searchable = searchableToolNames(this.tools, config);
     const claimed = new Set<string>();
     const groups: SearchGroup[] = [];
     for (const group of config?.groups ?? []) {
@@ -183,11 +239,48 @@ export class ToolAvailabilityRuntime {
     }
     const ungrouped = [...searchable].filter((name) => !claimed.has(name)).sort(compareExactString);
     if (ungrouped.length > 0) {
-      const fallback = groups.find((group) => group.id === 'other');
-      if (fallback) {
-        fallback.toolNames = [...fallback.toolNames, ...ungrouped].sort(compareExactString);
-      } else {
-        groups.push({ id: 'other', toolNames: ungrouped });
+      // Bucket ungrouped native tools by their permission `categoryHint` so the
+      // search inventory advertises a compact capability-family map instead of a
+      // single opaque `other` group. This reads metadata already on the bound
+      // tool (no schema is loaded) and never affects permission classification.
+      // A caller-supplied group with a colliding id keeps precedence: family
+      // members merge into it. Tools with no hint (or `custom_tool`) still fall
+      // back to `other`.
+      const familyMembers = new Map<string, { label?: string; names: string[] }>();
+      const otherNames: string[] = [];
+      for (const name of ungrouped) {
+        const hint = this.toolsByName.get(name)?.categoryHint;
+        // A mapped-but-`null` entry (e.g. custom_tool) and an absent hint both
+        // route to `other`; only a non-null family is bucketed.
+        const family = hint ? CATEGORY_FAMILY[hint] : null;
+        if (!family) {
+          otherNames.push(name);
+          continue;
+        }
+        const bucket = familyMembers.get(family.id) ?? { label: family.label, names: [] };
+        bucket.names.push(name);
+        familyMembers.set(family.id, bucket);
+      }
+      for (const id of [...familyMembers.keys()].sort(compareExactString)) {
+        const bucket = familyMembers.get(id)!;
+        const existing = groups.find((group) => group.id === id);
+        if (existing) {
+          existing.toolNames = [...existing.toolNames, ...bucket.names].sort(compareExactString);
+        } else {
+          groups.push({
+            id,
+            toolNames: [...bucket.names].sort(compareExactString),
+            ...(bucket.label !== undefined ? { label: bucket.label } : {}),
+          });
+        }
+      }
+      if (otherNames.length > 0) {
+        const fallback = groups.find((group) => group.id === 'other');
+        if (fallback) {
+          fallback.toolNames = [...fallback.toolNames, ...otherNames].sort(compareExactString);
+        } else {
+          groups.push({ id: 'other', toolNames: otherNames.sort(compareExactString) });
+        }
       }
     }
     this.groups = groups;
@@ -233,7 +326,7 @@ export class ToolAvailabilityRuntime {
   }
 
   prepare(
-    activeTools: Map<string, MakaTool>,
+    activeTools: Map<string, string>,
     requiredToolNames: ReadonlySet<string> = new Set(),
   ): ToolAvailabilityPlan {
     if (!this.searchIndex) {
@@ -246,11 +339,20 @@ export class ToolAvailabilityRuntime {
       };
     }
 
-    const connector = this.buildSearchConnector(activeTools);
+    const requiredNames = [...requiredToolNames].filter((name) => this.toolsByName.has(name));
+    const requiredNameSet = new Set(requiredNames);
+    // Required names are already on the provider list. Omit them from the
+    // search inventory so an exact-name search does not "activate" them again.
+    const connector = this.buildSearchConnector(activeTools, requiredNameSet);
     const allTools = [...this.tools, connector];
     const canonical = canonicalizeToolSet(allTools, this.invalidTool);
     const knownNames = new Set(canonical.providerTools.map((tool) => tool.name));
-    const requiredNames = [...requiredToolNames].filter((name) => knownNames.has(name));
+    // Activation belongs to a stable logical contribution, not a temporary
+    // wrapper object or merely its name. Equivalent Host wrappers survive
+    // per-step rebuilding; a replaced Plugin generation does not.
+    for (const [name, activatedKey] of activeTools) {
+      if (this.activationKeysByName.get(name) !== activatedKey) activeTools.delete(name);
+    }
     const step = { active: new Set<string>() };
     const computeActive = (): string[] => {
       const names = new Set<string>([...this.directNames, TOOL_SEARCH_NAME]);
@@ -275,13 +377,20 @@ export class ToolAvailabilityRuntime {
   }
 
   private buildSearchConnector(
-    activeTools: Map<string, MakaTool>,
+    activeTools: Map<string, string>,
+    requiredToolNames: ReadonlySet<string>,
   ): MakaTool<{ query: string; limit?: number }, ToolSearchResult> {
     return {
       name: TOOL_SEARCH_NAME,
-      description: renderInventory(this.groups),
+      description: renderInventory(this.groups, requiredToolNames),
       parameters: z.object({
-        query: z.string().trim().min(1).describe('Search query describing the needed capability.'),
+        query: z
+          .string()
+          .trim()
+          .min(1)
+          .describe(
+            'Search query describing the needed capability. An exact catalog tool name activates only that tool.',
+          ),
         limit: z
           .number()
           .int()
@@ -290,14 +399,9 @@ export class ToolAvailabilityRuntime {
           .optional()
           .describe(`Maximum matches to activate; defaults to ${TOOL_SEARCH_DEFAULT_LIMIT}.`),
       }),
-      nesting: 'direct_only',
       impl: ({ query, limit = TOOL_SEARCH_DEFAULT_LIMIT }, context) => {
         const normalizedQuery = query.trim();
-        const ranked = this.searchIndex!.search(normalizedQuery)
-          .map((result) => String(result.id))
-          .filter((name) => !activeTools.has(name))
-          .slice(0, TOOL_SEARCH_MAX_LIMIT)
-          .filter((name) => this.searchableNames.has(name));
+        const ranked = this.rankDeferredSearchHits(normalizedQuery, activeTools, requiredToolNames);
         const activated: string[] = [];
         let blocked: ToolSearchResult['blocked'];
         let schemaChars = 0;
@@ -317,7 +421,7 @@ export class ToolAvailabilityRuntime {
           activated.push(name);
           schemaChars += chars;
         }
-        for (const name of activated) activeTools.set(name, this.toolsByName.get(name)!);
+        for (const name of activated) activeTools.set(name, this.activationKeysByName.get(name)!);
         const result: ToolSearchResult = {
           activated,
           ...(blocked ? { blocked } : {}),
@@ -344,6 +448,41 @@ export class ToolAvailabilityRuntime {
         };
       },
     };
+  }
+
+  /**
+   * Rank deferred tools for one search. An exact catalog name (case-sensitive,
+   * then unique case-insensitive) never expands into MiniSearch neighbors, so
+   * naming one tool cannot invalidate the prompt-cache prefix with up to
+   * `TOOL_SEARCH_DEFAULT_LIMIT` extra schemas.
+   */
+  private rankDeferredSearchHits(
+    query: string,
+    activeTools: ReadonlyMap<string, string>,
+    requiredToolNames: ReadonlySet<string>,
+  ): string[] {
+    const withheld = (name: string) => activeTools.has(name) || requiredToolNames.has(name);
+    const exactName = this.resolveExactCatalogName(query);
+    if (exactName !== undefined) {
+      return this.searchableNames.has(exactName) && !withheld(exactName) ? [exactName] : [];
+    }
+    return this.searchIndex!.search(query)
+      .map((result) => String(result.id))
+      .filter((name) => !withheld(name))
+      .slice(0, TOOL_SEARCH_MAX_LIMIT)
+      .filter((name) => this.searchableNames.has(name));
+  }
+
+  private resolveExactCatalogName(query: string): string | undefined {
+    if (this.toolsByName.has(query)) return query;
+    const lowered = query.toLowerCase();
+    let match: string | undefined;
+    for (const name of this.toolsByName.keys()) {
+      if (name.toLowerCase() !== lowered) continue;
+      if (match !== undefined) return undefined;
+      match = name;
+    }
+    return match;
   }
 
   private buildDiagnostic(
@@ -381,11 +520,15 @@ export class ToolAvailabilityRuntime {
   }
 }
 
-function renderInventory(groups: readonly SearchGroup[]): string {
-  const lines = groups.flatMap((group) => [
-    `${group.id}:`,
-    ...group.toolNames.map((name) => `- ${name}`),
-  ]);
+function renderInventory(
+  groups: readonly SearchGroup[],
+  omitNames: ReadonlySet<string> = new Set(),
+): string {
+  const lines = groups.flatMap((group) => {
+    const names = group.toolNames.filter((name) => !omitNames.has(name));
+    if (names.length === 0) return [];
+    return [`${group.id}:`, ...names.map((name) => `- ${name}`)];
+  });
   return [
     'Search the deferred tools bound to this run. A successful search activates the',
     'bounded top matches; their complete callable definitions become visible on the',

@@ -20,23 +20,31 @@
 import { unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import {
+  decodeDefaultApiProtocol,
   decodeProviderType,
+  decodeCanonicalConnectionCatalogEntry,
+  decodeCredentialVersionBasis,
+  decodeConnectionName,
   decodeConnectionSlug,
   decodeRuntimePolicyEntityId,
   normalizeCatalogConnectionBaseUrl,
-  normalizeConnectionCatalogEntryUpdateForProvider,
+  normalizeConnectionCatalogEntryUpdate,
   normalizeConnectionModelDiscoveryResult,
   normalizeCredentialSecret,
   type ConnectionModelDiscoveryResult,
+  type ConnectionCatalogEntry,
+  type CredentialVersionBasis,
 } from '@maka/core/runtime-policy';
 import {
   deriveConnectionSlug,
-  PROVIDER_DEFAULTS,
+  PROVIDER_REGISTRY,
   providerAuthSupportsApiKey,
+  type ModelApiProtocol,
   type ProviderType,
 } from '@maka/core/llm-connections';
 import { syncDirectory } from '../stable-storage.js';
 import { record } from './codec.js';
+import { upgradeLegacyCustomProvider } from './legacy-custom-connection.js';
 import {
   codecError,
   commitOutcomeUnknown,
@@ -45,15 +53,20 @@ import {
   decodePersistedDomain,
   ioFailed,
 } from './errors.js';
+import type { InteractiveOAuthLoginTarget, InteractiveOAuthLoginProvider } from './operations.js';
 import { readBoundedJsonDocument, writeJsonDocument } from './document-io.js';
 const FILE = 'runtime-policy-onboarding.json';
 const SCHEMA_VERSION = 2 as const;
+const OAUTH_SCHEMA_VERSION = 3 as const;
 const MAX_BYTES = 5 * 1024 * 1024;
 
 export interface ConnectionOnboardingTransactionInput {
   readonly connectionId: unknown;
   readonly slug: unknown;
   readonly providerType: unknown;
+  readonly defaultApiProtocol?: unknown;
+  /** Optional caller-chosen display name; absent/null keeps the provider default. */
+  readonly name?: unknown;
   readonly suppliedSecret: unknown;
   readonly baseUrl: unknown;
   readonly enabledModelIds: unknown;
@@ -67,12 +80,36 @@ export interface ConnectionOnboardingIntent {
   /** Absent only while replaying a schema-v1 identity-first intent. */
   readonly slug: string | null;
   readonly providerType: ProviderType;
+  readonly defaultApiProtocol?: ModelApiProtocol;
+  /**
+   * Caller-chosen display name pinned into the durable intent; null falls
+   * back to the provider label at upsert. Absent in intents journaled before
+   * this field existed — they decode to null and behave exactly as before.
+   */
+  readonly name: string | null;
   readonly suppliedSecret: string | null;
   readonly baseUrl: string | null;
   readonly enabledModelIds: readonly string[];
   readonly discovery: ConnectionModelDiscoveryResult;
   readonly invalidateLastTest: boolean;
 }
+
+export interface InteractiveOAuthEnrollmentIntent {
+  readonly schemaVersion: typeof OAUTH_SCHEMA_VERSION;
+  readonly kind: 'oauth_enrollment';
+  readonly attemptId: string;
+  readonly target: InteractiveOAuthLoginTarget;
+  readonly connectionBefore: ConnectionCatalogEntry | null;
+  readonly connectionAfter: ConnectionCatalogEntry & {
+    readonly providerType: InteractiveOAuthLoginProvider;
+  };
+  readonly credentialBasis: CredentialVersionBasis | null;
+  readonly secret: string;
+}
+
+export type RuntimePolicyOnboardingIntent =
+  | ConnectionOnboardingIntent
+  | InteractiveOAuthEnrollmentIntent;
 
 export type CurrentConnectionOnboardingIntent = ConnectionOnboardingIntent & {
   readonly schemaVersion: 2;
@@ -85,13 +122,16 @@ export function prepareConnectionOnboardingIntent(
 ): CurrentConnectionOnboardingIntent {
   const decode = source === 'persisted' ? decodePersistedDomain : decodeConnectionInput;
   const providerType = decode(() => decodeProviderType(input.providerType));
-  if (!providerAuthSupportsApiKey(providerType)) {
+  const defaultApiProtocol = decode(() =>
+    decodeDefaultApiProtocol(input.defaultApiProtocol, providerType),
+  );
+  const definition = PROVIDER_REGISTRY[providerType];
+  if (!providerAuthSupportsApiKey(providerType) && definition.authKind !== 'oauth_token') {
     throw codecError(
       source === 'persisted' ? 'invalid_document' : 'invalid_connection_input',
-      'Onboarding requires an API-key provider',
+      'Onboarding requires a provider with a connection credential',
     );
   }
-  const definition = PROVIDER_DEFAULTS[providerType];
   const discovery = decode(() => normalizeConnectionModelDiscoveryResult(input.discovery));
   // Non-empty is the requirement; `source` is write provenance, not a
   // quality bar. A provider without a model-list endpoint runs discovery by
@@ -110,15 +150,11 @@ export function prepareConnectionOnboardingIntent(
       ? null
       : (decode(() => normalizeCatalogConnectionBaseUrl(input.baseUrl, providerType)) ?? null);
   const normalized = decode(() =>
-    normalizeConnectionCatalogEntryUpdateForProvider(
-      {
-        name: definition.label,
-        ...((baseUrl ?? definition.baseUrl) ? { baseUrl: baseUrl ?? definition.baseUrl } : {}),
-        enabled: true,
-        enabledModelIds: input.enabledModelIds,
-      },
-      providerType,
-    ),
+    normalizeConnectionCatalogEntryUpdate({
+      name: definition.label,
+      enabled: true,
+      enabledModelIds: input.enabledModelIds,
+    }),
   );
   const available = new Set(discovery.models.map(({ id }) => id));
   if (
@@ -147,6 +183,11 @@ export function prepareConnectionOnboardingIntent(
     connectionId: decode(() => decodeRuntimePolicyEntityId(input.connectionId)),
     slug: decode(() => decodeConnectionSlug(input.slug)),
     providerType,
+    ...(defaultApiProtocol === undefined ? {} : { defaultApiProtocol }),
+    name:
+      input.name === undefined || input.name === null
+        ? null
+        : decode(() => decodeConnectionName(input.name)),
     suppliedSecret,
     baseUrl,
     enabledModelIds: normalized.enabledModelIds,
@@ -157,12 +198,41 @@ export function prepareConnectionOnboardingIntent(
 
 export async function readConnectionOnboardingIntent(
   root: string,
-): Promise<ConnectionOnboardingIntent | undefined> {
+): Promise<RuntimePolicyOnboardingIntent | undefined> {
   const value = await readBoundedJsonDocument(root, FILE, MAX_BYTES);
   if (value === undefined) return undefined;
+  const envelope = record(
+    value,
+    FILE,
+    'invalid_document',
+    [
+      'schemaVersion',
+      'kind',
+      'attemptId',
+      'target',
+      'connectionBefore',
+      'connectionAfter',
+      'credentialBasis',
+      'secret',
+      'connectionId',
+      'slug',
+      'providerType',
+      'defaultApiProtocol',
+      'name',
+      'suppliedSecret',
+      'baseUrl',
+      'enabledModelIds',
+      'discovery',
+      'invalidateLastTest',
+    ],
+    ['schemaVersion'],
+  );
+  if (envelope.schemaVersion === OAUTH_SCHEMA_VERSION) {
+    return decodeInteractiveOAuthEnrollmentIntent(value);
+  }
   // `baseUrl` is allowed but not required for the oldest v1 journal shape.
   const raw = record(
-    value,
+    upgradeLegacyCustomProvider(value),
     FILE,
     'invalid_document',
     [
@@ -170,6 +240,8 @@ export async function readConnectionOnboardingIntent(
       'connectionId',
       'slug',
       'providerType',
+      'defaultApiProtocol',
+      'name',
       'suppliedSecret',
       'baseUrl',
       'enabledModelIds',
@@ -192,9 +264,11 @@ export async function readConnectionOnboardingIntent(
   const prepared = prepareConnectionOnboardingIntent(
     {
       providerType: raw.providerType,
+      defaultApiProtocol: raw.defaultApiProtocol,
       connectionId: raw.connectionId,
       slug:
         raw.schemaVersion === 1 ? deriveLegacyIntentPlaceholderSlug(raw.providerType) : raw.slug,
+      name: raw.name,
       suppliedSecret: raw.suppliedSecret,
       baseUrl: raw.baseUrl,
       enabledModelIds: raw.enabledModelIds,
@@ -208,9 +282,172 @@ export async function readConnectionOnboardingIntent(
 
 export function writeConnectionOnboardingIntent(
   root: string,
-  intent: CurrentConnectionOnboardingIntent,
+  intent: CurrentConnectionOnboardingIntent | InteractiveOAuthEnrollmentIntent,
 ): Promise<void> {
   return writeJsonDocument(root, FILE, intent, MAX_BYTES);
+}
+
+export function prepareInteractiveOAuthEnrollmentIntent(input: {
+  readonly attemptId: unknown;
+  readonly target: InteractiveOAuthLoginTarget;
+  readonly connectionBefore: ConnectionCatalogEntry | null;
+  readonly connectionAfter: ConnectionCatalogEntry;
+  readonly credentialBasis: CredentialVersionBasis | null;
+  readonly secret: unknown;
+}): InteractiveOAuthEnrollmentIntent {
+  const connectionAfter = decodeConnectionInput(() =>
+    decodeCanonicalConnectionCatalogEntry(input.connectionAfter),
+  );
+  if (!isOAuthProvider(connectionAfter.providerType)) {
+    throw codecError('invalid_connection_input', 'OAuth enrollment requires an OAuth provider');
+  }
+  return {
+    schemaVersion: OAUTH_SCHEMA_VERSION,
+    kind: 'oauth_enrollment',
+    attemptId: decodeOAuthAttemptId(input.attemptId, 'invalid_connection_input'),
+    target: decodeOAuthTarget(input.target, 'invalid_connection_input'),
+    connectionBefore:
+      input.connectionBefore === null
+        ? null
+        : decodeConnectionInput(() =>
+            decodeCanonicalConnectionCatalogEntry(input.connectionBefore),
+          ),
+    connectionAfter: connectionAfter as InteractiveOAuthEnrollmentIntent['connectionAfter'],
+    credentialBasis: input.credentialBasis ? structuredClone(input.credentialBasis) : null,
+    secret: decodeCredentialInput(() => normalizeCredentialSecret(input.secret)),
+  };
+}
+
+function decodeInteractiveOAuthEnrollmentIntent(value: unknown): InteractiveOAuthEnrollmentIntent {
+  const raw = record(value, FILE, 'invalid_document', [
+    'schemaVersion',
+    'kind',
+    'attemptId',
+    'target',
+    'connectionBefore',
+    'connectionAfter',
+    'credentialBasis',
+    'secret',
+  ]);
+  if (raw.schemaVersion !== OAUTH_SCHEMA_VERSION || raw.kind !== 'oauth_enrollment') {
+    throw codecError('invalid_document', `${FILE} has an invalid OAuth enrollment intent`);
+  }
+  const connectionAfter = decodePersistedDomain(() =>
+    decodeCanonicalConnectionCatalogEntry(raw.connectionAfter),
+  );
+  if (!isOAuthProvider(connectionAfter.providerType)) {
+    throw codecError('invalid_document', 'OAuth enrollment intent provider is invalid');
+  }
+  const connectionBefore =
+    raw.connectionBefore === null
+      ? null
+      : decodePersistedDomain(() => decodeCanonicalConnectionCatalogEntry(raw.connectionBefore));
+  const credentialBasis =
+    raw.credentialBasis === null
+      ? null
+      : decodePersistedDomain(() => decodeCredentialVersionBasis(raw.credentialBasis));
+  const target = decodeOAuthTarget(raw.target, 'invalid_document');
+  if (
+    (target.kind === 'create' && connectionBefore !== null) ||
+    (target.kind === 'create' && target.providerType !== connectionAfter.providerType) ||
+    (target.kind === 'create' &&
+      target.slug !== undefined &&
+      target.slug !== connectionAfter.slug) ||
+    (target.kind === 'create' &&
+      target.name !== undefined &&
+      target.name !== connectionAfter.name) ||
+    (target.kind === 'existing' &&
+      (connectionBefore === null || connectionBefore.connectionId !== target.connectionId)) ||
+    connectionAfter.connectionId !==
+      (target.kind === 'existing' ? target.connectionId : connectionAfter.connectionId) ||
+    (connectionBefore !== null &&
+      (connectionBefore.connectionId !== connectionAfter.connectionId ||
+        connectionBefore.slug !== connectionAfter.slug ||
+        connectionBefore.providerType !== connectionAfter.providerType))
+  ) {
+    throw codecError('invalid_document', 'OAuth enrollment intent identity is inconsistent');
+  }
+  return {
+    schemaVersion: OAUTH_SCHEMA_VERSION,
+    kind: 'oauth_enrollment',
+    attemptId: decodeOAuthAttemptId(raw.attemptId, 'invalid_document'),
+    target,
+    connectionBefore,
+    connectionAfter: connectionAfter as InteractiveOAuthEnrollmentIntent['connectionAfter'],
+    credentialBasis,
+    secret: decodePersistedDomain(() => normalizeCredentialSecret(raw.secret)),
+  };
+}
+
+function decodeOAuthTarget(
+  value: unknown,
+  source: 'invalid_connection_input' | 'invalid_document',
+): InteractiveOAuthLoginTarget {
+  const base = record(
+    value,
+    'OAuth enrollment target',
+    source,
+    ['kind', 'providerType', 'connectionId', 'slug', 'name'],
+    ['kind'],
+  );
+  if (base.kind === 'create') {
+    const item = record(
+      value,
+      'OAuth create target',
+      source,
+      ['kind', 'providerType', 'slug', 'name'],
+      ['kind', 'providerType'],
+    );
+    const decode = source === 'invalid_document' ? decodePersistedDomain : decodeConnectionInput;
+    const providerType = decode(() => decodeProviderType(item.providerType));
+    if (!isOAuthProvider(providerType)) {
+      throw codecError(source, 'OAuth create target provider is invalid');
+    }
+    if (providerType !== 'openai-codex' && (item.slug !== undefined || item.name !== undefined)) {
+      throw codecError(
+        source,
+        'Custom OAuth Connection identity is only supported for openai-codex',
+      );
+    }
+    if (providerType !== 'openai-codex') return { kind: 'create', providerType };
+    return {
+      kind: 'create',
+      providerType,
+      ...(item.slug === undefined ? {} : { slug: decode(() => decodeConnectionSlug(item.slug)) }),
+      ...(item.name === undefined ? {} : { name: decode(() => decodeConnectionName(item.name)) }),
+    };
+  }
+  if (base.kind === 'existing') {
+    const item = record(value, 'OAuth existing target', source, ['kind', 'connectionId']);
+    return {
+      kind: 'existing',
+      connectionId:
+        source === 'invalid_document'
+          ? decodePersistedDomain(() => decodeRuntimePolicyEntityId(item.connectionId))
+          : decodeConnectionInput(() => decodeRuntimePolicyEntityId(item.connectionId)),
+    };
+  }
+  throw codecError(source, 'OAuth enrollment target kind is invalid');
+}
+
+function isOAuthProvider(
+  providerType: ProviderType,
+): providerType is InteractiveOAuthLoginProvider {
+  return (
+    providerType === 'openai-codex' ||
+    providerType === 'xai-oauth' ||
+    providerType === 'github-copilot'
+  );
+}
+
+function decodeOAuthAttemptId(
+  value: unknown,
+  source: 'invalid_connection_input' | 'invalid_document',
+): string {
+  if (typeof value !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(value)) {
+    throw codecError(source, 'OAuth attempt id is invalid');
+  }
+  return value;
 }
 
 function deriveLegacyIntentPlaceholderSlug(rawProviderType: unknown): string {

@@ -17,12 +17,14 @@
  * under the License.
  */
 
+import { deferred } from '@maka/core/test-only/async-primitives';
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 
 import type { SessionEvent } from '@maka/core/events';
 
 import type { SessionHeader, StoredMessage } from '@maka/core/session';
+import { createGenesisExecutionBoundary } from '@maka/core/sandbox-boundary';
 import type { SandboxBoundaryResponse } from '@maka/core/sandbox-boundary';
 import type { AgentBackend, BackendSendInput, BackendStopMode } from '@maka/core/backend-types';
 
@@ -36,7 +38,126 @@ import {
   type RuntimeKernelDeps,
   RuntimeOwnerCleanupError,
 } from '../runtime-kernel.js';
-import { BackendRegistry, type SessionStore } from '../session-manager.js';
+import {
+  BackendRegistry,
+  type BackendFactoryContext,
+  type SessionStore,
+} from '../session-manager.js';
+import { waitFor as pollFor } from '@maka/core/test-only/async-primitives';
+
+test('delegated execution policy supports a frozen Host store and ordinary execution restores the saved policy', async () => {
+  const store = memoryStore();
+  await store.updateHeader(SESSION_ID, { permissionMode: 'ask' });
+  store.readExecutionBoundary = async () => createGenesisExecutionBoundary('ask');
+  // Production ExecutionStores freezes this facade, including its function properties.
+  Object.defineProperty(store, 'createSandboxBoundaryRequest', {
+    value: function () {
+      assert.equal(this, store);
+    },
+  });
+  Object.freeze(store);
+  let activationError: unknown;
+  const backends = new BackendRegistry();
+  const observed: Array<{
+    permission: string;
+    savedPermission: string;
+    boundary: string;
+    questions?: string;
+  }> = [];
+  const instances: BlockingBackend[] = [];
+  backends.register('ai-sdk', async (context) => {
+    try {
+      const request = context.store.createSandboxBoundaryRequest;
+      assert.ok(request);
+      await request.call(context.store, {} as never);
+      await context.store.readHeader(SESSION_ID);
+      await context.store.readExecutionBoundary(SESSION_ID);
+    } catch (error) {
+      activationError = error;
+      throw error;
+    }
+    observed.push({
+      permission: (await context.store.readHeader(SESSION_ID)).permissionMode,
+      savedPermission: (await store.readHeader(SESSION_ID)).permissionMode,
+      boundary: (await context.store.readExecutionBoundary(SESSION_ID)).kind,
+      questions: context.executionPolicy?.questions,
+    });
+    const backend = new BlockingBackend(SESSION_ID, {});
+    backend.releaseBlockedSend();
+    instances.push(backend);
+    return backend;
+  });
+  let id = 0;
+  const kernel = new RuntimeKernel({
+    store,
+    backends,
+    newId: () => `policy-${++id}`,
+    now: () => id,
+  });
+  for await (const _ of kernel.startTurn(
+    SESSION_ID,
+    { turnId: 'delegated', text: 'work' },
+    {
+      executionPolicy: { permissionMode: 'bypass', questions: 'return' },
+    },
+  )) {
+  }
+  assert.ifError(activationError);
+  for await (const _ of kernel.startTurn(SESSION_ID, { turnId: 'ordinary', text: 'followup' })) {
+  }
+  assert.deepEqual(observed, [
+    { permission: 'bypass', savedPermission: 'ask', boundary: 'bypass', questions: 'return' },
+    { permission: 'ask', savedPermission: 'ask', boundary: 'managed', questions: undefined },
+  ]);
+  assert.equal(instances[0]!.disposeCalls, 1);
+  assert.equal((await store.readHeader(SESSION_ID)).permissionMode, 'ask');
+  await kernel.disposeBackend(SESSION_ID);
+});
+
+test('steering updates the question policy of a reused backend and the next ordinary turn restores it', async () => {
+  const store = memoryStore();
+  const backends = new BackendRegistry();
+  const contexts: BackendFactoryContext[] = [];
+  const released = deferred<void>();
+  backends.register('ai-sdk', (context) => {
+    contexts.push(context);
+    const backend = new BlockingBackend(SESSION_ID, {});
+    backend.releaseBlockedSend();
+    const send = backend.send.bind(backend);
+    backend.send = async function* (input) {
+      for await (const event of send(input)) {
+        if (input.turnId === 'steered' && event.type === 'complete') await released.promise;
+        yield event;
+      }
+    };
+    return backend;
+  });
+  let id = 0;
+  const kernel = new RuntimeKernel({
+    store,
+    backends,
+    newId: () => `steer-${++id}`,
+    now: () => id,
+  });
+  for await (const _ of kernel.startTurn(SESSION_ID, { turnId: 'before', text: 'ordinary' })) {
+  }
+  const turn = kernel
+    .startTurn(SESSION_ID, { turnId: 'steered', text: 'working' }, { runId: 'steered-run' })
+    [Symbol.asyncIterator]();
+  await turn.next();
+  assert.equal(contexts.length, 1);
+  assert.equal(contexts.map((context) => context.executionPolicy)[0], undefined);
+  kernel.returnExecutionQuestions(SESSION_ID, 'steered-run');
+  assert.equal(contexts[0]!.executionPolicy?.questions, 'return');
+  assert.equal(kernel.readExecutionPolicy(SESSION_ID, 'steered-run')?.questions, 'return');
+  released.resolve();
+  while (!(await turn.next()).done) {}
+  for await (const _ of kernel.startTurn(SESSION_ID, { turnId: 'after', text: 'ordinary again' })) {
+  }
+  assert.equal(contexts.length, 2);
+  assert.equal(contexts[1]!.executionPolicy, undefined);
+  await kernel.disposeBackend(SESSION_ID);
+});
 
 describe('RuntimeKernel Interaction close cleanup', () => {
   test('reserve followed by begin failure settles a concurrent stop claim', async () => {
@@ -98,6 +219,8 @@ describe('RuntimeKernel Interaction close cleanup', () => {
           ...identity,
           acceptSandboxBoundaryRequest: async () => {},
           acceptUserQuestionRequest: async () => {},
+          acceptFormRequest: async () => {},
+          withdrawFormRequest: async () => {},
           close: async () => {
             closeCalls += 1;
             closeStarted.resolve();
@@ -246,21 +369,6 @@ describe('RuntimeKernel Interaction close cleanup', () => {
     );
     assert.equal(containsFailure(retryFailure, stopFailure), true);
     assert.equal(fixture.backend.stopCalls.length, 1);
-    const messages = await fixture.store.readMessages(SESSION_ID);
-    assert.equal(
-      messages.filter(
-        (message) =>
-          message.type === 'turn_state' &&
-          message.turnId === 'turn-blocked-send' &&
-          message.status === 'aborted',
-      ).length,
-      1,
-    );
-    assert.equal(
-      messages.filter((message) => message.type === 'system_note' && message.kind === 'abort')
-        .length,
-      1,
-    );
 
     const blockedActivation = fixture.kernel
       .startTurn(SESSION_ID, { turnId: 'turn-before-runner-settled', text: 'must not send' })
@@ -270,6 +378,62 @@ describe('RuntimeKernel Interaction close cleanup', () => {
 
     fixture.backend.releaseBlockedSend();
     await drainIterator(iterator);
+  });
+
+  test('the session run epoch bumps on every turn start and end', async () => {
+    const store = memoryStore();
+    const backends = new BackendRegistry();
+    const backend = new BlockingBackend(SESSION_ID, {});
+    backends.register('ai-sdk', () => backend);
+    let id = 0;
+    const kernel = new RuntimeKernel({
+      store,
+      backends,
+      newId: () => `epoch-id-${++id}`,
+      now: () => id,
+    });
+
+    assert.equal(kernel.sessionRunEpoch(SESSION_ID), 0);
+
+    const iterator = kernel
+      .startTurn(SESSION_ID, { turnId: 'turn-epoch-1', text: 'go' })
+      [Symbol.asyncIterator]();
+    await iterator.next();
+    const afterStart = kernel.sessionRunEpoch(SESSION_ID);
+    assert.ok(afterStart >= 1, 'a turn entering the active set bumps the epoch');
+
+    backend.releaseBlockedSend();
+    await drainIterator(iterator).catch(() => undefined);
+    assert.ok(
+      kernel.sessionRunEpoch(SESSION_ID) > afterStart,
+      'the turn leaving the active set bumps the epoch again',
+    );
+  });
+
+  test('each kernel gets its own host generation; epochs restart per process (#5713 review)', () => {
+    const backends = new BackendRegistry();
+    backends.register('ai-sdk', () => new BlockingBackend(SESSION_ID, {}));
+    const first = new RuntimeKernel({
+      store: memoryStore(),
+      backends,
+      newId: () => 'unused',
+      now: () => 0,
+      hostGeneration: () => 'host-generation-1',
+    });
+    // A second kernel stands in for the restarted Host process: a fresh
+    // generation and epoch counters back to zero, even though the previous
+    // process may have left a higher epoch on a client's catalog row.
+    const second = new RuntimeKernel({
+      store: memoryStore(),
+      backends,
+      newId: () => 'unused',
+      now: () => 0,
+      hostGeneration: () => 'host-generation-2',
+    });
+    assert.equal(first.sessionHostGeneration(), 'host-generation-1');
+    assert.equal(second.sessionHostGeneration(), 'host-generation-2');
+    assert.equal(first.sessionRunEpoch(SESSION_ID), 0);
+    assert.equal(second.sessionRunEpoch(SESSION_ID), 0);
   });
 
   test('a generation stopped after Run reservation cannot send on the stale backend', async () => {
@@ -362,21 +526,6 @@ describe('RuntimeKernel Interaction close cleanup', () => {
     await drainIterator(first);
     assert.equal(built[0]?.disposeCalls, 1);
     assert.deepEqual(built[0]?.stopCalls, [{ reason: 'user_stop', mode: 'after_step' }]);
-    const firstMessages = await store.readMessages(SESSION_ID);
-    assert.equal(
-      firstMessages.filter(
-        (message) =>
-          message.type === 'turn_state' &&
-          message.turnId === 'turn-generation-1' &&
-          message.status === 'aborted',
-      ).length,
-      1,
-    );
-    assert.equal(
-      firstMessages.filter((message) => message.type === 'system_note' && message.kind === 'abort')
-        .length,
-      1,
-    );
 
     const second = kernel
       .startTurn(SESSION_ID, { turnId: 'turn-generation-2', text: 'second' })
@@ -481,6 +630,8 @@ function runtimeFixture(options: RuntimeFixtureOptions = {}): {
       ...identity,
       acceptSandboxBoundaryRequest: async () => {},
       acceptUserQuestionRequest: async () => {},
+      acceptFormRequest: async () => {},
+      withdrawFormRequest: async () => {},
       close: async () => {
         markCloseStarted();
         if (options.deferredClose) await closeReleased;
@@ -504,7 +655,7 @@ function runtimeFixture(options: RuntimeFixtureOptions = {}): {
             messageAuthority: {
               bindRun: (identity) => ({
                 ...identity,
-                pull: () => [],
+                pull: async () => [],
                 ack: () => {},
                 nack: () => {},
                 release: () => {
@@ -639,22 +790,21 @@ function memoryStore(): SessionStore {
   return {
     create: async () => header,
     createSubagent: async () => ({ header, created: false }),
-    setExecutionBoundaryKind: async () => {
-      throw new Error('not implemented');
-    },
     readExecutionBoundary: async () => {
       throw new Error('not implemented');
     },
     list: async () => [],
     readHeader: async () => header,
-    readMessages: async () => [...messages],
-    listTurns: async () => [],
-    appendMessage: async (_sessionId, message) => {
-      messages.push(message);
-    },
-    appendMessages: async (_sessionId, next) => {
-      messages.push(...next);
-    },
+    readMessagesAfter: async (
+      _sessionId: string,
+      request: { afterSequence?: number; maxMessages: number },
+    ) => ({
+      records: messages
+        .map((message, sequence) => ({ sequence, message }))
+        .filter(({ sequence }) => sequence > (request.afterSequence ?? -1))
+        .slice(0, request.maxMessages),
+      highWaterSequence: messages.length > 0 ? messages.length - 1 : null,
+    }),
     updateHeader: async (_sessionId, patch) => {
       header = { ...header, ...patch };
       return header;
@@ -695,24 +845,8 @@ function containsFailure(failure: unknown, expected: unknown): boolean {
     failure.errors.some((nested) => containsFailure(nested, expected))
   );
 }
-
-function deferred<T>(): {
-  promise: Promise<T>;
-  resolve(value: T | PromiseLike<T>): void;
-} {
-  let resolve!: (value: T | PromiseLike<T>) => void;
-  const promise = new Promise<T>((resolvePromise) => {
-    resolve = resolvePromise;
-  });
-  return { promise, resolve };
-}
-
 async function waitFor(predicate: () => boolean): Promise<void> {
-  for (let attempt = 0; attempt < 50; attempt += 1) {
-    if (predicate()) return;
-    await new Promise<void>((resolve) => setImmediate(resolve));
-  }
-  assert.fail('condition was not met');
+  await pollFor(predicate, { attempts: 50 });
 }
 
 async function within<T>(promise: Promise<T>, operation: string): Promise<T> {

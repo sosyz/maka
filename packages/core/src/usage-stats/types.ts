@@ -28,8 +28,12 @@ export const MODEL_CALL_KINDS = [
   'goal_evaluation',
   'session_title',
   'session_recap',
+  'session_checkin',
+  'prompt_suggestion',
   'daily_review',
   'memory_extraction',
+  'workhub_intent',
+  'workhub_recall',
 ] as const;
 export type ModelCallKind = (typeof MODEL_CALL_KINDS)[number];
 
@@ -45,6 +49,13 @@ export interface UsageQuery {
   modelId?: string;
   toolName?: string;
   status?: 'success' | 'error' | 'aborted' | 'all';
+  /**
+   * Keep only calls of these kinds. Unset means every kind, which is what a
+   * Session's headline cost has always reported; `['main']` is how a consumer
+   * reads the agent loop's own spend and cache behavior without the auxiliary
+   * calls recorded alongside it (#5691).
+   */
+  callKinds?: readonly ModelCallKind[];
 }
 
 export interface UsageSummaryV2 {
@@ -63,6 +74,23 @@ export interface UsageSummaryV2 {
   cacheHitRequests: number;
   cacheCreateRequests: number;
   errorRequests: number;
+  /**
+   * Recorded model-call time, summed over the same rows as `totalTokens`.
+   *
+   * Every summary writes it, and the protocol epoch refuses peers that predate
+   * it at the handshake, so a total without a time basis cannot cross the wire.
+   */
+  totalDurationMs: number;
+  /**
+   * Recorded tool executions behind the same query, from the tool-invocation
+   * ledger — the model-call ledger does not describe them, so there is no
+   * canonical source to merge and this comes from the store alone.
+   *
+   * Optional because tool rows that predate connection attribution cannot
+   * answer a `connectionSlug` filter honestly: the Host omits the split for
+   * that query rather than drawing a ring from rows it cannot scope.
+   */
+  toolUsage?: { requests: number; durationMs: number };
 }
 
 export interface UsageBucket {
@@ -234,6 +262,7 @@ export type PromptSegmentKind =
   | 'tool_schema'
   | 'prior_history'
   | 'current_user'
+  /** Historical usage rows only; no current request builder emits this segment. */
   | 'turn_tail';
 
 export interface PromptSegmentEstimate {
@@ -283,7 +312,6 @@ export interface CompactionDecisionDiagnostic {
 export interface ContextBudgetDiagnostic {
   enabled: boolean;
   policyName?: string;
-  maxHistoryEstimatedTokens?: number;
   estimatedTokensBefore: number;
   estimatedTokensAfter: number;
   keptTurns: number;

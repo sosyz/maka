@@ -27,6 +27,7 @@
  */
 
 import * as nodeCrypto from 'node:crypto';
+import type { ModelRetryDecision } from './model-failure.js';
 import { CONTEXT_OFFLOAD_ID_MAX_CODE_POINTS, type SessionContextRef } from './context-offload.js';
 import type {
   AdditionalPermissionRequest,
@@ -36,7 +37,12 @@ import type {
   SandboxEscalationRequest,
 } from './permission.js';
 import type { SandboxBoundaryExpansion, SandboxBoundaryRequestStatus } from './sandbox-boundary.js';
+import type { InteractionFormField, InteractionRequesterProjection } from './interaction.js';
 import type { UserQuestionRequest } from './user-question.js';
+import type {
+  ClientCapabilityGrantCapability,
+  ClientCapabilityGrantScope,
+} from './client-capability-grant.js';
 import type {
   PipeShellOutput,
   PtyShellOutput,
@@ -48,6 +54,7 @@ import type {
 export { SHELL_RUN_SOURCE_TOOL_CALL_ID_MAX_BYTES } from './shell-run.js';
 import { type TokenUsageFields } from './usage-record-schema.js';
 import { defineObjectShape, hasExactShape, isRecord } from './record-schema.js';
+import type { DurableToolResultProjection } from './durable-tool-result-projection.js';
 
 export const TOOL_OUTPUT_STREAMS = ['stdout', 'stderr'] as const;
 export const TOOL_OUTPUT_DELTA_MAX_CHARS = 8192;
@@ -88,6 +95,26 @@ export interface AttachmentRef {
   ref: StorageRef;
 }
 
+/** A live directory on the originating Host, not a saved file or an access grant. */
+export interface DirectoryReference {
+  hostId: string;
+  path: string;
+}
+
+export const DIRECTORY_REFERENCE_MAX_COUNT = 4;
+
+export function isDirectoryReference(value: unknown): value is DirectoryReference {
+  return (
+    isRecord(value) &&
+    Object.keys(value).length === 2 &&
+    typeof value.hostId === 'string' &&
+    /^[A-Za-z0-9_-]{1,128}$/.test(value.hostId) &&
+    typeof value.path === 'string' &&
+    value.path.length <= 4096 &&
+    isCanonicalAbsolutePath(value.path)
+  );
+}
+
 /**
  * An inline quoted excerpt attached to a user message — e.g. text selected in
  * the transcript and carried into a follow-up. Unlike {@link AttachmentRef}
@@ -98,9 +125,31 @@ export interface QuoteRef {
   text: string;
   /** Optional label shown on the chip (e.g. the source turn's role/preview). */
   label?: string;
+  /**
+   * The user's own note about why they quoted this. Model-facing, so a "look at
+   * this" quote carries its intent instead of leaving the model to guess what
+   * the excerpt is for.
+   */
+  comment?: string;
   /** Provenance: the transcript turn the excerpt was selected from. */
   sourceTurnId?: string;
+  /** Source Session identity for a read-only cross-session snapshot. */
+  sourceSessionId?: string;
+  /** Frozen source Session display name for provenance chips and replay. */
+  sourceSessionName?: string;
+  /** Unix timestamp at which the source snapshot was captured. */
+  sourceCapturedAt?: number;
+  /** Whether the source snapshot was bounded before it was attached. */
+  sourceTruncated?: boolean;
 }
+
+/**
+ * Cap for {@link QuoteRef.comment}. A note about a quote carries intent, not
+ * content: long prose belongs in the message text, which has its own limit.
+ * The single authority for the IPC normalizer, the Runtime Host protocol and
+ * the composer's staging cap.
+ */
+export const QUOTE_COMMENT_MAX_LENGTH = 1000;
 
 /**
  * Frozen display metadata for one token embedded in a sent message's visible
@@ -129,6 +178,7 @@ export interface MessageContent {
   displayText?: string;
   /** Ordered attachment references; omit when empty. Attachment bytes never travel here. */
   attachments?: AttachmentRef[];
+  directoryReferences?: DirectoryReference[];
   /** Ordered inline excerpts; omit when empty. Provenance remains part of content identity. */
   quotes?: QuoteRef[];
   /** Sent inline tokens; an empty array marks a current-format plain message. Never model-visible. */
@@ -137,13 +187,50 @@ export interface MessageContent {
 
 const MESSAGE_CONTENT_SHAPE = defineObjectShape<MessageContent>()(
   ['text'],
-  ['displayText', 'attachments', 'quotes', 'inlineReferences'],
+  ['displayText', 'attachments', 'directoryReferences', 'quotes', 'inlineReferences'],
 );
+
+/**
+ * A Turn message is meaningful when at least one of its four content carriers
+ * is present: inline text, an inline excerpt, an attachment reference, or a
+ * directory reference. Admission, compaction estimates, replay visibility,
+ * and recap projection must share this one predicate (#4804) — restating it
+ * per layer is how a quote-only message ends up admitted by one boundary and
+ * silently dropped by the next.
+ *
+ * The inline text is deliberately NOT trimmed. Admission asks "is this frame
+ * legal"; replay visibility asks "will the model see this already-persisted
+ * event", and that answer must stay compatible with everything admission has
+ * ever accepted — trimming here retroactively re-reads stored history as
+ * invisible and blocks replay on it (#4815 review). Surfaces that want the
+ * trimmed judgement (the desktop guard) trim at their own boundary.
+ */
+export function hasMeaningfulMessageContent(content: MessageContent): boolean {
+  return (
+    content.text.length > 0 ||
+    (content.quotes?.length ?? 0) > 0 ||
+    (content.attachments?.length ?? 0) > 0 ||
+    (content.directoryReferences?.length ?? 0) > 0
+  );
+}
 const ATTACHMENT_REF_SHAPE = defineObjectShape<AttachmentRef>()(
   ['kind', 'name', 'mimeType', 'bytes', 'ref'],
   [],
 );
-const QUOTE_REF_SHAPE = defineObjectShape<QuoteRef>()(['text'], ['label', 'sourceTurnId']);
+const QUOTE_REF_SHAPE = defineObjectShape<QuoteRef>()(
+  ['text'],
+  [
+    'label',
+    'comment',
+    'sourceTurnId',
+    'sourceSessionId',
+    'sourceSessionName',
+    'sourceCapturedAt',
+    'sourceTruncated',
+  ],
+);
+const QUOTE_REF_SESSION_ID_MAX_LENGTH = 512;
+const QUOTE_REF_SESSION_NAME_MAX_LENGTH = 200;
 const INLINE_REFERENCE_SHAPE = defineObjectShape<InlineReference>()(
   ['kind', 'value', 'label', 'start'],
   [],
@@ -170,6 +257,9 @@ const EXTERNAL_FILE_REF_SHAPE = defineObjectShape<Extract<StorageRef, { kind: 'e
 export function normalizeMessageContent(content: MessageContent): MessageContent {
   return {
     text: content.text,
+    ...(content.directoryReferences?.length
+      ? { directoryReferences: content.directoryReferences.map((ref) => ({ ...ref })) }
+      : {}),
     ...(content.displayText !== undefined && content.displayText !== content.text
       ? { displayText: content.displayText }
       : {}),
@@ -187,7 +277,24 @@ export function normalizeMessageContent(content: MessageContent): MessageContent
           quotes: content.quotes.map((quote) => ({
             text: quote.text,
             ...(quote.label !== undefined ? { label: quote.label } : {}),
+            ...(quote.comment !== undefined ? { comment: quote.comment } : {}),
             ...(quote.sourceTurnId !== undefined ? { sourceTurnId: quote.sourceTurnId } : {}),
+            ...(quote.sourceSessionId !== undefined
+              ? { sourceSessionId: quote.sourceSessionId }
+              : {}),
+            ...(quote.sourceSessionName !== undefined
+              ? { sourceSessionName: quote.sourceSessionName }
+              : {}),
+            ...(quote.sourceCapturedAt !== undefined
+              ? {
+                  sourceCapturedAt: Object.is(quote.sourceCapturedAt, -0)
+                    ? 0
+                    : quote.sourceCapturedAt,
+                }
+              : {}),
+            ...(quote.sourceTruncated !== undefined
+              ? { sourceTruncated: quote.sourceTruncated }
+              : {}),
           })),
         }
       : {}),
@@ -203,6 +310,7 @@ export function aggregateMessageContents(contents: readonly MessageContent[]): M
   const text = contents.map((content) => content.text).join('\n\n');
   const displayText = contents.map((content) => content.displayText ?? content.text).join('\n\n');
   const attachments = contents.flatMap((content) => content.attachments ?? []);
+  const directoryReferences = contents.flatMap((content) => content.directoryReferences ?? []);
   const quotes = contents.flatMap((content) => content.quotes ?? []);
   const inlineReferences: InlineReference[] = [];
   const hasInlineReferenceMarker = contents.some(
@@ -220,6 +328,7 @@ export function aggregateMessageContents(contents: readonly MessageContent[]): M
     text,
     ...(displayText !== text ? { displayText } : {}),
     ...(attachments.length > 0 ? { attachments } : {}),
+    ...(directoryReferences.length > 0 ? { directoryReferences } : {}),
     ...(quotes.length > 0 ? { quotes } : {}),
     ...(hasInlineReferenceMarker ? { inlineReferences } : {}),
   });
@@ -235,6 +344,9 @@ export function isMessageContent(value: unknown): value is MessageContent {
     isRecord(value) &&
     hasExactShape(value, MESSAGE_CONTENT_SHAPE) &&
     typeof value.text === 'string' &&
+    (value.directoryReferences === undefined ||
+      (Array.isArray(value.directoryReferences) &&
+        value.directoryReferences.every(isDirectoryReference))) &&
     (value.displayText === undefined || typeof value.displayText === 'string') &&
     (value.attachments === undefined ||
       (Array.isArray(value.attachments) && value.attachments.every(isAttachmentRef))) &&
@@ -287,12 +399,35 @@ export function isInlineReference(value: unknown): value is InlineReference {
 }
 
 export function isQuoteRef(value: unknown): value is QuoteRef {
+  const record = isRecord(value) ? value : undefined;
+  const sourceFields = record
+    ? [
+        record.sourceSessionId,
+        record.sourceSessionName,
+        record.sourceCapturedAt,
+        record.sourceTruncated,
+      ]
+    : [];
+  const hasSourceMetadata = sourceFields.some((field) => field !== undefined);
   return (
-    isRecord(value) &&
-    hasExactShape(value, QUOTE_REF_SHAPE) &&
-    typeof value.text === 'string' &&
-    (value.label === undefined || typeof value.label === 'string') &&
-    (value.sourceTurnId === undefined || typeof value.sourceTurnId === 'string')
+    record !== undefined &&
+    hasExactShape(record, QUOTE_REF_SHAPE) &&
+    typeof record.text === 'string' &&
+    (record.label === undefined || typeof record.label === 'string') &&
+    (record.comment === undefined || typeof record.comment === 'string') &&
+    (record.sourceTurnId === undefined || typeof record.sourceTurnId === 'string') &&
+    (!hasSourceMetadata ||
+      (typeof record.sourceSessionId === 'string' &&
+        record.sourceSessionId.length > 0 &&
+        record.sourceSessionId.length <= QUOTE_REF_SESSION_ID_MAX_LENGTH &&
+        typeof record.sourceSessionName === 'string' &&
+        record.sourceSessionName.length > 0 &&
+        record.sourceSessionName.length <= QUOTE_REF_SESSION_NAME_MAX_LENGTH &&
+        typeof record.sourceCapturedAt === 'number' &&
+        Number.isFinite(record.sourceCapturedAt) &&
+        record.sourceCapturedAt >= 0 &&
+        record.sourceCapturedAt <= 8.64e15 &&
+        typeof record.sourceTruncated === 'boolean'))
   );
 }
 
@@ -395,6 +530,12 @@ export function messageContentsEqual(left: MessageContent, right: MessageContent
   return (
     left.text === right.text &&
     leftDisplayText === rightDisplayText &&
+    (left.directoryReferences?.length ?? 0) === (right.directoryReferences?.length ?? 0) &&
+    (left.directoryReferences ?? []).every(
+      (ref, index) =>
+        ref.hostId === right.directoryReferences?.[index]?.hostId &&
+        ref.path === right.directoryReferences?.[index]?.path,
+    ) &&
     ((leftAttachments === undefined && rightAttachments === undefined) ||
       (leftAttachments !== undefined &&
         rightAttachments !== undefined &&
@@ -448,7 +589,12 @@ function quoteRefsEqual(left: QuoteRef, right: QuoteRef): boolean {
   return (
     left.text === right.text &&
     left.label === right.label &&
-    left.sourceTurnId === right.sourceTurnId
+    left.comment === right.comment &&
+    left.sourceTurnId === right.sourceTurnId &&
+    left.sourceSessionId === right.sourceSessionId &&
+    left.sourceSessionName === right.sourceSessionName &&
+    left.sourceCapturedAt === right.sourceCapturedAt &&
+    left.sourceTruncated === right.sourceTruncated
   );
 }
 
@@ -521,20 +667,27 @@ export type SessionEvent =
   | AnyPermissionRequestEvent
   | SandboxBoundaryRequestEvent
   | SandboxBoundaryDecisionAckEvent
+  | ClientCapabilityRequestEvent
+  | ClientCapabilityDecisionAckEvent
   | PermissionAnswerAckEvent
   | PermissionClosureAckEvent
   | PermissionDecisionAckEvent
   | UserQuestionRequestEvent
   | UserQuestionAnswerAckEvent
+  | FormRequestEvent
+  | FormAnswerAckEvent
   | PlanSubmittedEvent
   | TokenUsageEvent
   | SteeringMessageEvent
+  | RuntimeContextEvent
   | MessageAdmissionEvent
   | QueueUpdateEvent
   | ProviderRetryEvent
   | ErrorEvent
   | CompleteEvent
-  | AbortEvent;
+  | AbortEvent
+  | ContextCompactionAppliedEvent
+  | ContextCompactionStartedEvent;
 
 export interface TextDeltaEvent extends BaseEvent {
   type: 'text_delta';
@@ -546,6 +699,7 @@ export interface TextDeltaEvent extends BaseEvent {
 
 export interface TextCompleteEvent extends BaseEvent {
   type: 'text_complete';
+  interrupted?: true;
   messageId: string;
   text: string;
   /** Provider-owned text metadata such as Responses URL citations. */
@@ -560,8 +714,25 @@ export interface ThinkingDeltaEvent extends BaseEvent {
   text: string;
 }
 
+/**
+ * Apply a text/thinking delta to a stream that has consumed `currentEnd`
+ * source characters. Overlap with consumed text is dropped, so replayed and
+ * reseeded deltas are idempotent. A delta that starts past `currentEnd` is a
+ * gap and returns `undefined`; one without `startOffset` appends.
+ */
+export function foldAssistantDelta(
+  currentEnd: number,
+  delta: { readonly startOffset?: number; readonly text: string },
+): { tail: string; endOffset: number } | undefined {
+  const startOffset = delta.startOffset ?? currentEnd;
+  if (startOffset > currentEnd) return undefined;
+  const tail = delta.text.slice(currentEnd - startOffset);
+  return { tail, endOffset: currentEnd + tail.length };
+}
+
 export interface ThinkingCompleteEvent extends BaseEvent {
   type: 'thinking_complete';
+  interrupted?: true;
   messageId: string;
   text: string;
   /** Anthropic signed thinking — MUST be re-sent on replay. */
@@ -698,9 +869,13 @@ export interface ToolResultEvent extends BaseEvent, ToolActivityIdentity {
   providerExecuted?: boolean;
   /** Raw provider result retained for provider-native replay; never rendered directly. */
   providerOutput?: unknown;
+  /** Provider-neutral model-visible output computed before durable publication. */
+  modelProjection?: DurableToolResultProjection;
   /** The transport omitted durable result content; consumers must not treat the placeholder as authoritative. */
   contentOmitted?: true;
   isError: boolean;
+  /** Explicit call outcome; absent on legacy and non-migrated tools. */
+  outcome?: import('./tool-result-status.js').ToolCallOutcome;
   content: ToolResultContent;
   durationMs?: number;
 }
@@ -709,6 +884,7 @@ type ShellRunResultMetadata = {
   kind: 'shell_run';
   ref: string;
   status: ShellRunStatus;
+  pid?: number;
   cwd: string;
   cmd: string;
   startedAt: number;
@@ -787,11 +963,19 @@ export type ToolResultContent =
       toolCallId: string;
       toolName: string;
       artifactId?: string;
+      resourceRef?: string;
       bodySha256?: string;
       originalEstimatedTokens: number;
       originalBytes: number;
       rewriteVersion: number;
-      reason: 'stale_tool_result_pruned_before_compact';
+      /**
+       * Both prune paths now record the same durable projection transition
+       * (#4283), so the archived-result read model spans both reasons.
+       */
+      reason:
+        | 'tool_result_pruned'
+        | 'stale_tool_result_pruned_before_compact'
+        | 'active_current_turn_tool_result_pruned_before_next_step';
     }
   | {
       kind: 'terminal';
@@ -964,6 +1148,15 @@ export interface UserQuestionRequestEvent extends BaseEvent, UserQuestionRequest
   type: 'user_question_request';
 }
 
+export interface FormRequestEvent extends BaseEvent {
+  type: 'form_request';
+  requestId: string;
+  toolUseId: string;
+  message: string;
+  requester: InteractionRequesterProjection;
+  fields: readonly InteractionFormField[];
+}
+
 export interface SandboxBoundaryRequestEvent extends BaseEvent {
   type: 'sandbox_boundary_request';
   requestId: string;
@@ -972,12 +1165,24 @@ export interface SandboxBoundaryRequestEvent extends BaseEvent {
   expansion: SandboxBoundaryExpansion;
 }
 
+export interface ClientCapabilityRequestEvent extends BaseEvent {
+  type: 'client_capability_request';
+  requestId: string;
+  toolUseId: string;
+  capability: ClientCapabilityGrantCapability;
+  scope: ClientCapabilityGrantScope;
+}
+
 /**
  * The requests a session can park on while it waits for the user. Both are
  * registered by RuntimeKernel while unanswered, so a surface that missed the
  * live event can rehydrate the prompt instead of stranding the run.
  */
-export type ActiveInteractionRequestEvent = SandboxBoundaryRequestEvent | UserQuestionRequestEvent;
+export type ActiveInteractionRequestEvent =
+  | SandboxBoundaryRequestEvent
+  | UserQuestionRequestEvent
+  | FormRequestEvent
+  | ClientCapabilityRequestEvent;
 
 export interface SandboxBoundaryDecisionAckEvent extends BaseEvent {
   type: 'sandbox_boundary_decision_ack';
@@ -988,12 +1193,26 @@ export interface SandboxBoundaryDecisionAckEvent extends BaseEvent {
   revision: number;
 }
 
+export interface ClientCapabilityDecisionAckEvent extends BaseEvent {
+  type: 'client_capability_decision_ack';
+  requestId: string;
+  toolUseId: string;
+  decision: 'allow' | 'deny';
+}
+
 /**
  * Echo that the backend accepted a user-question answer.
  * The canonical answer remains owned by InteractionStore.
  */
 export interface UserQuestionAnswerAckEvent extends BaseEvent {
   type: 'user_question_answer_ack';
+  requestId: string;
+  toolUseId: string;
+}
+
+/** Echo that the hosted runtime accepted a form answer. */
+export interface FormAnswerAckEvent extends BaseEvent {
+  type: 'form_answer_ack';
   requestId: string;
   toolUseId: string;
 }
@@ -1075,6 +1294,13 @@ export interface SteeringMessageEvent extends BaseEvent {
   submittedContentDigest?: `sha256:${string}`;
 }
 
+/** Internal model context, persisted in order but not rendered as a chat message. */
+export interface RuntimeContextEvent extends BaseEvent {
+  type: 'runtime_context';
+  name: string;
+  text: string;
+}
+
 /**
  * Transient Host projection fact: a submitted message now belongs to this
  * Turn. It is emitted by the session projector, not by a backend or durable
@@ -1115,6 +1341,7 @@ export interface QueueUpdateEvent extends BaseEvent {
 }
 
 export type ProviderRetryReason =
+  | 'stream_truncated'
   | 'network'
   | 'provider_capacity'
   | 'provider_unavailable'
@@ -1160,6 +1387,7 @@ export interface ProviderRetryStartedEvent extends BaseEvent {
 
 export interface ErrorEvent extends BaseEvent {
   type: 'error';
+  retry?: ModelRetryDecision;
   recoverable: boolean;
   code?: string;
   /** Stable machine-readable reason for UI / telemetry routing. */
@@ -1177,16 +1405,12 @@ export interface CompleteEvent extends BaseEvent {
     | 'error'
     | 'plan_handoff'
     | 'graph_yield'
+    | 'event_wait'
     | 'permission_handoff'
     | 'step_limit'
-    | 'max_tokens'
-    | 'context_budget_exhausted';
-  /**
-   * Detail for `stopReason: 'context_budget_exhausted'` — the runtime could not
-   * produce a provider-safe request even after mid-turn compaction. A first-class
-   * outcome, not a provider context-length error.
-   */
-  contextBudgetExhaustedDetail?: ContextBudgetExhaustedDetail;
+    | 'max_tokens';
+  /** External provider terminal reason, retained even when the caller cancelled the turn. */
+  providerStopReason?: string;
   /** Durable result of an explicit context-compaction execution. */
   contextCompactionOutcome?: ContextCompactionOutcome;
 }
@@ -1196,38 +1420,39 @@ export type ContextCompactionOutcome =
   | { kind: 'unchanged'; reason: string }
   | { kind: 'failed'; reason: string };
 
-export const CONTEXT_BUDGET_EXHAUSTED_DETAILS = [
-  'no_safe_completed_span',
-  'summarizer_failed',
-  'malformed_summary_missing_section',
-  'malformed_summary_truncated',
-  'malformed_summary_too_small_for_fold',
-  'head_anchor_exceeds_capacity',
-] as const;
-
-export type ContextBudgetExhaustedDetail = (typeof CONTEXT_BUDGET_EXHAUSTED_DETAILS)[number];
-
-export function isContextBudgetExhaustedDetail(
-  value: unknown,
-): value is ContextBudgetExhaustedDetail {
-  return CONTEXT_BUDGET_EXHAUSTED_DETAILS.includes(value as ContextBudgetExhaustedDetail);
-}
-
 export type CompleteStopReason = CompleteEvent['stopReason'];
 
 /** Stable failure taxonomy for complete events that did not finish the turn. */
 export function failureClassFromCompleteStopReason(
   reason: CompleteStopReason,
-): 'runtime_error' | 'tool_step_cap_reached' | 'context_budget_exhausted' | undefined {
+): 'runtime_error' | 'tool_step_cap_reached' | undefined {
   if (reason === 'error') return 'runtime_error';
   if (reason === 'step_limit') return 'tool_step_cap_reached';
-  if (reason === 'context_budget_exhausted') return 'context_budget_exhausted';
   return undefined;
 }
 
 export interface AbortEvent extends BaseEvent {
   type: 'abort';
   reason: 'user_stop' | 'redirect' | 'timeout' | 'crash';
+}
+
+/**
+ * A host-owned explicit context-compaction Turn has started. Synthesized by the
+ * Runtime Host session projector (not the kernel) purely so a client can render
+ * a "compacting" transcript row while the Turn is in flight; it carries no
+ * durable state and is excluded from `BackendSessionEvent` like `queue_update`.
+ */
+export interface ContextCompactionStartedEvent extends BaseEvent {
+  type: 'context_compaction_started';
+}
+
+/**
+ * A persisted compaction has taken over the request projection. Its timestamp
+ * invalidates older context measurements while the turn is still running.
+ * The runtime maps this event to a hidden system note before publishing it.
+ */
+export interface ContextCompactionAppliedEvent extends BaseEvent {
+  type: 'context_compaction_applied';
 }
 
 // ============================================================================

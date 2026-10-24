@@ -42,7 +42,6 @@ import {
   RUNTIME_HOST_OPERATOR_PROJECT_DIRECTORY_CONFIGURATION_REQUEST_ENV,
   RUNTIME_HOST_OPERATOR_PROCESS_LIFETIME_LOCK_CAPABILITY,
   RUNTIME_HOST_SERVICE_LOG_MAX_BYTES,
-  type RuntimeHostOperatorCapability,
   type RuntimeHostServiceManagementFrame,
 } from '@maka/runtime-host/operator';
 import { resolveStorageRoot, tryAcquireInteractiveRootOwner } from '@maka/storage/root-authority';
@@ -60,6 +59,7 @@ import { runManagedRuntimeHostUpdateCli } from '../runtime-host-update-command.j
 import {
   cleanupRuntimeHostManagedDeployment,
   effectiveRuntimeHostProjectDirectoryRoots,
+  formatRuntimeHostServiceReadinessDiagnostic,
   manageRuntimeHostService,
   replaceRuntimeHostManagedService,
   resolveRuntimeHostManagedServiceConfigPath,
@@ -76,6 +76,7 @@ import {
   writeRuntimeHostManagedUpdatePolicy,
 } from '../runtime-host-update-policy-store.js';
 import {
+  createSystemdUserRuntimeHostLifecycleProvider,
   createSystemdUserRuntimeHostService,
   renderSystemdUnit,
   renderSystemdUpdateService,
@@ -86,6 +87,65 @@ import {
 } from '../runtime-host-systemd-service.js';
 
 describe('managed Runtime Host service', () => {
+  it('uses native Host paths consistently for serve and managed service roots', () => {
+    const paths =
+      process.platform === 'win32'
+        ? ['C:\\projects', 'C:/projects', '\\\\server\\share\\projects']
+        : ['/srv/projects'];
+    for (const path of paths) {
+      for (const [option, value] of [
+        ['--project-root', `Work=${path}`],
+        ['--project-root-json', JSON.stringify({ label: 'Work', path })],
+      ]) {
+        assert.ok(option && value);
+        assert.deepEqual(parseRuntimeHostCommand(['serve', option, value]), {
+          kind: 'runtime-host-serve',
+          json: false,
+          projectDirectoryRoots: [{ label: 'Work', path }],
+        });
+        for (const action of ['install', 'configure']) {
+          const target =
+            action === 'configure'
+              ? [
+                  '--expected-service-id',
+                  'b'.repeat(64),
+                  '--expected-root-path',
+                  path,
+                  '--expected-root-id',
+                  'a'.repeat(64),
+                  '--expected-config-fingerprint',
+                  `sha256:${'c'.repeat(64)}`,
+                ]
+              : [];
+          const result = parseRuntimeHostCommand(['service', action, option, value, ...target]);
+          assert.equal(result.kind, 'runtime-host-service-manage', JSON.stringify(result));
+          if (result.kind !== 'runtime-host-service-manage')
+            assert.fail('expected managed command');
+          assert.deepEqual(result.projectDirectoryRoots, [{ label: 'Work', path }]);
+        }
+      }
+    }
+    for (const path of [
+      'relative',
+      'C:relative',
+      ...(process.platform === 'win32' ? [] : ['C:\\projects']),
+    ]) {
+      assert.equal(
+        parseRuntimeHostCommand(['service', 'install', '--project-root', `Work=${path}`]).kind,
+        'error',
+      );
+      assert.equal(
+        parseRuntimeHostCommand([
+          'service',
+          'install',
+          '--project-root-json',
+          JSON.stringify({ label: 'Work', path }),
+        ]).kind,
+        'error',
+      );
+    }
+  });
+
   it('parses the bounded managed service command surface', () => {
     const nativeProjectRoot = process.platform === 'win32' ? 'C:\\projects' : '/srv/projects';
     assert.deepEqual(
@@ -187,6 +247,9 @@ describe('managed Runtime Host service', () => {
         '/ip4/0.0.0.0/udp/44001/quic-v1',
         '--clear-coordination-relays',
         '--no-automatic-relay-discovery',
+        '--webrtc-stun',
+        'stun:stun.example:3478',
+        '--webrtc-stun-status',
         '--allow-interrupt-active-tasks',
         '--expected-service-id',
         'b'.repeat(64),
@@ -207,6 +270,8 @@ describe('managed Runtime Host service', () => {
         listenAddresses: ['/ip4/0.0.0.0/udp/44001/quic-v1'],
         coordinationRelays: [],
         automaticRelayDiscovery: false,
+        webRtcStunPolicy: { kind: 'custom', urls: ['stun:stun.example:3478'] },
+        webRtcStunStatus: true,
         allowInterruptActiveTasks: true,
         managedRootId: 'a'.repeat(64),
         operatorDeploymentId: '00000000-0000-4000-8000-000000000001',
@@ -491,6 +556,70 @@ describe('managed Runtime Host service', () => {
       },
     );
     assert.equal(parseRuntimeHostCommand(['service', 'status', '--root', '/tmp']).kind, 'error');
+    const setupUpdateArgs = [
+      'setup',
+      '--principal',
+      'desktop.client-1',
+      '--preset',
+      'desktop-client',
+    ];
+    assert.equal(
+      parseRuntimeHostCommand([...setupUpdateArgs, '--allow-interrupt-active-tasks']).kind,
+      'error',
+    );
+    const expectedExisting = {
+      rootId: 'a'.repeat(64),
+      operator: {
+        kind: 'node',
+        platform: 'posix',
+        nodePath: '/old/node',
+        modulePath: '/operator.mjs',
+      },
+    };
+    const recoveryArgs = [
+      ...setupUpdateArgs,
+      '--lifecycle',
+      'on-demand',
+      '--reuse-existing-environment',
+    ];
+    const targetArgs = [
+      '--managed-root-id',
+      expectedExisting.rootId,
+      '--expected-operator-json',
+      JSON.stringify(expectedExisting.operator),
+    ];
+    const recovery = parseRuntimeHostCommand([...recoveryArgs, ...targetArgs]);
+    assert.deepEqual(
+      recovery.kind === 'runtime-host-setup' ? recovery.expectedExisting : null,
+      expectedExisting,
+    );
+    for (const invalid of [
+      targetArgs.slice(0, 2),
+      targetArgs.slice(2),
+      [...targetArgs, '--expected-operator-json', '{}'],
+    ]) {
+      assert.equal(parseRuntimeHostCommand([...recoveryArgs, ...invalid]).kind, 'error');
+    }
+    assert.equal(parseRuntimeHostCommand([...setupUpdateArgs, ...targetArgs]).kind, 'error');
+    const explicitSetupUpdate = parseRuntimeHostCommand([
+      ...setupUpdateArgs,
+      '--update-existing',
+      '--allow-interrupt-active-tasks',
+    ]);
+    assert.equal(explicitSetupUpdate.kind, 'runtime-host-setup');
+    if (explicitSetupUpdate.kind === 'runtime-host-setup') {
+      assert.equal(explicitSetupUpdate.allowInterruptActiveTasks, true);
+    }
+    assert.equal(
+      parseRuntimeHostCommand([
+        ...setupUpdateArgs,
+        '--update-existing',
+        '--allow-interrupt-active-tasks',
+        '--allow-interrupt-active-tasks',
+      ]).kind,
+      'error',
+    );
+
     assert.equal(
       parseRuntimeHostCommand([
         'setup',
@@ -2519,9 +2648,8 @@ describe('managed Runtime Host service', () => {
     let observedState: 'running' | 'stopped' = 'running';
     let observedCliPath: string | undefined;
     let readyFailure = false;
-    let operatorSupportsProcessLifetimeLock = false;
-    let legacyLeaseCalls = 0;
     let operatorStatusFailure = false;
+    let operatorLacksCapability = false;
     let operatorFailure: Extract<RuntimeHostServiceManagementFrame, { kind: 'error' }> | undefined;
     let replacementPreconditionFailure = false;
     let replaceFailure = false;
@@ -2543,11 +2671,15 @@ describe('managed Runtime Host service', () => {
       version,
       root: deploymentRoot,
       cliPath,
-      operatorPath: join(deploymentRoot, 'operator'),
+      operator: {
+        kind: 'node' as const,
+        platform: 'posix' as const,
+        nodePath: '/usr/bin/node',
+        modulePath: join(deploymentRoot, 'operator.mjs'),
+      },
       activate: async () => {
         assert.equal(insideLifecycle, true);
         order.push('activate');
-        operatorSupportsProcessLifetimeLock = true;
       },
       cleanup: async () => {
         order.push('cleanup');
@@ -2583,13 +2715,6 @@ describe('managed Runtime Host service', () => {
         }
       },
       withDeploymentLock: async <T>(_root: string, operation: () => Promise<T>) => operation(),
-      withLegacyOperatorLeases: async <T>(
-        _root: string,
-        operation: (fds: readonly number[]) => Promise<T>,
-      ) => {
-        legacyLeaseCalls += 1;
-        return operation([]);
-      },
       openDeployment: async (
         input: Parameters<typeof openRuntimeHostManagedPackageDeployment>[0],
       ) => deployment(input.version, input.cliPath),
@@ -2605,21 +2730,20 @@ describe('managed Runtime Host service', () => {
           ),
         ),
       runOperator: async (
-        _operatorPath: string,
+        operator: import('@maka/runtime-host/operator').RuntimeHostOperatorCommand,
         args: readonly string[],
-        invocation?: {
-          readonly inheritedFds?: readonly number[];
-          readonly capabilityRequest?: RuntimeHostOperatorCapability;
-        },
+        invocation?: { readonly capabilityRequest?: string },
       ) => {
+        assert.deepEqual(operator, {
+          kind: 'legacy_posix_executable',
+          executablePath: join(deploymentRoot, 'operator'),
+        });
         const action = args[0];
         assert.ok(action === 'status' || action === 'retire');
         if (action === 'status') {
           if (operatorStatusFailure) throw new Error('The active operator is unavailable');
-          assert.equal(
-            invocation?.capabilityRequest,
-            RUNTIME_HOST_OPERATOR_PROCESS_LIFETIME_LOCK_CAPABILITY,
-          );
+          const capabilityRequest = invocation?.capabilityRequest;
+          assert.equal(capabilityRequest, 'process-lifetime-lock-v1');
           return {
             schemaVersion: 1 as const,
             kind: 'result' as const,
@@ -2635,13 +2759,9 @@ describe('managed Runtime Host service', () => {
               stateRoot: expectedTarget.rootPath,
               projectDirectoryRoots: [],
             },
-            ...(operatorSupportsProcessLifetimeLock
-              ? {
-                  operatorCapabilities: [
-                    RUNTIME_HOST_OPERATOR_PROCESS_LIFETIME_LOCK_CAPABILITY,
-                  ] as RuntimeHostOperatorCapability[],
-                }
-              : {}),
+            ...(operatorLacksCapability || !capabilityRequest
+              ? {}
+              : { operatorCapabilities: [capabilityRequest] }),
           };
         }
         order.push(action);
@@ -2706,7 +2826,6 @@ describe('managed Runtime Host service', () => {
     const exitCode = await runManagedRuntimeHostUpdateCli(options, overrides);
     assert.equal(exitCode, 0);
     assert.deepEqual(order, ['retire', 'activate', 'replace', 'cleanup']);
-    assert.equal(legacyLeaseCalls, 1);
     const frames = output
       .trim()
       .split('\n')
@@ -2832,7 +2951,6 @@ describe('managed Runtime Host service', () => {
     readyFailure = true;
     assert.equal(await runManagedRuntimeHostUpdateCli(options, overrides), 0);
     assert.deepEqual(order, ['retire', 'activate', 'replace', 'cleanup']);
-    assert.equal(legacyLeaseCalls, 1);
     const activeRecovery = decodeRuntimeHostServiceManagementFrame(
       output.trim().split('\n').at(-1) ?? '',
     );
@@ -2880,7 +2998,6 @@ describe('managed Runtime Host service', () => {
     expectAllowInterruptActiveTasks = true;
     assert.equal(await runManagedRuntimeHostUpdateCli(options, overrides), 0);
     assert.deepEqual(order, ['retire', 'force-retire', 'activate', 'replace', 'cleanup']);
-    assert.equal(legacyLeaseCalls, 1);
 
     statusReads = 0;
     observedVersion = '1.0.0';
@@ -2954,6 +3071,46 @@ describe('managed Runtime Host service', () => {
       staleCandidate?.kind === 'error' ? staleCandidate.error.code : undefined,
       'target_mismatch',
     );
+
+    // An operator that cannot echo the requested capability predates the
+    // lifetime-lock protocol: the update must refuse rather than retire it
+    // without the advisory lease.
+    statusReads = 0;
+    observedVersion = '1.0.0';
+    operatorLacksCapability = true;
+    output = '';
+    order.length = 0;
+    assert.equal(await runManagedRuntimeHostUpdateCli(options, overrides), 1);
+    assert.deepEqual(order, []);
+    const legacyOperator = decodeRuntimeHostServiceManagementFrame(
+      output.trim().split('\n').at(-1) ?? '',
+    );
+    assert.equal(
+      legacyOperator?.kind === 'error' ? legacyOperator.error.code : undefined,
+      'service_manager_operation_failed',
+    );
+
+    // Repair mode must not soften the refusal: with a damaged active target
+    // the probe catch degrades probe failures to "operator unavailable", but
+    // an answered-but-unsupported verdict still refuses — otherwise the
+    // forced retire under --allow-interrupt-active-tasks would retire an
+    // operator it cannot safely interrogate.
+    statusReads = 0;
+    observedVersion = '2.0.0';
+    readyFailure = true;
+    output = '';
+    order.length = 0;
+    assert.equal(await runManagedRuntimeHostUpdateCli(options, overrides), 1);
+    assert.deepEqual(order, []);
+    const repairedLegacyOperator = decodeRuntimeHostServiceManagementFrame(
+      output.trim().split('\n').at(-1) ?? '',
+    );
+    assert.equal(
+      repairedLegacyOperator?.kind === 'error' ? repairedLegacyOperator.error.code : undefined,
+      'service_manager_operation_failed',
+    );
+    readyFailure = false;
+    operatorLacksCapability = false;
   });
 
   it('rejects invalid Project roots and temporary npx launch paths before deployment', async (t) => {
@@ -3037,6 +3194,30 @@ describe('managed Runtime Host service', () => {
     );
   });
 
+  it('treats an absent systemd supervisor as already retired', async (t) => {
+    const base = await mkdtemp(join(tmpdir(), 'maka-runtime-host-systemd-retire-'));
+    t.after(() => rm(base, { recursive: true, force: true }));
+    const serviceId = resolveRuntimeHostManagedServiceId(join(base, 'config'));
+    const unitPath = resolveSystemdUserRuntimeHostServicePath(serviceId, {
+      XDG_CONFIG_HOME: base,
+    });
+    const systemd = createFakeSystemd(unitPath);
+    const provider = createSystemdUserRuntimeHostLifecycleProvider(serviceId, {
+      env: { XDG_CONFIG_HOME: base },
+      homeDir: base,
+      uid: 1000,
+      runSystemctl: systemd.run,
+      runLoginctl: async () => success('yes\n'),
+    });
+
+    await provider.supervisor.retire();
+
+    assert.equal(
+      systemd.calls.some(([command]) => command === 'stop'),
+      false,
+    );
+  });
+
   it('serializes status behind an in-flight deployment', async (t) => {
     const base = await mkdtemp(join(tmpdir(), 'maka-runtime-host-service-lock-'));
     t.after(() => rm(base, { recursive: true, force: true }));
@@ -3079,6 +3260,25 @@ describe('managed Runtime Host service', () => {
     releaseReady();
     await installing;
     assert.notEqual((await status).service.config, null);
+  });
+
+  it('formats bounded, redacted readiness evidence for a failed managed Host', () => {
+    const diagnostic = formatRuntimeHostServiceReadinessDiagnostic({
+      lastFailure: 'Host state is failed; token=connection-secret',
+      status: {
+        state: 'failed',
+        active: false,
+        pid: null,
+        lastExitCode: 78,
+      },
+      logs: `${'x'.repeat(8_000)}\nstartup failed: {"apiKey":"fixture-secret"}`,
+    });
+
+    assert.match(diagnostic, /Host state is failed/u);
+    assert.match(diagnostic, /last exit code: 78/u);
+    assert.match(diagnostic, /service logs \(tail\):/u);
+    assert.doesNotMatch(diagnostic, /connection-secret|fixture-secret/u);
+    assert.ok(Buffer.byteLength(diagnostic, 'utf8') <= 2_048);
   });
 });
 

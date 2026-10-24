@@ -22,11 +22,15 @@ export type ProxyType = 'http' | 'https' | 'socks5';
 export const SENSITIVE_PLACEHOLDER = '••••••••' as const;
 export type Sensitive = string | typeof SENSITIVE_PLACEHOLDER;
 
+export function isSensitivePlaceholder(value: string | undefined): boolean {
+  return value === SENSITIVE_PLACEHOLDER || value === '••••••';
+}
+
 export function applySensitivePatch(
   prev: string | undefined,
   next: Sensitive | undefined,
 ): string | undefined {
-  if (next === undefined || next === SENSITIVE_PLACEHOLDER) return prev;
+  if (next === undefined || isSensitivePlaceholder(next)) return prev;
   if (next === '') return undefined;
   return next;
 }
@@ -68,7 +72,7 @@ export const NETWORK_DEFAULTS: RuntimeNetworkSettings = {
   preferIpv4: false,
 };
 
-export interface TestProxySettings extends ProxySettings {
+export interface TestProxySettings extends Omit<ProxySettings, 'password'> {
   authEnabled?: boolean;
 }
 

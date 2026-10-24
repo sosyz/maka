@@ -18,10 +18,16 @@
  */
 
 import assert from 'node:assert/strict';
+import { execFile, spawnSync } from 'node:child_process';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
+import { promisify } from 'node:util';
 import test from 'node:test';
 import {
   activateRuntimeHostSshOperator,
+  runtimeHostSshOperatorRemoteCommand,
   type RuntimeHostSshOperatorProcess,
   type RuntimeHostSshOperatorProcessFactory,
 } from '../client/ssh-operator-activation.js';
@@ -32,6 +38,7 @@ import {
 import { RUNTIME_HOST_PROTOCOL_VERSION } from '../protocol/index.js';
 
 const ROOT_ID = 'a'.repeat(64);
+const execFileAsync = promisify(execFile);
 const RESULT = {
   schemaVersion: 1,
   kind: 'result',
@@ -44,13 +51,75 @@ const RESULT = {
   endpoint: { host: '127.0.0.1', port: 45_678, websocketPath: '/runtime-host' },
 } as const;
 
+const operator = (modulePath: string) => ({
+  kind: 'node' as const,
+  platform: 'posix' as const,
+  nodePath: '/usr/bin/node',
+  modulePath,
+});
+
+test('Windows SSH operator preserves native argv, environment, output and exit status', {
+  skip: process.platform !== 'win32',
+}, async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'maka-operator-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const modulePath = join(directory, 'operator 中文.mjs');
+  await writeFile(
+    modulePath,
+    `import { readFileSync } from 'node:fs';process.stdout.write(JSON.stringify({args:process.argv.slice(2),env:process.env.MAKA_TEST_VALUE,stdin:readFileSync(0,'utf8')}));process.stderr.write('diagnostic');process.exitCode=37;`,
+  );
+  const args = [
+    'configure',
+    '--project-root-json',
+    JSON.stringify({ label: 'My project', path: 'C:\\项目\\' }),
+    '',
+    'space and trailing slash\\',
+    'embedded"quote',
+    'backslash\\"quote',
+    '%PATH%',
+    '!PATH!',
+    '&|<>',
+  ];
+  const environment = { MAKA_TEST_VALUE: 'literal "value" 中文' };
+  const command = runtimeHostSshOperatorRemoteCommand(
+    {
+      kind: 'node',
+      platform: 'win32',
+      nodePath: process.execPath,
+      modulePath,
+    },
+    args,
+    environment,
+  );
+  const encoded = command.split(' -EncodedCommand ')[1];
+  assert.ok(encoded);
+  const result = spawnSync(
+    'powershell.exe',
+    ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
+    {
+      encoding: 'utf8',
+      input: 'operator input 中文\n',
+      windowsHide: true,
+      timeout: 15_000,
+    },
+  );
+  assert.ifError(result.error);
+  assert.equal(result.status, 37, result.stderr);
+  assert.equal(result.stderr, 'diagnostic');
+  assert.deepEqual(JSON.parse(result.stdout), {
+    args,
+    env: environment.MAKA_TEST_VALUE,
+    stdin: 'operator input 中文\n',
+  });
+});
+
 test('SSH activation accepts a strict final frame that drains after process exit', async () => {
   let invocation: Parameters<RuntimeHostSshOperatorProcessFactory>[0] | undefined;
   const result = await activateRuntimeHostSshOperator(
     {
       destination: 'operator@example.com',
       sshPort: 2222,
-      operatorPath: "/opt/maka/operator's bin",
+      operator: operator("/opt/maka/operator's bin"),
       rootId: ROOT_ID,
       interaction: 'batch',
     },
@@ -83,8 +152,30 @@ test('SSH activation accepts a strict final frame that drains after process exit
     '-p',
     '2222',
     'operator@example.com',
-    `'${"/opt/maka/operator's bin".replaceAll("'", `'"'"'`)}' activate --framed --root-id ${ROOT_ID}`,
+    `exec '/usr/bin/node' '${"/opt/maka/operator's bin".replaceAll("'", `'"'"'`)}' 'activate' '--framed' '--root-id' '${ROOT_ID}'`,
   ]);
+});
+
+test('POSIX operator commands apply environment before exec', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'maka-ssh-operator-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const modulePath = join(directory, 'operator.mjs');
+  await writeFile(modulePath, `process.stdout.write(process.env.MAKA_TEST_VALUE ?? 'missing');\n`);
+  const command = runtimeHostSshOperatorRemoteCommand(
+    { ...operator(modulePath), nodePath: process.execPath },
+    [],
+    { MAKA_TEST_VALUE: "value with ' quotes" },
+  );
+
+  const { stdout } = await execFileAsync('/bin/sh', ['-c', command]);
+  assert.equal(stdout, "value with ' quotes");
+  assert.equal(
+    runtimeHostSshOperatorRemoteCommand(
+      { kind: 'legacy_posix_executable', executablePath: '/opt/maka/operator' },
+      ['activate'],
+    ),
+    "exec '/opt/maka/operator' 'activate'",
+  );
 });
 
 test('SSH activation rejects multiple framed results', async () => {
@@ -92,7 +183,7 @@ test('SSH activation rejects multiple framed results', async () => {
     activateRuntimeHostSshOperator(
       {
         destination: 'operator@example.com',
-        operatorPath: '/opt/maka/operator',
+        operator: operator('/opt/maka/operator.mjs'),
         rootId: ROOT_ID,
         interaction: 'batch',
       },
@@ -117,7 +208,7 @@ test('SSH activation kills and rejects oversized operator output', async () => {
     activateRuntimeHostSshOperator(
       {
         destination: 'operator@example.com',
-        operatorPath: '/opt/maka/operator',
+        operator: operator('/opt/maka/operator.mjs'),
         rootId: ROOT_ID,
         interaction: 'batch',
       },

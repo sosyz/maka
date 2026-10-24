@@ -31,9 +31,81 @@ import {
   authorizeRuntimeHostOperation,
   createRuntimeHostConnectionAuthority,
 } from '../server/connection-authority.js';
-import { decodeScheduledTaskMutateInput } from '../protocol/scheduled-task.js';
+import {
+  decodeScheduledTaskMutateInput,
+  decodeScheduledTaskMutateResult,
+} from '../protocol/scheduled-task.js';
 
 describe('ScheduledTask protocol', () => {
+  test('preserves Agent tool mode through mutations and catalog reads, including legacy templates', () => {
+    for (const toolMode of [undefined, 'direct', 'code_mode'] as const) {
+      const effect = agentRunEffect('project-1');
+      assert.equal(effect.kind, 'agent_run');
+      if (effect.kind !== 'agent_run') return;
+      const task = {
+        ...scheduledTask('agent-task'),
+        effect: {
+          ...effect,
+          execution: {
+            ...effect.execution,
+            ...(toolMode === undefined ? {} : { toolMode }),
+          },
+        },
+      };
+      const create = {
+        kind: 'create',
+        input: {
+          title: task.title,
+          intentBody: task.intent.body,
+          schedule: task.schedule,
+          effect: task.effect,
+        },
+      };
+      const update = { kind: 'update', taskId: task.id, patch: { effect: task.effect } };
+      const result = { kind: 'task', task };
+      const page = {
+        kind: 'page',
+        revision: 1,
+        tasks: [scheduledTask('notification'), task],
+        nextCursor: null,
+      };
+      assert.deepEqual(decodeScheduledTaskMutateInput(create), create);
+      assert.deepEqual(decodeScheduledTaskMutateInput(update), update);
+      assert.deepEqual(decodeScheduledTaskMutateResult(result), result);
+      assert.deepEqual(decodeScheduledTaskQueryResult(result), result);
+      assert.deepEqual(decodeScheduledTaskQueryResult(page), page);
+    }
+  });
+
+  test('rejects invalid Agent tool modes on writes and reads', () => {
+    const effect = agentRunEffect('project-1');
+    if (effect.kind !== 'agent_run') return;
+    for (const toolMode of ['unknown', null, 42]) {
+      const invalidEffect = { ...effect, execution: { ...effect.execution, toolMode } };
+      assert.throws(
+        () =>
+          decodeScheduledTaskMutateInput({
+            kind: 'create',
+            input: {
+              title: 'Invalid',
+              intentBody: '',
+              schedule: { kind: 'once', runAt: 1 },
+              effect: invalidEffect,
+            },
+          }),
+        /Invalid ScheduledTask tool mode/u,
+      );
+      assert.throws(
+        () =>
+          decodeScheduledTaskQueryResult({
+            kind: 'task',
+            task: { ...scheduledTask('invalid'), effect: invalidEffect },
+          }),
+        /Invalid ScheduledTask tool mode/u,
+      );
+    }
+  });
+
   test('requires Host-path authority only when a mutation submits a Host path', () => {
     const authority = createRuntimeHostConnectionAuthority({
       principalKind: 'remote_owner',
@@ -95,6 +167,41 @@ describe('ScheduledTask protocol', () => {
       patch: { effect: withRetiredBackend(template) },
     });
     assertDropped(updated.kind === 'update' ? updated.patch.effect : undefined);
+  });
+
+  test('requires Connection identity on Agent task mutations but accepts legacy reads', () => {
+    const legacy = agentRunEffect('project-1');
+    if (legacy.kind !== 'agent_run') return;
+    const { llmConnectionId: _legacyId, ...legacyExecution } = legacy.execution;
+    assert.throws(
+      () =>
+        decodeScheduledTaskMutateInput({
+          kind: 'create',
+          input: {
+            title: 'Legacy task',
+            intentBody: 'Run it',
+            schedule: { kind: 'once', runAt: 1 },
+            effect: { kind: 'agent_run', execution: legacyExecution },
+          },
+        }),
+      /requires Connection id/u,
+    );
+    assert.deepEqual(
+      decodeScheduledTaskQueryResult({
+        kind: 'task',
+        task: {
+          ...scheduledTask('legacy-task'),
+          effect: { kind: 'agent_run', execution: legacyExecution },
+        },
+      }),
+      {
+        kind: 'task',
+        task: {
+          ...scheduledTask('legacy-task'),
+          effect: { kind: 'agent_run', execution: legacyExecution },
+        },
+      },
+    );
   });
 
   test('accepts signal-only catalog changes', () => {
@@ -169,6 +276,7 @@ function agentRunEffect(projectId: string | null | undefined): ScheduledTaskEffe
     execution: {
       cwd: '/workspace',
       ...(projectId === undefined ? {} : { projectId }),
+      llmConnectionId: 'connection-openai',
       llmConnectionSlug: 'openai',
       model: 'gpt-5',
       permissionMode: 'ask',

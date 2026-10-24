@@ -17,6 +17,9 @@
  * under the License.
  */
 
+import { PersonalAssistantEnableSwitch } from '../features/personal-assistant/index.js';
+import { CheckinDefaultModelHint, CheckinEnableSwitch } from '../features/conversation/index.js';
+import { JevSettingsSection } from '../features/jev-settings';
 import { useEffect, useMemo, useState } from "react";
 import { PersonalizationSettingsSection } from "./personalization-settings-section";
 import {
@@ -31,11 +34,13 @@ import type {
   ChatDefaultPermissionMode,
   ShellPreference,
   NetworkProxySettings,
+  RuntimeHostNetworkProxySettings,
   UpdateAppSettingsResult,
 } from '@maka/core/settings';
-import type { ThinkingLevel } from '@maka/core/model-thinking';
-import type { IdentifiedLlmConnection } from '@maka/core/llm-connections';
-import type { TestProxyInput } from "@maka/core/settings/network-settings";
+import type {
+  IdentifiedLlmConnection,
+  ProjectedLlmConnection,
+} from '@maka/core/llm-connections';
 import { buildChatModelChoices } from "@maka/core/chat-model-choice";
 import {
   Button,
@@ -45,6 +50,7 @@ import {
   ModelPicker,
   PermissionModeSelect,
   Selector,
+  StatusDot,
   Switch,
   modelChoiceValue,
   modelMenuGroups,
@@ -56,16 +62,22 @@ import {
 } from "@maka/ui";
 import { ProviderBrandMark } from "./provider-brand-marks";
 import { PasswordInput } from "./password-input";
-import { getConversationCopy } from '@maka/ui';
 import { settingsActionErrorMessage } from "./settings-error-copy";
 import { useActionGuard, useKeyedActionGuard } from "./use-action-guard";
 import { useOptimisticSettingsDraft } from "./use-optimistic-settings-draft";
+import {
+  NetworkProxyPasswordDraft,
+  runAfterProxyPasswordCommit,
+  type ProxyPasswordDraft,
+  type TestProxyInput,
+} from "../features/network-proxy/index.js";
 import { getSettingsPreferencesCopy } from "../locales/settings-preferences-copy.js";
 import { settingsTestResultMessage } from "../locales/settings-test-result-copy.js";
 import { getShellCopy } from "../locales/shell-copy.js";
-import type { RuntimeHostSettingsConnectionsBridge } from './runtime-host-settings-bridge.js';
+import type { RuntimeHostSettingsConnectionsBridge } from '../features/connection-settings';
 import { getSettingsSharedCopy } from '../locales/settings-shared-copy.js';
 import {
+  RuntimeHostSettingsGenerationBoundary,
   useOptionalRuntimeHostSettingsTarget,
   useRuntimeHostSettingsTarget,
 } from './runtime-host-settings-target.js';
@@ -74,7 +86,7 @@ import { SettingsRowSkeleton } from './settings-skeleton.js';
 
 export function GeneralSettingsPage(props: {
   settings: AppSettings;
-  connections: readonly IdentifiedLlmConnection[];
+  connections: readonly ProjectedLlmConnection[];
   defaultSlug: string | null;
   connectionsBridge: Pick<RuntimeHostSettingsConnectionsBridge, 'setDefaultModel'> | undefined;
   runtimeHostAvailabilityStatus: 'loading' | 'ready' | 'unavailable' | 'error';
@@ -282,6 +294,37 @@ export function GeneralSettingsPage(props: {
             />
           }
         />
+        <SettingsRow
+          label={copy.personalAssistant}
+          description={copy.personalAssistantHelp}
+          end={host && runtimeHostTargetVerified ? (
+            <RuntimeHostSettingsGenerationBoundary>
+              <PersonalAssistantEnableSwitch
+                host={host}
+                label={copy.personalAssistant}
+                isLabelHidden
+                isDisabled={!runtimeHostSettingsInteractive}
+              />
+            </RuntimeHostSettingsGenerationBoundary>
+          ) : (
+            <Switch label={copy.personalAssistant} isLabelHidden value={false} isDisabled />
+          )}
+        />
+        <SettingsRow
+          label={copy.checkin}
+          description={copy.checkinHelp}
+          end={
+            <>
+              <CheckinDefaultModelHint hasDefaultModel={props.defaultSlug !== null}>
+                <span className="settingsStatus" role="status">
+                  <StatusDot variant="warning" label={copy.checkinNeedsDefaultModel} />
+                  <span>{copy.checkinNeedsDefaultModel}</span>
+                </span>
+              </CheckinDefaultModelHint>
+              <CheckinEnableSwitch label={copy.checkin} />
+            </>
+          }
+        />
       </SettingsSection>
       {showRuntimeHostDefaults ? (
         <GeneralDefaultsCard
@@ -296,7 +339,7 @@ export function GeneralSettingsPage(props: {
           showSettingsPlaceholder={showRuntimeHostSettingsPlaceholder}
           onRefresh={props.onRefreshConnections}
           permissionMode={props.settings.chatDefaults.permissionMode}
-          thinkingLevel={props.settings.chatDefaults.thinkingLevel}
+          codeModeEnabled={props.settings.chatDefaults.codeModeEnabled === true}
           onUpdate={props.onUpdate}
         />
       ) : null}
@@ -318,6 +361,9 @@ export function GeneralSettingsPage(props: {
               testNetworkProxy={props.testNetworkProxy!}
             />
           </SettingsSection>
+          {host && <RuntimeHostSettingsGenerationBoundary>
+            <JevSettingsSection settings={props.settings.jev} isInteractive={runtimeHostSettingsInteractive} onUpdate={props.onUpdate} />
+          </RuntimeHostSettingsGenerationBoundary>}
         </>
       ) : showRuntimeHostSettingsPlaceholder ? (
         <>
@@ -383,6 +429,9 @@ function ShellSettingsSection(props: {
       await props.onUpdate({
         shell: { preference, executable: normalizedExecutable },
       });
+      // The save action disappears once the draft matches what was saved, so
+      // the confirmation has to come from somewhere else.
+      if (mountedRef.current) toast.success(copy.shellSaved);
     } catch (error) {
       if (mountedRef.current) {
         toast.error(
@@ -438,15 +487,20 @@ function ShellSettingsSection(props: {
           />
         </SettingsField>
       ) : null}
-      <SettingsActions>
-        <Button
-          variant="primary"
-          isDisabled={!canSave || !props.isInteractive}
-          isLoading={saving}
-          onClick={() => void save()}
-          label={saving ? copy.savingShell : dirty ? copy.saveShell : copy.shellSaved}
-        />
-      </SettingsActions>
+      {/* Only while there is something to save. A permanent disabled
+          "已保存" button took a row of its own under the select even in the
+          default auto mode, where there is never anything to confirm. */}
+      {dirty || saving ? (
+        <SettingsActions>
+          <Button
+            variant="secondary"
+            isDisabled={!canSave || !props.isInteractive}
+            isLoading={saving}
+            onClick={() => void save()}
+            label={saving ? copy.savingShell : copy.saveShell}
+          />
+        </SettingsActions>
+      ) : null}
     </SettingsSection>
   );
 }
@@ -477,12 +531,8 @@ function isRejectedShellPreference(error: unknown): boolean {
  * `PermissionModeSelect` so labels, hints, and markup can't drift from the
  * composer picker.
  */
-/** Sentinel for "no preference" — Selector needs a value, absence is not one. */
-const FOLLOW_MODEL_DEFAULT = "__follow_model__";
-const THINKING_LEVELS: readonly ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
-
 function GeneralDefaultsCard(props: {
-  connections: readonly IdentifiedLlmConnection[];
+  connections: readonly ProjectedLlmConnection[];
   defaultSlug: string | null;
   connectionsBridge: Pick<RuntimeHostSettingsConnectionsBridge, 'setDefaultModel'> | undefined;
   connectionsAvailable: boolean;
@@ -493,7 +543,7 @@ function GeneralDefaultsCard(props: {
   showSettingsPlaceholder: boolean;
   onRefresh(): Promise<void>;
   permissionMode: ChatDefaultPermissionMode;
-  thinkingLevel?: ThinkingLevel;
+  codeModeEnabled: boolean;
   onUpdate(
     patch: Parameters<typeof window.maka.settings.update>[0],
   ): Promise<UpdateAppSettingsResult>;
@@ -501,19 +551,16 @@ function GeneralDefaultsCard(props: {
   const host = useOptionalRuntimeHostSettingsTarget();
   const locale = useUiLocale();
   const copy = getSettingsPreferencesCopy(locale).general;
-  // Level names come from the composer's own map — one vocabulary for the
-  // levels, so the settings row and the in-chat menu can never disagree.
-  const conversationCopy = getConversationCopy(locale);
   const sections = getSettingsPreferencesCopy(locale).sections;
   const boundaryCopy = getShellCopy(locale).sessionSettingsActions;
   const toast = useToast();
   const mountedRef = useMountedRef();
-  const persistGuard = useKeyedActionGuard<
-    "default-model" | "permission-mode" | "thinking-level"
-  >();
-  const [saving, setSaving] = useState(false);
-  const [savingPermissionMode, setSavingPermissionMode] = useState(false);
-  const [savingThinkingLevel, setSavingThinkingLevel] = useState(false);
+  type SaveKey = "default-model" | "permission-mode";
+  const persistGuard = useKeyedActionGuard<SaveKey>();
+  const [savingRows, setSavingRows] = useState<Partial<Record<SaveKey, boolean>>>({});
+  function setRowSaving(key: SaveKey, saving: boolean) {
+    setSavingRows((current) => ({ ...current, [key]: saving }));
+  }
 
   const modelChoices = useMemo(
     () => buildChatModelChoices(props.connections),
@@ -541,7 +588,7 @@ function GeneralDefaultsCard(props: {
     if (!props.connectionsBridge || !props.connectionsInteractive) return;
     const releaseSave = persistGuard.begin("default-model");
     if (!releaseSave) return;
-    setSaving(true);
+    setRowSaving("default-model", true);
     try {
       const parsed = parseModelChoiceValue(nextValue);
       await props.connectionsBridge.setDefaultModel(
@@ -565,7 +612,7 @@ function GeneralDefaultsCard(props: {
       }
     } finally {
       releaseSave();
-      if (mountedRef.current) setSaving(false);
+      if (mountedRef.current) setRowSaving("default-model", false);
     }
   }
 
@@ -602,7 +649,7 @@ function GeneralDefaultsCard(props: {
         return;
       }
     }
-    setSavingPermissionMode(true);
+    setRowSaving("permission-mode", true);
     try {
       await props.onUpdate({ chatDefaults: { permissionMode: nextMode } });
     } catch (error) {
@@ -616,29 +663,19 @@ function GeneralDefaultsCard(props: {
       }
     } finally {
       releaseSave();
-      if (mountedRef.current) setSavingPermissionMode(false);
+      if (mountedRef.current) setRowSaving("permission-mode", false);
     }
   }
 
-  async function persistThinkingLevel(next: ThinkingLevel | undefined) {
+  async function persistCodeMode(codeModeEnabled: boolean) {
     if (!props.settingsInteractive) return;
-    const releaseSave = persistGuard.begin("thinking-level");
-    if (!releaseSave) return;
-    setSavingThinkingLevel(true);
     try {
-      await props.onUpdate({ chatDefaults: { thinkingLevel: next } });
+      await props.onUpdate({ chatDefaults: { codeModeEnabled } });
     } catch (error) {
       if (mountedRef.current) {
-        toast.error(
-          copy.saveDefaultThinkingFailed,
-          settingsActionErrorMessage(error, locale),
-          undefined,
-          host ? { profileId: host.profileId } : undefined,
-        );
+        toast.error(copy.updateFailed, settingsActionErrorMessage(error, locale), undefined,
+          host ? { profileId: host.profileId } : undefined);
       }
-    } finally {
-      releaseSave();
-      if (mountedRef.current) setSavingThinkingLevel(false);
     }
   }
 
@@ -647,6 +684,23 @@ function GeneralDefaultsCard(props: {
       title={sections.chatDefaults}
       description={sections.chatDefaultsHelp}
     >
+      {props.settingsAvailable ? (
+        <SettingsRow
+          label="Code Mode"
+          description={copy.codeModeHelp}
+          end={
+            <Switch
+              label="Code Mode"
+              isLabelHidden
+              value={props.codeModeEnabled}
+              isDisabled={!props.settingsInteractive}
+              changeAction={persistCodeMode}
+            />
+          }
+        />
+      ) : props.showSettingsPlaceholder ? (
+        <SettingsRowSkeleton label="Code Mode" description={copy.codeModeHelp} width="3rem" />
+      ) : null}
       {props.connectionsAvailable ? (
         <SettingsRow
           label={copy.defaultModel}
@@ -658,8 +712,7 @@ function GeneralDefaultsCard(props: {
               leadingOption={{ value: "", label: copy.notSet }}
               renderProviderMark={(type) => <ProviderBrandMark type={type} />}
               ariaLabel={copy.defaultModel}
-              disabled={saving || !props.connectionsInteractive}
-              loading={saving}
+              disabled={savingRows["default-model"] || !props.connectionsInteractive}
               triggerClassName="settingsModelPickerTrigger"
               onValueChange={persistDefault}
             />
@@ -683,7 +736,7 @@ function GeneralDefaultsCard(props: {
                 void persistPermissionMode(mode);
               }}
               align="end"
-              disabled={savingPermissionMode || !props.settingsInteractive}
+              disabled={savingRows["permission-mode"] || !props.settingsInteractive}
               ariaLabel={copy.defaultPermission}
             />
           }
@@ -692,42 +745,6 @@ function GeneralDefaultsCard(props: {
         <SettingsRowSkeleton
           label={copy.defaultPermission}
           description={copy.defaultPermissionHelp}
-          width="7rem"
-        />
-      ) : null}
-      {/* The absent option is first and means exactly that: no preference, so
-          each model uses its own. It is not a level, which is why the composer
-          menu now calls that same state 模型默认 rather than 默认 — the old
-          wording promised a knob that did not exist anywhere. */}
-      {props.settingsAvailable ? (
-        <SettingsRow
-          label={copy.defaultThinking}
-          description={copy.defaultThinkingHelp}
-          end={
-            <Selector
-              label={copy.defaultThinking}
-              isLabelHidden
-              value={props.thinkingLevel ?? FOLLOW_MODEL_DEFAULT}
-              onChange={(value) => {
-                void persistThinkingLevel(
-                  value === FOLLOW_MODEL_DEFAULT ? undefined : (value as ThinkingLevel),
-                );
-              }}
-              options={[
-                { value: FOLLOW_MODEL_DEFAULT, label: copy.followModelDefault },
-                ...THINKING_LEVELS.map((level) => ({
-                  value: level,
-                  label: conversationCopy.model.level[level],
-                })),
-              ]}
-              isDisabled={savingThinkingLevel || !props.settingsInteractive}
-            />
-          }
-        />
-      ) : props.showSettingsPlaceholder ? (
-        <SettingsRowSkeleton
-          label={copy.defaultThinking}
-          description={copy.defaultThinkingHelp}
           width="7rem"
         />
       ) : null}
@@ -746,29 +763,35 @@ function NetworkProxySection(props: {
   const host = useRuntimeHostSettingsTarget();
   const locale = useUiLocale();
   const copy = getSettingsPreferencesCopy(locale).general;
-  const persistedProxy = props.settings.network.proxy;
+  const persistedProxy = props.settings.network
+    .proxy as RuntimeHostNetworkProxySettings;
   const [testing, setTesting] = useState(false);
   const proxyTestGuard = useActionGuard<"test">();
   const toast = useToast();
+  function reportNetworkSaveError(error: unknown): void {
+    toast.error(
+      copy.saveNetworkFailed,
+      settingsActionErrorMessage(error, locale),
+      undefined,
+      { profileId: host.profileId },
+    );
+  }
   const {
     draft: proxyDraft,
     draftRef: proxyDraftRef,
     mountedRef: networkPageMountedRef,
     update,
-  } = useOptimisticSettingsDraft<NetworkProxySettings>(
+  } = useOptimisticSettingsDraft<RuntimeHostNetworkProxySettings>(
     persistedProxy,
     (patch) =>
       props
         .onUpdate({ network: { proxy: patch } })
-        .then((result) => result.settings.network.proxy),
+        .then(
+          (result) =>
+            result.settings.network.proxy as RuntimeHostNetworkProxySettings,
+    ),
     {
-      onError: (error) =>
-        toast.error(
-          copy.saveNetworkFailed,
-          settingsActionErrorMessage(error, locale),
-          undefined,
-          { profileId: host.profileId },
-        ),
+      onError: reportNetworkSaveError,
     },
   );
 
@@ -777,12 +800,27 @@ function NetworkProxySection(props: {
     return update(patch);
   }
 
-  async function testProxy() {
+  async function saveProxyPassword(secret: string) {
+    try {
+      await props.onUpdate({
+        network: {
+          proxy: { credential: { kind: "replace", secret } },
+        },
+      });
+    } catch (error) {
+      reportNetworkSaveError(error);
+      throw error;
+    }
+  }
+
+  async function testProxy(passwordDraft: ProxyPasswordDraft) {
     if (!props.isInteractive) return;
     if (!proxyTestGuard.begin("test")) return;
     setTesting(true);
     try {
-      const result = await props.testNetworkProxy(toProxyTestInput(proxyDraftRef.current));
+      const result = await runAfterProxyPasswordCommit(passwordDraft, () =>
+        props.testNetworkProxy(toProxyTestInput(proxyDraftRef.current)),
+      );
       const latency =
         result.latencyMs !== undefined ? ` · ${result.latencyMs} ms` : "";
       const message = settingsTestResultMessage(result, locale);
@@ -814,7 +852,9 @@ function NetworkProxySection(props: {
   }
 
   return (
-    <>
+    <NetworkProxyPasswordDraft save={saveProxyPassword}>
+      {(passwordDraft) => (
+        <>
       <SettingsRow
         label={copy.proxy}
         description={copy.proxyHelp}
@@ -875,7 +915,16 @@ function NetworkProxySection(props: {
                 isLabelHidden
                 value={proxyDraft.authEnabled}
                 isDisabled={!props.isInteractive}
-                onChange={(authEnabled) => void updateProxy({ authEnabled })}
+                onChange={(authEnabled) => {
+                  if (authEnabled) {
+                    void updateProxy({ authEnabled });
+                    return;
+                  }
+                  passwordDraft.cancel();
+                  void updateProxy({ authEnabled }).then((saved) => {
+                    if (saved) passwordDraft.cancel();
+                  });
+                }}
               />
             }
           />
@@ -890,8 +939,22 @@ function NetworkProxySection(props: {
                   isDisabled={!props.isInteractive}
                 />
                 <PasswordInput
-                  value={proxyDraft.password}
-                  onChange={(next) => void updateProxy({ password: next })}
+                  value={passwordDraft.value}
+                  onChange={passwordDraft.edit}
+                  onFocusExit={() => void passwordDraft.commit().catch(() => {})}
+                  onEnter={() => void passwordDraft.commit().catch(() => {})}
+                  onKeyDown={(event) => {
+                    if (event.key !== "Escape") return;
+                    event.preventDefault();
+                    event.stopPropagation();
+                    passwordDraft.cancel();
+                  }}
+                  hasCopyAction={false}
+                  placeholder={
+                    proxyDraft.passwordConfigured
+                      ? copy.passwordSavedPlaceholder
+                      : undefined
+                  }
                   label={copy.password}
                   isDisabled={!props.isInteractive}
                 />
@@ -907,31 +970,26 @@ function NetworkProxySection(props: {
               }
               placeholder="metaso.cn, baidu.com"
               label={copy.bypassList}
-              description={copy.bypassHelp}
+              description={copy.bypassHelp(proxyDraft.autoBypassDomains.length)}
               width="100%"
               isDisabled={!props.isInteractive}
             />
           </SettingsField>
 
-          <SettingsField>
-            <Banner
-              status="info"
-              title={copy.autoBypass(proxyDraft.autoBypassDomains.length)}
-            />
-          </SettingsField>
-
           <SettingsActions>
             <Button
-              variant="primary"
+              variant="secondary"
               isLoading={testing}
               isDisabled={!props.isInteractive}
-              onClick={() => void testProxy()}
+              onClick={() => void testProxy(passwordDraft)}
               label={copy.testCurrent}
             />
           </SettingsActions>
         </>
       )}
-    </>
+        </>
+      )}
+    </NetworkProxyPasswordDraft>
   );
 }
 
@@ -947,8 +1005,6 @@ function toProxyTestInput(proxy: NetworkProxySettings): TestProxyInput {
         proxy.authEnabled && proxy.username.trim()
           ? proxy.username.trim()
           : undefined,
-      password:
-        proxy.authEnabled && proxy.password ? proxy.password : undefined,
       bypassList: proxy.bypassList,
     },
   };

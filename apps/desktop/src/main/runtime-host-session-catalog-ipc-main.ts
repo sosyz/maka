@@ -17,25 +17,32 @@
  * under the License.
  */
 
+import { isExecutorConfiguration } from '@maka/core/executor-catalog';
 import { randomUUID } from 'node:crypto';
 import { isCollaborationMode } from '@maka/core/collaboration';
 import { isOrchestrationMode } from '@maka/core/orchestration';
 import { isPermissionMode } from '@maka/core/permission';
-import { isThinkingLevel } from '@maka/core/model-thinking';
+import { isThinkingLevel, type ThinkingLevel } from '@maka/core/model-thinking';
 import { type CreateSessionRequestInput, type SessionListFilter } from '@maka/core/runtime-inputs';
 import { type SessionChangedEvent, type SessionChangedReason, type SessionCatalogSummary } from '@maka/core/session';
-import { projectSessionCatalogSummary } from '@maka/runtime-host/client';
+import { RuntimeHostOperationError, projectSessionCatalogSummary } from '@maka/runtime-host/client';
 import type {
   SessionCatalogProjection,
-  SharedSessionCatalogProjection,
   SessionCreateInput,
+  SessionRemovePreviewInput,
   WorkspaceTarget,
   SessionModelTarget,
 } from '@maka/runtime-host/protocol';
-import { resolveCreateSessionRequest } from './create-session-input.js';
 import type {
-  DesktopRuntimeHostClient,
-  DesktopSessionConfigurationPatch,
+  DesktopSessionUpdateFailureCode,
+  DesktopSessionUpdateResult,
+} from '../shared/desktop-session-projection.js';
+import { resolveCreateSessionRequest } from './create-session-input.js';
+import type { ManagedTaskDirectoryAuthority } from './managed-task-directory.js';
+import {
+  type DesktopRuntimeHostClient,
+  DesktopRuntimeHostClientError,
+  type DesktopSessionConfigurationPatch,
 } from './runtime-host-client.js';
 import {
   requestsRevisionFamily,
@@ -51,7 +58,10 @@ import {
 type RuntimeHostSessionCatalogClient = Pick<
   DesktopRuntimeHostClient,
   | 'createSession'
+  | 'getSession'
   | 'listSessions'
+  | 'previewSessionRemoval'
+  | 'relocateSessionWorkspace'
   | 'removeSession'
   | 'setSessionLifecycle'
   | 'updateSessionConfiguration'
@@ -59,17 +69,28 @@ type RuntimeHostSessionCatalogClient = Pick<
 >;
 
 export interface DesktopHostSessionSummary extends SessionCatalogSummary {
+  revision: number;
   labelsTruncated: boolean;
   shared?: true;
 }
 
 export interface RuntimeHostSessionCatalogIpcDeps {
   client: RuntimeHostSessionCatalogClient;
+  queryExecutors?: (input: import('@maka/runtime-host/protocol').PluginExecutorQueryInput) => Promise<import('@maka/runtime-host/protocol').PluginExecutorQueryResult>;
   /** Observer state supplements the Host catalog without falling back to the durable header. */
   runningTurnIds: (sessionId: string) => readonly string[];
   resolveCreateProject: (
     input: Pick<CreateSessionRequestInput, 'cwd' | 'projectId'>,
+    allocateHostProject?: () => Promise<WorkspaceTarget>,
   ) => Promise<WorkspaceTarget>;
+  /** Present only for a Host that owns its workspace filesystem. */
+  allocateAssistantWorkspace?: () => Promise<WorkspaceTarget>;
+  /**
+   * Dedicated task-directory authority for the explicit relocation
+   * correction. Absent on Hosts that cannot provision Client directories —
+   * the IPC then refuses rather than guessing.
+   */
+  dedicatedTaskDirectory?: ManagedTaskDirectoryAuthority;
   emitSessionsChanged: (
     reason: SessionChangedReason,
     sessionId?: string,
@@ -78,10 +99,6 @@ export interface RuntimeHostSessionCatalogIpcDeps {
   releaseSessionResources: (sessionId: string) => void | Promise<void>;
   sessionCopyCleanup: SessionCopyCleanupAuthority;
   newId?: () => string;
-}
-
-export interface RuntimeHostSharedSessionCatalogIpcDeps {
-  getSession(): Promise<DesktopHostSessionSummary | null>;
 }
 
 export function registerRuntimeHostSessionCatalogIpc(
@@ -110,9 +127,32 @@ export function registerRuntimeHostSessionCatalogIpc(
   const actionIds = (sessionId: string, options: unknown) =>
     resolveSessionActionIds(() => listSessions(), sessionId, options);
 
+  handleReconnectableRead(ipcMain, 'sessions:executorCatalog', async (_event, cwd: string, refresh?: boolean, executorId?: string, listOnly?: boolean) => {
+    if (typeof cwd !== 'string' || !cwd) throw new Error('Executor discovery requires a workspace');
+    if (refresh !== undefined && typeof refresh !== 'boolean') throw new Error('Invalid executor refresh flag');
+    if (executorId !== undefined && (typeof executorId !== 'string' || !executorId || executorId.length > 256))
+      throw new Error('Invalid executor ID');
+    if (listOnly !== undefined && typeof listOnly !== 'boolean') throw new Error('Invalid executor inventory flag');
+    return (await deps.queryExecutors?.({ kind: 'catalog', cwd, ...(refresh ? { refresh: true } : {}),
+      ...(executorId ? { executorId } : {}), ...(listOnly ? { listOnly: true } : {}) }))?.items ?? [];
+  });
+  handleReconnectableRead(ipcMain, 'sessions:executorState', async (_event, sessionId: string) =>
+    (await deps.queryExecutors?.({ kind: 'conversation', sessionId }))?.items ?? [],
+  );
   handleReconnectableRead(ipcMain, 'sessions:list', (_event, filter?: unknown) =>
     listSessions(normalizeSessionListFilter(filter)),
   );
+  handleReconnectableRead(ipcMain, 'sessions:get', async (_event, sessionId: unknown) => {
+    if (typeof sessionId !== 'string' || sessionId.length === 0) {
+      throw new Error('Invalid Session id');
+    }
+    await recoveryTask;
+    if (pendingCleanup.has(sessionId)) return null;
+    const session = await deps.client.getSession(sessionId);
+    return session === null
+      ? null
+      : toDesktopHostSessionListSummary(session, deps.runningTurnIds(sessionId));
+  });
   ipcMain.handle('sessions:cleanupSessionCopy', async (_event, sessionId: string) => {
     await deps.sessionCopyCleanup.cleanup(sessionId);
     pendingCleanup.delete(sessionId);
@@ -122,32 +162,25 @@ export function registerRuntimeHostSessionCatalogIpc(
     pendingCleanup.add(sessionId);
   });
   ipcMain.handle('sessions:create', async (_event, input?: CreateSessionRequestInput) => {
-    const request = resolveCreateSessionRequest(input);
-    const workspace = await deps.resolveCreateProject({
-      ...(input?.cwd === undefined ? {} : { cwd: input.cwd }),
-      ...(input?.projectId === undefined ? {} : { projectId: input.projectId }),
-    });
-    const session = await deps.client.createSession({
-      sessionId: newId(),
-      workspace,
-      ...(request.mode === undefined ? {} : { mode: request.mode }),
-      ...(request.mode === undefined ? { name: request.name } : {}),
-      ...(request.labels === undefined ? {} : { labels: request.labels }),
-      modelTarget: normalizeModelTarget(input),
-      ...normalizeCreateThinkingLevel(input?.thinkingLevel),
-      ...(request.mode !== undefined || request.permissionMode === undefined
-        ? {}
-        : { permissionMode: request.permissionMode }),
-      collaborationMode: request.collaborationMode,
-      orchestrationMode: request.orchestrationMode,
-    });
+    const workspace = await deps.resolveCreateProject(
+      {
+        ...(input?.cwd === undefined ? {} : { cwd: input.cwd }),
+        ...(input?.projectId === undefined ? {} : { projectId: input.projectId }),
+      },
+      input?.labels?.includes('personal-assistant') ? deps.allocateAssistantWorkspace : undefined,
+    );
+    const session = await deps.client.createSession(resolveDesktopSessionCreateInput(input, newId(), workspace));
     deps.emitSessionsChanged('created', session.id);
     return toDesktopHostSessionSummary(session);
   });
   ipcMain.handle('sessions:archive', async (_event, sessionId: string, options?: unknown) => {
     requestsRevisionFamily(options);
     const ids = await actionIds(sessionId, { revisionFamily: true });
-    await deps.client.setSessionLifecycle(sessionId, 'archived');
+    try {
+      await deps.client.setSessionLifecycle(sessionId, 'archived');
+    } catch (error) {
+      throw asArchiveRefusal(error);
+    }
     await finishSessionRetirement(deps, ids, 'archived');
   });
   ipcMain.handle('sessions:unarchive', async (_event, sessionId: string, options?: unknown) => {
@@ -204,9 +237,36 @@ export function registerRuntimeHostSessionCatalogIpc(
       return updateConfiguration(deps, sessionId, { orchestrationMode: mode }, 'mode-change');
     },
   );
-  ipcMain.handle('sessions:setModel', async (_event, sessionId: string, input: unknown) => {
-    const modelTarget = normalizeExplicitModel(input);
-    return updateConfiguration(deps, sessionId, { modelTarget, thinkingLevel: null }, 'updated');
+  ipcMain.handle(
+    'sessions:setModelConfiguration',
+    async (_event, sessionId: string, input: unknown) => {
+      const modelTarget = normalizeExplicitModel(input);
+      const thinkingLevel = normalizeRequiredThinkingLevel(input);
+      return updateConfiguration(deps, sessionId, { modelTarget, thinkingLevel }, 'updated');
+    },
+  );
+  ipcMain.handle(
+    'sessions:setExecutorConfiguration',
+    async (_event, sessionId: string, input: unknown) => {
+      if (typeof input !== 'object' || input === null || Array.isArray(input)) {
+        throw new Error('Invalid executor configuration');
+      }
+      const record = input as Record<string, unknown>;
+      const executorId = normalizeOptionalString(record.executorId, 'executor id');
+      if (!executorId) throw new Error('Executor id is required');
+      const model = normalizeOptionalString(record.model, 'executor model');
+      const thinkingLevel = normalizeRequiredThinkingLevel(input);
+      return updateConfiguration(
+        deps,
+        sessionId,
+        { executorTarget: { executorId, ...(model ? { model } : {}) }, thinkingLevel },
+        'updated',
+      );
+    },
+  );
+  ipcMain.handle('sessions:setExecutorModelConfiguration', async (_event, sessionId: string, config: unknown) => {
+    if (!isExecutorConfiguration(config)) throw new Error('Invalid executor configuration');
+    return updateConfiguration(deps, sessionId, { executorConfig: config }, 'updated');
   });
   ipcMain.handle('sessions:setThinkingLevel', async (_event, sessionId: string, level: unknown) => {
     if (level !== undefined && level !== null && !isThinkingLevel(level)) {
@@ -219,56 +279,131 @@ export function registerRuntimeHostSessionCatalogIpc(
     const ids = await actionIds(sessionId, { revisionFamily: true });
     // A task restored under the caller's decision is left alone, and nothing
     // downstream of the deletion runs for it.
-    const disposition = await deps.client.removeSession(sessionId, {
+    const outcome = await deps.client.removeSession(sessionId, {
       requireArchived: requiresArchivedSession(options),
+      // Shape-checked by the protocol codec, which refuses anything but a
+      // positive integer rather than dropping the guard.
+      ...archiveAgeGuard(options),
     });
-    if (disposition === 'removed') await finishSessionRetirement(deps, ids, 'deleted');
-    return disposition;
+    if (outcome.disposition === 'removed') await finishSessionRetirement(deps, ids, 'deleted');
+    return outcome;
   });
+  ipcMain.handle('sessions:removePreview', async (_event, input: unknown) =>
+    // Read-only, for the confirm. The protocol codec validates the whole input.
+    deps.client.previewSessionRemoval(input as SessionRemovePreviewInput),
+  );
+  ipcMain.handle(
+    'sessions:moveToProject',
+    async (_event, sessionId: string, projectId: unknown) => {
+      if (projectId !== null && (typeof projectId !== 'string' || projectId.length === 0)) {
+        throw new Error('Invalid project id');
+      }
+      return moveSessionToProject(deps, sessionId, projectId);
+    },
+  );
+  ipcMain.handle('sessions:moveToDedicatedDirectory', async (_event, sessionId: string) =>
+    moveSessionToDedicatedDirectory(deps, sessionId),
+  );
 }
 
-export function registerRuntimeHostSharedSessionCatalogIpc(
-  deps: RuntimeHostSharedSessionCatalogIpcDeps,
-  ipcMain: ReconnectableReadIpcMain,
-): void {
-  handleReconnectableRead(ipcMain, 'sessions:list', async (_event, filter?: unknown) => {
-    if (normalizeSessionListFilter(filter)?.subagentParentSessionId) return [];
-    const session = await deps.getSession();
-    return session ? [session] : [];
-  });
+/**
+ * Re-files an existing Session into another Project, or out of every Project.
+ *
+ * Unlike the configuration updates, this is not a revision-family action: a
+ * move re-points one working directory, and moving an archived or branched
+ * sibling's cwd as a side effect is not what the user asked for.
+ *
+ * The revision is read once, here, and carried into the commit. Detaching needs
+ * the Session's own cwd as the target, and that directory is only meaningful
+ * paired with the revision it was read at: committing it against a later
+ * revision would move the Session back to a directory a concurrent writer had
+ * already left, which is exactly what the Host's compare-and-set exists to
+ * stop. So a conflict is reported, not retried.
+ */
+async function moveSessionToProject(
+  deps: RuntimeHostSessionCatalogIpcDeps,
+  sessionId: string,
+  projectId: string | null,
+): Promise<DesktopSessionUpdateResult<DesktopHostSessionSummary>> {
+  let session: SessionCatalogProjection;
+  try {
+    const current = await deps.client.getSession(sessionId);
+    if (!current) {
+      throw new DesktopRuntimeHostClientError(
+        'session_not_found',
+        `No such Session: ${sessionId}`,
+      );
+    }
+    const workspace: WorkspaceTarget =
+      projectId === null
+        ? { kind: 'host_path', path: current.workspace.hostCwd }
+        : { kind: 'project', projectId };
+    session = await deps.client.relocateSessionWorkspace(
+      sessionId,
+      current.revision,
+      workspace,
+    );
+  } catch (error) {
+    const code = updateFailureCode(error);
+    if (code) return { ok: false, code };
+    throw error;
+  }
+  deps.emitSessionsChanged('updated', sessionId);
+  return { ok: true, session: toDesktopHostSessionSummary(session) };
 }
 
-export function toDesktopHostSharedSessionSummary(
-  session: SharedSessionCatalogProjection,
-): DesktopHostSessionSummary {
-  return {
-    id: session.id,
-    name: session.name,
-    activityAt: session.activityAt,
-    isFlagged: false,
-    isArchived: false,
-    labels: [],
-    labelsTruncated: false,
-    hasUnread: false,
-    ...(session.lastMessageAt === undefined ? {} : { lastMessageAt: session.lastMessageAt }),
-    ...(session.lastMessagePreview === undefined
-      ? {}
-      : { lastMessagePreview: session.lastMessagePreview }),
-    status: session.status,
-    ...(session.liveRunState === undefined
-      ? {}
-      : { runningTurnIds: [...session.liveRunState.runningTurnIds] }),
-    ...(session.blockedReason === undefined ? {} : { blockedReason: session.blockedReason }),
-    ...(session.statusUpdatedAt === undefined
-      ? {}
-      : { statusUpdatedAt: session.statusUpdatedAt }),
-    backend: 'ai-sdk',
-    llmConnectionSlug: '',
-    connectionLocked: true,
-    model: '',
-    permissionMode: 'ask',
-    shared: true,
-  };
+/**
+ * The explicit correction for a Session bound to an unintended implicit
+ * directory: allocate a dedicated task directory, then rebind through the
+ * same `session.workspace.relocate` authority `moveToProject` uses — one
+ * revision read, one compare-and-set commit, and no project re-pointing.
+ *
+ * The directory is created only once the Session proves eligible, and before
+ * the relocate because the Host requires the target to already exist. A
+ * failed response may follow a committed binding, so the directory is kept.
+ * Automatic directory cleanup is outside this policy.
+ */
+async function moveSessionToDedicatedDirectory(
+  deps: RuntimeHostSessionCatalogIpcDeps,
+  sessionId: string,
+): Promise<DesktopSessionUpdateResult<DesktopHostSessionSummary>> {
+  const authority = deps.dedicatedTaskDirectory;
+  if (!authority) {
+    throw new Error('Dedicated task directories are unavailable on this Runtime Host');
+  }
+  let session: SessionCatalogProjection;
+  try {
+    const current = await deps.client.getSession(sessionId);
+    if (!current) {
+      throw new DesktopRuntimeHostClientError(
+        'session_not_found',
+        `No such Session: ${sessionId}`,
+      );
+    }
+    // A Project-bound Session relocates through `moveToProject` — this
+    // correction is only for a projectless Host-path binding, so dropping a
+    // Project association here can never be an accident. A Session already
+    // inside the managed root needs no correction: refusing keeps a retry or
+    // a racing second invocation from orphaning a fresh directory.
+    if (
+      current.workspace.target.kind !== 'host_path' ||
+      (await authority.classify(current.workspace.hostCwd)) === 'managed'
+    ) {
+      return { ok: false, code: 'operation_unavailable' };
+    }
+    const directory = await authority.allocate();
+    session = await deps.client.relocateSessionWorkspace(
+      sessionId,
+      current.revision,
+      { kind: 'host_path', path: directory },
+    );
+  } catch (error) {
+    const code = updateFailureCode(error);
+    if (code) return { ok: false, code };
+    throw error;
+  }
+  deps.emitSessionsChanged('updated', sessionId);
+  return { ok: true, session: toDesktopHostSessionSummary(session) };
 }
 
 /**
@@ -279,6 +414,11 @@ export function toDesktopHostSharedSessionSummary(
  * destructive answer. It repeats the shape check its sibling does instead of
  * relying on the caller running that one first.
  */
+function archiveAgeGuard(options: unknown): { requireArchivedForMs?: number } {
+  const value = (options as { requireArchivedForMs?: unknown } | undefined)?.requireArchivedForMs;
+  return value === undefined ? {} : { requireArchivedForMs: value as number };
+}
+
 function requiresArchivedSession(options: unknown): boolean {
   if (options === undefined) return false;
   if (!options || typeof options !== 'object' || Array.isArray(options)) {
@@ -309,10 +449,55 @@ async function updateConfiguration(
   patch: DesktopSessionConfigurationPatch,
   reason: SessionChangedReason,
   extra?: Pick<SessionChangedEvent, 'modelId' | 'turnId'>,
-): Promise<DesktopHostSessionSummary> {
-  const session = await deps.client.updateSessionConfiguration(sessionId, patch);
+): Promise<DesktopSessionUpdateResult<DesktopHostSessionSummary>> {
+  let session: SessionCatalogProjection;
+  try {
+    session = await deps.client.updateSessionConfiguration(sessionId, patch);
+  } catch (error) {
+    const code = updateFailureCode(error);
+    if (code) return { ok: false, code };
+    throw error;
+  }
   deps.emitSessionsChanged(reason, sessionId, extra);
-  return toDesktopHostSessionSummary(session);
+  return { ok: true, session: toDesktopHostSessionSummary(session) };
+}
+
+/**
+ * Electron IPC strips the error class off a `RuntimeHostOperationError`, so a
+ * refusal the rail can explain has to travel as a stable token in the message
+ * text. These are the archive guard's `session_busy` refusals a user can act
+ * on; any other failure keeps the Host's own message.
+ */
+const ARCHIVE_REFUSAL_TOKENS: ReadonlyArray<readonly [needle: string, reason: string]> = [
+  ['has an active WorkHub delegation', 'workhub_delegation'],
+  ['has an undelivered WorkHub result', 'workhub_result'],
+  ['has a live linked child Session', 'linked_child'],
+];
+
+function asArchiveRefusal(error: unknown): unknown {
+  if (!(error instanceof RuntimeHostOperationError) || error.code !== 'session_busy') return error;
+  for (const [needle, reason] of ARCHIVE_REFUSAL_TOKENS) {
+    if (error.message.includes(needle)) return new Error(`session_archive_refused: ${reason}`);
+  }
+  return error;
+}
+
+const EXPECTED_UPDATE_FAILURES = [
+  'session_busy',
+  'operation_conflict',
+  'operation_unavailable',
+  'not_found',
+] as const;
+
+function updateFailureCode(error: unknown): DesktopSessionUpdateFailureCode | undefined {
+  if (error instanceof RuntimeHostOperationError) {
+    return EXPECTED_UPDATE_FAILURES.find((code) => code === error.code);
+  }
+  if (error instanceof DesktopRuntimeHostClientError) {
+    if (error.code === 'revision_conflict') return 'operation_conflict';
+    if (error.code === 'session_not_found') return 'not_found';
+  }
+  return undefined;
 }
 
 function normalizeParentSessionFilter(value: unknown): string | undefined {
@@ -343,6 +528,33 @@ function normalizeSessionListFilter(value: unknown): SessionListFilter | undefin
   };
 }
 
+export function resolveDesktopSessionCreateInput(input: CreateSessionRequestInput | undefined, sessionId: string, workspace: WorkspaceTarget): SessionCreateInput {
+  const request = resolveCreateSessionRequest(input);
+  const executorId = normalizeOptionalString(input?.executorId, 'executor id');
+  if (executorId && (input?.llmConnectionId !== undefined || input?.llmConnectionSlug !== undefined)) {
+    throw new Error('Plugin executor selection cannot include a model connection');
+  }
+  return {
+    sessionId, workspace,
+    ...(request.mode === undefined ? {} : { mode: request.mode }),
+    name: request.name,
+    ...(request.labels === undefined ? {} : { labels: request.labels }),
+    ...(executorId
+      ? {
+          executorId,
+          ...(input?.executorConfig ? { executorConfig: input.executorConfig } : {}),
+          ...(normalizeOptionalString(input?.model, 'executor model')
+            ? { executorModel: normalizeOptionalString(input?.model, 'executor model') }
+            : {}),
+        }
+      : { modelTarget: normalizeModelTarget(input) }),
+    ...normalizeCreateThinkingLevel(input?.thinkingLevel),
+    ...(request.mode !== undefined || request.permissionMode === undefined ? {} : { permissionMode: request.permissionMode }),
+    collaborationMode: request.collaborationMode,
+    orchestrationMode: request.orchestrationMode,
+  };
+}
+
 function normalizeModelTarget(input: CreateSessionRequestInput | undefined): SessionModelTarget {
   const connectionId = normalizeOptionalString(input?.llmConnectionId, 'model connection id');
   const slug = normalizeOptionalString(input?.llmConnectionSlug, 'model connection');
@@ -366,6 +578,14 @@ function normalizeExplicitModel(input: unknown): Extract<SessionModelTarget, { k
   };
 }
 
+function normalizeRequiredThinkingLevel(input: unknown): ThinkingLevel | null {
+  const level = (input as Record<string, unknown> | null)?.thinkingLevel;
+  if (level !== null && !isThinkingLevel(level)) {
+    throw new Error(`Invalid thinking level: ${String(level)}`);
+  }
+  return level;
+}
+
 function normalizeOptionalString(value: unknown, label: string): string | undefined {
   if (value === undefined) return undefined;
   if (typeof value !== 'string' || value.trim().length === 0) {
@@ -378,6 +598,7 @@ function normalizeCreateThinkingLevel(
   value: unknown,
 ): Pick<SessionCreateInput, 'thinkingLevel'> | Record<string, never> {
   if (value === undefined) return {};
+  if (value === null) return { thinkingLevel: null };
   if (!isThinkingLevel(value)) throw new Error(`Invalid thinking level: ${String(value)}`);
   return { thinkingLevel: value };
 }
@@ -387,6 +608,7 @@ export function toDesktopHostSessionSummary(
 ): DesktopHostSessionSummary {
   return {
     ...projectSessionCatalogSummary(session),
+    revision: session.revision,
     labelsTruncated: session.labelsTruncated,
   };
 }

@@ -17,6 +17,7 @@
  * under the License.
  */
 
+import { deferred } from '@maka/core/test-only/async-primitives';
 import assert from 'node:assert/strict';
 import { mkdtemp, open, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -40,6 +41,7 @@ import { HostConnectionEffectCoordinator } from '../server/connection-effect-coo
 import { HostOAuthExecutionAuthority } from '../server/oauth-execution-authority.js';
 import type { ConnectionContext } from '../server/operation-dispatcher.js';
 import { RuntimePolicyActivationGate } from '../server/runtime-policy-activation-gate.js';
+import { resolveExecutionTarget } from '../server/execution-model-authority.js';
 import type { ConnectionOnboardingSaveResult, OperationOutcome } from '../protocol/index.js';
 
 const context: ConnectionContext = {
@@ -48,6 +50,79 @@ const context: ConnectionContext = {
   principal: 'local_os_user',
   acquireResidency: () => ({ release: () => undefined }),
 };
+
+test('Fireworks onboarding keeps an unrelated model with unknown limits and persists the selected K3', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'maka-fireworks-onboarding-'));
+  const capability = await resolveStorageRoot({
+    path: join(base, 'interactive'),
+    kind: 'interactive',
+  });
+  const k3 = 'accounts/fireworks/models/kimi-k3';
+  const other = 'accounts/fireworks/models/qwen3p8-max';
+  const requests: string[] = [];
+  try {
+    for (const reopen of [false, true]) {
+      const owner = await tryAcquireInteractiveRootOwner(capability);
+      assert.ok(owner);
+      try {
+        const stores = await openInteractiveRuntimePolicyStoresForWrite(owner.lease);
+        if (!reopen) {
+          const coordinator = new HostConnectionEffectCoordinator({
+            stores,
+            activation: new RuntimePolicyActivationGate(),
+            oauthCredentials: new HostOAuthExecutionAuthority(stores),
+            createTransport: () => ({
+              fetch: async (input) => {
+                const path = new URL(String(input)).pathname;
+                requests.push(path);
+                if (path === '/v1/accounts') return Response.json({ accounts: [] });
+                assert.equal(path, '/v1/accounts/fireworks/models');
+                return Response.json({
+                  models: [
+                    { name: k3, contextLength: 1048576 },
+                    { name: other, contextLength: 0 },
+                  ],
+                });
+              },
+              close: async () => undefined,
+            }),
+          });
+          try {
+            const saved = await coordinator.handlers['connection.onboarding.save'](
+              {
+                target: {
+                  kind: 'create',
+                  providerType: 'fireworks-ai',
+                  slug: 'fireworks',
+                  name: 'Fireworks',
+                },
+                apiKey: 'fixture-key',
+                baseUrl: null,
+                enabledModelIds: [k3],
+              },
+              context,
+            );
+            assertSaved(saved);
+          } finally {
+            await coordinator.close();
+          }
+        }
+        const catalog = await stores.connectionCatalog.getSnapshot();
+        assert.equal(catalog.connections.length, 1);
+        assert.deepEqual(catalog.connections[0]?.enabledModelIds, [k3]);
+        assert.deepEqual(catalog.connections[0]?.models, [
+          { id: k3, contextWindow: 1048576 },
+          { id: other },
+        ]);
+      } finally {
+        await owner.close();
+      }
+    }
+    assert.deepEqual(requests, ['/v1/accounts', '/v1/accounts/fireworks/models']);
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
 
 test('verifies a first-run API key without persisting a connection or credential', async () => {
   await withFixture(async ({ stores }) => {
@@ -82,6 +157,141 @@ test('verifies a first-run API key without persisting a connection or credential
   });
 });
 
+test('adopts serialized OAuth material with every model the Host verifies', async () => {
+  await withFixture(async ({ stores }) => {
+    const importedSecret = serializeOAuthSubscriptionTokens({
+      access_token: 'gho_import_a',
+      refresh_token: 'gho_import_a',
+      expires_at: Number.MAX_SAFE_INTEGER,
+      token_type: 'Bearer',
+      base_url: 'https://api.githubcopilot.com',
+    });
+    let discoverySecret = '';
+    const coordinator = new HostConnectionEffectCoordinator({
+      stores,
+      activation: new RuntimePolicyActivationGate(),
+      oauthCredentials: new HostOAuthExecutionAuthority(stores),
+      createTransport: () => recordingTransport(() => undefined),
+      runModelDiscovery: async (_connection, secret) => {
+        discoverySecret = secret;
+        return { ok: true, models: [{ id: 'copilot-a' }, { id: 'copilot-b' }] };
+      },
+    });
+
+    const adopted = await coordinator.handlers['connection.onboarding.save'](
+      {
+        target: { kind: 'create', providerType: 'github-copilot' },
+        apiKey: importedSecret,
+        baseUrl: null,
+        enabledModelIds: [],
+      },
+      context,
+    );
+
+    assertSaved(adopted);
+    assert.equal(discoverySecret, 'gho_import_a');
+    const updated = (await stores.connectionCatalog.getSnapshot()).connections.find(
+      ({ providerType }) => providerType === 'github-copilot',
+    );
+    assert.ok(updated);
+    assert.deepEqual(updated.enabledModelIds, ['copilot-a', 'copilot-b']);
+    assert.equal(
+      (
+        await stores.operations.exportCredentialMaterial({
+          scope: 'connection',
+          connectionId: updated.connectionId,
+          kind: 'oauth_token',
+        })
+      )?.secret,
+      importedSecret,
+    );
+  });
+});
+
+test('a blocked local adoption cannot overwrite a newer interactive OAuth login', async () => {
+  await withFixture(async ({ stores }) => {
+    const connection = await createConnection(
+      stores,
+      0,
+      connectionDraft('copilot-race', 'github-copilot'),
+    );
+    const importA = serializeOAuthSubscriptionTokens({
+      access_token: 'gho_import_a',
+      refresh_token: 'gho_import_a',
+      expires_at: Number.MAX_SAFE_INTEGER,
+      token_type: 'Bearer',
+      base_url: 'https://api.githubcopilot.com',
+    });
+    const loginB = serializeOAuthSubscriptionTokens({
+      access_token: 'gho_login_b',
+      refresh_token: 'gho_login_b',
+      expires_at: Number.MAX_SAFE_INTEGER,
+      token_type: 'Bearer',
+      base_url: 'https://api.githubcopilot.com',
+    });
+    const discoveryStarted = deferred<void>();
+    const releaseDiscovery = deferred<void>();
+    const coordinator = new HostConnectionEffectCoordinator({
+      stores,
+      activation: new RuntimePolicyActivationGate(),
+      oauthCredentials: new HostOAuthExecutionAuthority(stores),
+      createTransport: () => recordingTransport(() => undefined),
+      runModelDiscovery: async (_connection, secret) => {
+        assert.equal(secret, 'gho_import_a');
+        discoveryStarted.resolve();
+        await releaseDiscovery.promise;
+        return { ok: true, models: [{ id: 'copilot-import-model' }] };
+      },
+    });
+
+    const adoption = coordinator.handlers['connection.onboarding.save'](
+      {
+        target: { kind: 'existing', connectionId: connection.connectionId },
+        apiKey: importA,
+        baseUrl: null,
+        enabledModelIds: [],
+      },
+      context,
+    );
+    await discoveryStarted.promise;
+
+    const interactive = await stores.operations.beginInteractiveOAuthLogin({
+      attemptId: 'interactive-login-b',
+      target: { kind: 'existing', connectionId: connection.connectionId },
+    });
+    assert.equal(interactive.kind, 'ready');
+    if (interactive.kind !== 'ready') throw new Error('Interactive login did not start');
+    const committed = await stores.operations.completeInteractiveOAuthLogin(
+      interactive.ticket,
+      loginB,
+    );
+    assert.equal(committed.kind, 'committed');
+
+    releaseDiscovery.resolve();
+    assert.deepEqual(await adoption, {
+      ok: true,
+      result: { kind: 'rejected', reason: 'superseded' },
+    });
+    assert.equal(
+      (
+        await stores.operations.exportCredentialMaterial({
+          scope: 'connection',
+          connectionId: connection.connectionId,
+          kind: 'oauth_token',
+        })
+      )?.secret,
+      loginB,
+    );
+    const after = (await stores.connectionCatalog.getSnapshot()).connections.find(
+      ({ connectionId }) => connectionId === connection.connectionId,
+    );
+    assert.equal(
+      after?.models.some(({ id }) => id === 'copilot-import-model'),
+      false,
+    );
+  });
+});
+
 test('rejects a semantically invalid onboarding endpoint in Storage before discovery', async () => {
   await withFixture(async ({ stores }) => {
     let discoveryRuns = 0;
@@ -99,7 +309,7 @@ test('rejects a semantically invalid onboarding endpoint in Storage before disco
     assert.deepEqual(
       await coordinator.handlers['connection.onboarding.verify'](
         {
-          target: { kind: 'create', providerType: 'openai-compatible' },
+          target: { kind: 'create', providerType: 'custom', defaultApiProtocol: 'openai-chat' },
           apiKey: 'relay-secret',
           baseUrl: 'ftp://relay.example.test/v1',
         },
@@ -185,6 +395,118 @@ test('two create tickets cannot commit the same planned slug', async () => {
   });
 });
 
+test('onboards a caller-named connection with the requested slug and display name', async () => {
+  await withFixture(async ({ stores }) => {
+    const coordinator = onboardingCoordinator(stores, () => undefined, 'gpt-5');
+    const saved = await coordinator.handlers['connection.onboarding.save'](
+      {
+        target: {
+          kind: 'create',
+          providerType: 'openai',
+          slug: 'openai-work',
+          name: 'Work OpenAI',
+        },
+        apiKey: 'sk-live',
+        baseUrl: null,
+        enabledModelIds: ['gpt-5'],
+      },
+      context,
+    );
+    assertSaved(saved);
+    assert.equal(saved.result.connection.slug, 'openai-work');
+    const catalog = await stores.connectionCatalog.getSnapshot();
+    const created = catalog.connections.find(({ slug }) => slug === 'openai-work');
+    assert.equal(created?.name, 'Work OpenAI');
+
+    // An unnamed follow-up still derives its identity from the catalog — the
+    // requested slug never collides with it because the catalog did take it.
+    const derived = await coordinator.handlers['connection.onboarding.save'](
+      {
+        target: { kind: 'create', providerType: 'openai' },
+        apiKey: 'sk-live-2',
+        baseUrl: null,
+        enabledModelIds: ['gpt-5'],
+      },
+      context,
+    );
+    assertSaved(derived);
+    assert.equal(derived.result.connection.slug, 'openai');
+  });
+});
+
+test('rejects a requested slug that is already taken, before any discovery runs', async () => {
+  await withFixture(async ({ stores }) => {
+    const coordinator = onboardingCoordinator(stores, () => undefined, 'gpt-5');
+    const saved = await coordinator.handlers['connection.onboarding.save'](
+      {
+        target: { kind: 'create', providerType: 'openai', slug: 'openai-work' },
+        apiKey: 'sk-live',
+        baseUrl: null,
+        enabledModelIds: ['gpt-5'],
+      },
+      context,
+    );
+    assertSaved(saved);
+
+    const verify = await coordinator.handlers['connection.onboarding.verify'](
+      {
+        target: { kind: 'create', providerType: 'openai', slug: 'openai-work' },
+        apiKey: 'sk-live-2',
+        baseUrl: null,
+      },
+      context,
+    );
+    assert.equal(verify.ok, true);
+    if (!verify.ok) return;
+    assert.deepEqual(verify.result, { kind: 'rejected', reason: 'slug_taken' });
+
+    const save = await coordinator.handlers['connection.onboarding.save'](
+      {
+        target: { kind: 'create', providerType: 'openai', slug: 'openai-work' },
+        apiKey: 'sk-live-2',
+        baseUrl: null,
+        enabledModelIds: ['gpt-5'],
+      },
+      context,
+    );
+    assert.equal(save.ok, true);
+    if (!save.ok) return;
+    assert.deepEqual(save.result, { kind: 'rejected', reason: 'slug_taken' });
+    // Nothing was created: the taken slug still names exactly one connection.
+    const catalog = await stores.connectionCatalog.getSnapshot();
+    assert.equal(catalog.connections.filter(({ slug }) => slug === 'openai-work').length, 1);
+  });
+});
+
+test('a requested slug lost mid-flight reports slug_taken, never a silent rename', async () => {
+  await withFixture(async ({ stores }) => {
+    const requested = {
+      target: { kind: 'create', providerType: 'openai', slug: 'openai-work' } as const,
+      baseUrl: null,
+    };
+    const first = await stores.operations.beginConnectionOnboarding(requested);
+    const second = await stores.operations.beginConnectionOnboarding(requested);
+    assert.equal(first.kind, 'ready');
+    assert.equal(second.kind, 'ready');
+    if (first.kind !== 'ready' || second.kind !== 'ready') return;
+    assert.equal(first.candidate.slug, 'openai-work');
+    assert.equal(second.candidate.slug, 'openai-work');
+
+    const completion = {
+      suppliedSecret: 'sk-live',
+      enabledModelIds: ['gpt-5'],
+      discovery: { models: [{ id: 'gpt-5' }], source: 'fetched' as const, fetchedAt: 1 },
+    };
+    const committed = await stores.operations.completeConnectionOnboarding(
+      first.ticket,
+      completion,
+    );
+    assert.equal(committed.kind, 'committed');
+    const lost = await stores.operations.completeConnectionOnboarding(second.ticket, completion);
+    assert.deepEqual(lost, { kind: 'slug_taken' });
+  });
+});
+
 test('reports catalog_full both before discovery and when the last slot fills before commit', async () => {
   await withFixture(async ({ root, stores }) => {
     const connections = Array.from(
@@ -250,7 +572,7 @@ test('onboards a custom relay end to end: rejects a missing endpoint, discovers 
     assert.deepEqual(
       await coordinator.handlers['connection.onboarding.verify'](
         {
-          target: { kind: 'create', providerType: 'openai-compatible' },
+          target: { kind: 'create', providerType: 'custom', defaultApiProtocol: 'openai-chat' },
           apiKey: 'relay-secret',
           baseUrl: null,
         },
@@ -262,7 +584,7 @@ test('onboards a custom relay end to end: rejects a missing endpoint, discovers 
 
     const saved = await coordinator.handlers['connection.onboarding.save'](
       {
-        target: { kind: 'create', providerType: 'openai-compatible' },
+        target: { kind: 'create', providerType: 'custom', defaultApiProtocol: 'openai-chat' },
         apiKey: 'relay-secret',
         baseUrl: 'https://relay.example.test/v1',
         enabledModelIds: ['relay/model'],
@@ -270,11 +592,11 @@ test('onboards a custom relay end to end: rejects a missing endpoint, discovers 
       context,
     );
     assertSaved(saved);
-    assert.equal(saved.result.connection.slug, 'openai-compatible');
+    assert.equal(saved.result.connection.slug, 'custom');
     assert.equal(observedBaseUrl, 'https://relay.example.test/v1');
 
     const connection = (await stores.connectionCatalog.getSnapshot()).connections.find(
-      ({ slug }) => slug === 'openai-compatible',
+      ({ slug }) => slug === 'custom',
     );
     assert.equal(connection?.baseUrl, 'https://relay.example.test/v1');
     // Re-verifying with a blank endpoint now reuses the persisted one.
@@ -301,7 +623,7 @@ test('re-onboarding by connection identity edits a Desktop custom-slug relay in 
     // connection's identity and must edit it, not derive a second connection
     // at the canonical slug (#3467 review).
     const connection = await createConnection(stores, 0, {
-      ...connectionDraft('my-relay', 'openai-compatible'),
+      ...connectionDraft('my-relay', 'custom'),
       baseUrl: 'https://relay-a.example.test/v1',
       enabledModelIds: ['relay/model'],
     });
@@ -389,7 +711,7 @@ test('a save whose connection changed between discovery and commit is superseded
     // the commit, and the save must NOT persist relay B with the model
     // inventory relay A produced.
     const connection = await createConnection(stores, 0, {
-      ...connectionDraft('openai-compatible', 'openai-compatible'),
+      ...connectionDraft('custom', 'custom'),
       baseUrl: 'https://relay-a.example.test/v1',
       enabledModelIds: ['relay/original'],
     });
@@ -489,6 +811,85 @@ test('a save whose connection changed between discovery and commit is superseded
   });
 });
 
+test('provider state identity follows endpoint, credential, and request-header ownership', async () => {
+  await withFixture(async ({ stores }) => {
+    const connection = await createConnection(stores, 0, {
+      ...connectionDraft('identity-relay', 'custom'),
+      baseUrl: 'https://relay-a.example.test/v1',
+    });
+    await setConnectionCredential(stores, connection, 'key-a');
+    const header = {
+      llmConnectionId: connection.connectionId,
+      llmConnectionSlug: connection.slug,
+      model: 'gpt-5',
+    };
+    const resolveIdentity = async () =>
+      (
+        await resolveExecutionTarget(
+          header,
+          stores,
+          new HostOAuthExecutionAuthority(stores),
+          () => {
+            throw new Error('API-key provider must not create an OAuth refresh transport');
+          },
+        )
+      ).providerStateIdentity;
+    const initial = await resolveIdentity();
+
+    const moved = await stores.connectionCatalog.update({
+      expected: { connectionId: connection.connectionId, revision: connection.revision },
+      changes: {
+        name: connection.name,
+        baseUrl: 'https://relay-b.example.test/v1',
+        enabled: true,
+        enabledModelIds: connection.enabledModelIds,
+      },
+    });
+    assert.equal(moved.kind, 'committed');
+    const afterEndpoint = await resolveIdentity();
+    assert.notEqual(afterEndpoint, initial);
+
+    const status = await connectionCredentialStatus(stores, connection);
+    assert.equal(status.configured, true);
+    if (!status.configured) return;
+    const rotated = await stores.credentialVault.set({
+      locator: connectionCredential(connection),
+      expected: { credentialId: status.credentialId, revision: status.revision },
+      secret: 'key-b',
+    });
+    assert.equal(rotated.kind, 'committed');
+    const afterCredential = await resolveIdentity();
+    assert.notEqual(afterCredential, afterEndpoint);
+
+    const headers = await stores.credentialVault.set({
+      locator: {
+        scope: 'connection',
+        connectionId: connection.connectionId,
+        kind: 'request_headers',
+      },
+      expected: null,
+      secret: JSON.stringify({ 'X-Relay-Account': 'account-b' }),
+    });
+    assert.equal(headers.kind, 'committed');
+    const afterHeaders = await resolveIdentity();
+    assert.notEqual(afterHeaders, afterCredential);
+
+    const current = (await stores.connectionCatalog.getSnapshot()).connections[0]!;
+    const rewired = await stores.connectionCatalog.update({
+      expected: { connectionId: current.connectionId, revision: current.revision },
+      changes: {
+        name: current.name,
+        baseUrl: current.baseUrl,
+        enabled: true,
+        enabledModelIds: current.enabledModelIds,
+        modelOverrides: { 'gpt-5': { apiProtocol: 'openai-responses' } },
+      },
+    });
+    assert.equal(rewired.kind, 'committed');
+    assert.notEqual(await resolveIdentity(), afterHeaders);
+  });
+});
+
 test('onboarding probes with the custom request headers the models path sends, and a header rotation supersedes', async () => {
   await withFixture(async ({ stores }) => {
     // A connection that authenticates through a custom header (plus a body
@@ -497,7 +898,7 @@ test('onboarding probes with the custom request headers the models path sends, a
     // models.fetch reaches fine (#3467 review).
     const headerSecret = 'header-secret-must-not-escape';
     const connection = await createConnection(stores, 0, {
-      ...connectionDraft('header-relay', 'openai-compatible'),
+      ...connectionDraft('header-relay', 'custom'),
       baseUrl: 'https://relay.example.test/v1',
       enabledModelIds: ['relay/model'],
       requestBodyOverlay: { tenant: 'acme' },
@@ -841,19 +1242,13 @@ test('invalidates a verified result when onboarding rotates only the credential'
   });
 });
 
-test('onboarding keeps what its wizard never offered and prunes what it did', async () => {
+test('onboarding keeps models its wizard never offered and clears profiles on endpoint changes', async () => {
   await withFixture(async ({ stores }) => {
-    // Two rules meet here. `relayModelProfiles` is scoped to `enabledModelIds`
-    // — the canonical decoder rejects a table keyed by a model the selection
-    // dropped, and this write path bypasses that decoder, so the subset
-    // invariant has to hold on the way out or the document cannot be read
-    // back. And a model the wizard never listed was never offered for the user
-    // to keep, so not re-picking it is not a decision to drop it (#1584).
     const connection = await createConnection(stores, 0, {
-      ...connectionDraft('openai-compatible', 'openai-compatible'),
+      ...connectionDraft('custom', 'custom'),
       baseUrl: 'https://relay.example.test/v1',
       enabledModelIds: ['kept-model', 'dropped-model'],
-      relayModelProfiles: {
+      modelOverrides: {
         'kept-model': { contextWindow: 128_000 },
         'dropped-model': { contextWindow: 262_144 },
       },
@@ -878,14 +1273,14 @@ test('onboarding keeps what its wizard never offered and prunes what it did', as
     // `dropped-model` is absent from what discovery returned, so the wizard
     // could not show it: it survives, and so does its declaration.
     assert.deepEqual(updated?.enabledModelIds, ['kept-model', 'dropped-model']);
-    assert.deepEqual(updated?.relayModelProfiles, {
+    assert.deepEqual(updated?.modelOverrides, {
       'kept-model': { contextWindow: 128_000 },
       'dropped-model': { contextWindow: 262_144 },
     });
     // The real failure was on the next read, not on the write.
     assert.deepEqual(
       (await stores.connectionCatalog.getSnapshot()).connections.map(({ slug }) => slug),
-      ['openai-compatible'],
+      ['custom'],
     );
 
     // Declarations are endpoint-keyed, like the update path enforces: a
@@ -905,20 +1300,17 @@ test('onboarding keeps what its wizard never offered and prunes what it did', as
       ({ connectionId }) => connectionId === connection.connectionId,
     );
     assert.equal(swapped?.baseUrl, 'https://relay-b.example.test/v1');
-    assert.equal(swapped?.relayModelProfiles, undefined);
+    assert.equal(swapped?.modelOverrides, undefined);
   });
 });
 
-test('onboarding drops a declaration for a model the wizard offered and the user unchecked', async () => {
+test('onboarding preserves parameters for a model the user unchecked', async () => {
   await withFixture(async ({ stores }) => {
-    // The other half: discovery listed this model, so the wizard showed it and
-    // leaving it unticked IS the decision. Its declaration goes with it, or the
-    // persisted table would key a model the selection no longer holds.
     const connection = await createConnection(stores, 0, {
-      ...connectionDraft('openai-compatible', 'openai-compatible'),
+      ...connectionDraft('custom', 'custom'),
       baseUrl: 'https://relay.example.test/v1',
       enabledModelIds: ['kept-model', 'unchecked-model'],
-      relayModelProfiles: {
+      modelOverrides: {
         'kept-model': { contextWindow: 128_000 },
         'unchecked-model': { contextWindow: 262_144 },
       },
@@ -951,7 +1343,10 @@ test('onboarding drops a declaration for a model the wizard offered and the user
       ({ connectionId }) => connectionId === connection.connectionId,
     );
     assert.deepEqual(updated?.enabledModelIds, ['kept-model']);
-    assert.deepEqual(updated?.relayModelProfiles, { 'kept-model': { contextWindow: 128_000 } });
+    assert.deepEqual(updated?.modelOverrides, {
+      'kept-model': { contextWindow: 128_000 },
+      'unchecked-model': { contextWindow: 262_144 },
+    });
   });
 });
 
@@ -1133,6 +1528,55 @@ test('beginDrain rejects new effects while close waits for an already accepted e
   });
 });
 
+test('discovery for the default-model chooser leaves all new models unselected until confirmation', async () => {
+  await withFixture(async ({ stores }) => {
+    const a = await createConnection(stores, 0, connectionDraft('default-a', 'openai'));
+    const oldTarget = { connectionId: a.connectionId, modelId: 'gpt-5' };
+    await stores.connectionCatalog.setDefaultTarget({
+      expectedCatalogRevision: 1,
+      target: oldTarget,
+    });
+    const b = await createConnection(stores, 2, {
+      ...connectionDraft('default-b', 'custom'),
+      baseUrl: 'https://relay.example/v1',
+      enabledModelIds: [],
+    });
+    await setConnectionCredential(stores, b, 'test-secret');
+    const coordinator = new HostConnectionEffectCoordinator({
+      stores,
+      activation: new RuntimePolicyActivationGate(),
+      oauthCredentials: new HostOAuthExecutionAuthority(stores),
+      createTransport: () => recordingTransport(() => {}),
+      runModelDiscovery: async () => ({ ok: true, models: [{ id: 'first' }, { id: 'second' }] }),
+    });
+    try {
+      const fetched = await coordinator.handlers['connection.models.fetch'](
+        { connectionId: b.connectionId, preserveSelection: true },
+        context,
+      );
+      assert.equal(fetched.ok, true);
+      const discovered = await stores.connectionCatalog.getSnapshot();
+      assert.deepEqual(
+        discovered.connections[1]?.models.map(({ id }) => id),
+        ['first', 'second'],
+      );
+      assert.deepEqual(discovered.connections[1]?.enabledModelIds, []);
+      assert.deepEqual(discovered.defaultTarget, oldTarget);
+      const chosen = await stores.connectionCatalog.setDefaultTarget({
+        expectedCatalogRevision: discovered.revision,
+        target: { connectionId: b.connectionId, modelId: 'second' },
+        enableModel: true,
+      });
+      assert.equal(chosen.kind, 'committed');
+      const after = await stores.connectionCatalog.getSnapshot();
+      assert.deepEqual(after.connections[1]?.enabledModelIds, ['second']);
+      assert.deepEqual(after.defaultTarget, { connectionId: b.connectionId, modelId: 'second' });
+    } finally {
+      await coordinator.close();
+    }
+  });
+});
+
 test('provider discovery failure preserves the existing catalog and returns no secret', async () => {
   await withFixture(async ({ stores }) => {
     const connection = await createConnection(stores, 0, connectionDraft('discovery', 'openai'));
@@ -1198,7 +1642,10 @@ test('OAuth connection effects resolve the canonical access token instead of sen
       refresh_token: 'oauth-refresh-token-must-not-escape',
       expires_at: Date.now() + 60 * 60_000,
     });
-    const enrollment = await stores.operations.beginInteractiveOAuthLogin(connection.connectionId);
+    const enrollment = await stores.operations.beginInteractiveOAuthLogin({
+      attemptId: 'connection-effect-oauth',
+      target: { kind: 'existing', connectionId: connection.connectionId },
+    });
     assert.equal(enrollment.kind, 'ready');
     if (enrollment.kind !== 'ready') throw new Error('OAuth enrollment did not start');
     const credential = await stores.operations.completeInteractiveOAuthLogin(
@@ -1407,6 +1854,7 @@ function connectionDraft(
     slug,
     name: slug,
     providerType,
+    ...(providerType === 'custom' ? { defaultApiProtocol: 'openai-chat' as const } : {}),
     enabled: true,
     enabledModelIds: ['gpt-5'],
   };
@@ -1532,18 +1980,6 @@ function recordingTransport(onClose: () => void): ConnectionEffectFetchTransport
     },
   };
 }
-
-function deferred<T>(): {
-  readonly promise: Promise<T>;
-  resolve(value: T): void;
-} {
-  let resolve!: (value: T) => void;
-  const promise = new Promise<T>((settle) => {
-    resolve = settle;
-  });
-  return { promise, resolve };
-}
-
 function assertRedacted(value: unknown, forbidden: readonly string[]): void {
   const serialized = JSON.stringify(value);
   for (const text of forbidden) assert.equal(serialized.includes(text), false);

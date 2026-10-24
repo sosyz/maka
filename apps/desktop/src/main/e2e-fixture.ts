@@ -23,7 +23,10 @@ import type { E2eFixtureScenario, E2eFixtureState } from '@maka/core/e2e-fixture
 import { MODEL_CALL_ATTEMPT_EVENT_TYPE } from '@maka/core/model-call-attempt';
 import type { UiLocale } from '@maka/core/ui-locale';
 import { createSqliteAgentRunStore } from '@maka/storage/agent-run-store';
+import { createWorkspaceRuntimeStore } from '@maka/storage/runtime-event-persistence';
 import { createProjectCatalog } from '@maka/storage/project-catalog';
+import { openInteractiveRuntimePolicyStoresForWrite } from '@maka/storage/runtime-policy-stores';
+import { openInteractiveSessionTodoStoreForWrite } from '@maka/storage/session-todo-authority';
 import {
   resolveStorageRoot,
   tryAcquireInteractiveRootOwner,
@@ -33,6 +36,7 @@ import {
   E2E_FIXTURE_NOW,
   LONG_SIDEBAR_PROJECT_ID,
   LONG_SIDEBAR_PROJECT_NAME,
+  LARGE_HISTORY_SESSION_PREFIX,
   LONG_SIDEBAR_SESSION_PREFIX,
   PARTIAL_HISTORY_SESSION_ID,
   PROMPT_RAIL_SESSION_ID,
@@ -40,6 +44,7 @@ import {
   writeSession,
 } from './e2e-fixture/seed-helpers.js';
 import {
+  largeHistorySessions,
   partialHistoryMessages,
   partialHistorySession,
   promptRailMessages,
@@ -49,6 +54,7 @@ import {
 } from './e2e-fixture/scenarios-chat.js';
 import { seedMcpFixture, seedSkillsMarketFixture } from './e2e-fixture/scenarios-modules.js';
 import { longSidebarSessions } from './e2e-fixture/scenarios-sessions.js';
+import { CHECKIN_FIXTURE_CONNECTION, checkinSessions } from './e2e-fixture/scenarios-checkin.js';
 import {
   writeConnections,
   writeDailyReviewArchives,
@@ -58,11 +64,12 @@ import {
 import { usageStatsRecords, usageStatsSessions } from './e2e-fixture/scenarios-usage.js';
 
 const E2E_FIXTURE_SCENARIOS = new Set<E2eFixtureScenario>([
-  'settings-models',
+  'settings-connections',
   'turn-narrative',
   'turn-narrative-browser',
   'chat-prompt-rail',
   'chat-partial-history',
+  'chat-large-history',
   'settings-data',
   'settings-bots-onboarding',
   'settings-general',
@@ -73,6 +80,7 @@ const E2E_FIXTURE_SCENARIOS = new Set<E2eFixtureScenario>([
   'module-daily-review',
   'scheduled-tasks',
   'sidebar-search-modal-open',
+  'checkin',
 ]);
 
 export interface E2eFixture {
@@ -83,7 +91,6 @@ export interface E2eFixture {
   locale: UiLocale | null;
   timezone: string | null;
   platform: 'darwin' | 'win32' | 'linux' | null;
-  scrollMotion: 'auto' | 'smooth' | null;
 }
 
 export function resolveE2eFixture(
@@ -94,7 +101,6 @@ export function resolveE2eFixture(
   rawLocale: string | undefined = undefined,
   rawTimezone: string | undefined = undefined,
   rawPlatform: string | undefined = undefined,
-  rawScrollMotion: string | undefined = undefined,
 ): E2eFixture | null {
   if (!rawScenario) return null;
   if (isPackaged) throw new Error('MAKA_E2E_FIXTURE is only available in dev/test builds.');
@@ -110,13 +116,7 @@ export function resolveE2eFixture(
     locale: parseLocaleFlag(rawLocale),
     timezone: parseTimezoneFlag(rawTimezone),
     platform: parsePlatformFlag(rawPlatform),
-    scrollMotion: parseScrollMotionFlag(rawScrollMotion),
   };
-}
-
-function parseScrollMotionFlag(raw: string | undefined): 'auto' | 'smooth' | null {
-  const normalized = raw?.trim().toLowerCase();
-  return normalized === 'auto' || normalized === 'smooth' ? normalized : null;
 }
 
 function parseThemeFlag(raw: string | undefined): 'light' | 'dark' | 'auto' | null {
@@ -128,7 +128,9 @@ function parseThemeFlag(raw: string | undefined): 'light' | 'dark' | 'auto' | nu
 
 function parseLocaleFlag(raw: string | undefined): UiLocale | null {
   const normalized = raw?.trim().toLowerCase();
-  return normalized === 'zh' || normalized === 'en' ? normalized : null;
+  if (normalized === 'zh-cn') return 'zh-CN';
+  if (normalized === 'zh-tw') return 'zh-TW';
+  return normalized === 'en' ? 'en' : null;
 }
 
 function parseTimezoneFlag(raw: string | undefined): string | null {
@@ -158,28 +160,31 @@ export function getE2eFixtureState(fixture: E2eFixture | null): E2eFixtureState 
   if (!fixture) return null;
   const state: E2eFixtureState = {
     enabled: true,
-    now: E2E_FIXTURE_NOW,
+    // Check-in compares Session activity with the Host's real clock.
+    ...(fixture.scenario === 'checkin' ? {} : { now: E2E_FIXTURE_NOW }),
     ...(fixture.reducedMotion ? { reducedMotion: true } : {}),
     ...(fixture.theme ? { theme: fixture.theme } : {}),
     ...(fixture.locale ? { locale: fixture.locale } : {}),
     ...(fixture.timezone ? { timezone: fixture.timezone } : {}),
-    ...(fixture.scrollMotion ? { scrollMotion: fixture.scrollMotion } : {}),
   };
   switch (fixture.scenario) {
-    case 'settings-models':
+    case 'settings-connections':
       return { ...state, activeSessionId: TURN_SESSION_ID, openSettingsSection: 'models' };
     case 'turn-narrative':
-      return { ...state, activeSessionId: TURN_SESSION_ID, workbarCollapsed: false, workbarTab: 'tasks' };
+      // Any open face will do — the scenario is about focus order through the
+      // transcript, and the workbar is here only so the panel is on screen.
+      // This was the Task face until it was retired.
+      return { ...state, activeSessionId: TURN_SESSION_ID, workbarCollapsed: false, workbarTab: 'review' };
     case 'turn-narrative-browser':
       return { ...state, activeSessionId: TURN_SESSION_ID, workbarCollapsed: false, workbarTab: 'browser' };
     case 'chat-prompt-rail':
       // Workbar collapsed: the rail lives on the chat scrollport's right edge,
-      // and the panel would take the width the measurements are about. Whether
-      // this window scrolls smoothly is a per-launch choice (`scrollMotion`),
-      // because only the jump case needs it and it costs seconds of settling.
+      // and the panel would take the width the measurements are about.
       return { ...state, activeSessionId: PROMPT_RAIL_SESSION_ID, workbarCollapsed: true };
     case 'chat-partial-history':
       return { ...state, activeSessionId: PARTIAL_HISTORY_SESSION_ID, workbarCollapsed: true };
+    case 'chat-large-history':
+      return { ...state, activeSessionId: `${LARGE_HISTORY_SESSION_PREFIX}1`, workbarCollapsed: true };
     case 'settings-data':
       return { ...state, activeSessionId: TURN_SESSION_ID, openSettingsSection: 'data' };
     case 'settings-bots-onboarding':
@@ -203,6 +208,8 @@ export function getE2eFixtureState(fixture: E2eFixture | null): E2eFixtureState 
       return { ...state, activeSessionId: TURN_SESSION_ID, sidebarSection: 'daily-review', sidebarCollapsed: false };
     case 'scheduled-tasks':
       return { ...state, activeSessionId: TURN_SESSION_ID, sidebarSection: 'automations', sidebarCollapsed: false };
+    case 'checkin':
+      return { ...state, sidebarCollapsed: false };
     case 'sidebar-search-modal-open':
       return {
         ...state,
@@ -218,15 +225,21 @@ export async function seedE2eFixture(input: {
   workspaceRoot: string;
   fixture: E2eFixture;
   now?: number;
+  /** Test seam: bounds lagging runs per fold pass; unset keeps the ledger default. */
+  projectionCatchUpLimit?: number;
 }): Promise<void> {
-  const now = input.now ?? E2E_FIXTURE_NOW;
   const scenario = input.fixture.scenario;
+  const now = input.now ?? (scenario === 'checkin' ? Date.now() : E2E_FIXTURE_NOW);
   await rm(input.workspaceRoot, { recursive: true, force: true });
   await mkdir(input.workspaceRoot, { recursive: true });
   const storageRoot = await resolveStorageRoot({ path: input.workspaceRoot, kind: 'interactive' });
   await writeSettings(input.workspaceRoot, scenario);
   await writeConnections(input.workspaceRoot, now, scenario);
-  await writeSession(input.workspaceRoot, turnSession(now), turnMessages(now));
+  await writeSession(
+    input.workspaceRoot,
+    turnSession(now),
+    turnMessages(now),
+  );
 
   if (scenario === 'chat-prompt-rail') {
     await writeSession(input.workspaceRoot, promptRailSession(now), promptRailMessages(now));
@@ -237,6 +250,11 @@ export async function seedE2eFixture(input: {
       partialHistorySession(now),
       partialHistoryMessages(now),
     );
+  }
+  if (scenario === 'chat-large-history') {
+    for (const seed of largeHistorySessions(now)) {
+      await writeSession(input.workspaceRoot, seed.header, seed.messages);
+    }
   }
   if (scenario === 'sidebar-search-modal-open') {
     for (const seed of longSidebarSessions(now)) {
@@ -253,6 +271,7 @@ export async function seedE2eFixture(input: {
       catalog.close();
     }
   }
+  if (scenario === 'checkin') await writeCheckinSessions(input.workspaceRoot, storageRoot, now);
   if (scenario === 'scheduled-tasks') await writeScheduledTasks(input.workspaceRoot, now);
   if (scenario === 'module-daily-review') await writeDailyReviewArchives(input.workspaceRoot, now);
   if (scenario === 'module-skills') await seedSkillsMarketFixture(input.workspaceRoot);
@@ -270,13 +289,14 @@ export async function seedE2eFixture(input: {
     // below. It MUST be the lease's canonicalPath, not the raw workspaceRoot —
     // a /var vs /private/var realpath difference would open a different DB.
     const runStore = createSqliteAgentRunStore(owner.lease.canonicalPath);
+    const runtimeEventStore = createWorkspaceRuntimeStore(owner.lease.canonicalPath);
     try {
       const records = usageStatsRecords(now);
       // Model calls seed the CANONICAL ledger through the AgentRun event stream;
       // tools stay on the legacy telemetry table (there is no canonical tool
       // ledger). This is what actually exercises the canonical merge branch.
-      for (const { header: runHeader, attempt } of records.modelCalls) {
-        await runStore.createRun(runHeader);
+      for (const { opening, attempt } of records.modelCalls) {
+        await runtimeEventStore.appendRuntimeEvent(attempt.sessionId, attempt.runId, opening);
         await runStore.appendEvent(attempt.sessionId, attempt.runId, {
           id: attempt.attemptId,
           type: MODEL_CALL_ATTEMPT_EVENT_TYPE,
@@ -288,14 +308,65 @@ export async function seedE2eFixture(input: {
         });
       }
       for (const record of records.tools) await usage.telemetry.recordToolInvocation(record);
+      runtimeEventStore.close();
       await runStore.close?.();
       // Fold the appended attempts into the read model so the page's first read
       // sees canonical usage (production's readCanonicalUsage also repairs).
-      await usage.modelCalls.catchUpModelCallProjection();
+      // One pass bounds how many lagging runs it processes, and the padded
+      // fixture creates hundreds of runs, so fold until nothing is pending.
+      for (;;) {
+        const projection = await usage.modelCalls.catchUpModelCallProjection({
+          limit: input.projectionCatchUpLimit,
+        });
+        if (projection.pendingRuns === 0) break;
+      }
       await usage.flush();
     } finally {
       await usage.close();
       await owner.close();
     }
+  }
+}
+
+async function writeCheckinSessions(
+  workspaceRoot: string,
+  storageRoot: Awaited<ReturnType<typeof resolveStorageRoot>>,
+  now: number,
+): Promise<void> {
+  // A Session that names its connection by slug alone is a legacy one the Host
+  // will not run, so each is bound to the seeded connection's identity.
+  const connectionId = await withFixtureRootOwner(storageRoot, async (lease) => {
+    const policy = await openInteractiveRuntimePolicyStoresForWrite(lease);
+    const catalog = await policy.connectionCatalog.getSnapshot();
+    const connection = catalog.connections.find((entry) => entry.slug === CHECKIN_FIXTURE_CONNECTION);
+    if (!connection) throw new Error('The check-in fixture connection was not seeded');
+    return connection.connectionId;
+  });
+  const seeds = checkinSessions(now);
+  for (const seed of seeds) {
+    await writeSession(workspaceRoot, { ...seed.header, llmConnectionId: connectionId }, seed.messages);
+  }
+  const owner = await tryAcquireInteractiveRootOwner(storageRoot);
+  if (!owner) throw new Error('Unable to acquire the E2E fixture storage root');
+  try {
+    const todos = await openInteractiveSessionTodoStoreForWrite(owner.lease);
+    for (const seed of seeds) {
+      if (seed.todos) await todos.replaceAll(seed.header.id, seed.todos);
+    }
+  } finally {
+    await owner.close();
+  }
+}
+
+async function withFixtureRootOwner<T>(
+  storageRoot: Awaited<ReturnType<typeof resolveStorageRoot>>,
+  run: (lease: NonNullable<Awaited<ReturnType<typeof tryAcquireInteractiveRootOwner>>>['lease']) => Promise<T>,
+): Promise<T> {
+  const owner = await tryAcquireInteractiveRootOwner(storageRoot);
+  if (!owner) throw new Error('Unable to acquire the E2E fixture storage root');
+  try {
+    return await run(owner.lease);
+  } finally {
+    await owner.close();
   }
 }

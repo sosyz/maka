@@ -26,9 +26,10 @@
 //
 // The backend (main process) has its own separate redactor in
 // redaction.ts for log/persistence sanitization — the two are intentionally
-// different: the display redactor prefers false positives (masking a
-// benign hex is better than leaking a real token), while the backend
-// redactor is stricter to avoid over-redacting structured logs.
+// different: the display redactor masks additional display-specific token
+// shapes and prefers false positives. The backend uses key-aware rules for
+// structured logs, but also inspects assignments nested in text values and
+// masks sensitive-key lookalikes such as `shortcut=key:Enter`.
 
 interface Pattern {
   /** Stable identifier for the masked region in the output. */
@@ -56,6 +57,24 @@ const PATTERNS: Pattern[] = [
     streamingTerminator: /[\s"'<>]/,
     streamingValueGroup: 3,
   },
+  // URL userinfo:  https://user:pass@host  /  https://token@host
+  // Structural — any authority that contains `@` is credential-bearing, so
+  // this does not depend on a provider prefix list. Runs before the query
+  // rule so only the userinfo is replaced and host/path survive.
+  // Character class matches streamingTerminator so a bare `https://host`
+  // cannot swallow later `@` across whitespace/quotes/angle brackets.
+  // Known boundary: punctuation like commas can still join a bare URL to a
+  // later `@`; a proper fix would restrict userinfo to the RFC 3986 set.
+  // http(s) only for now. Streaming cannot recognize userinfo before `@`
+  // arrives (`https://user:pa` stays clear until then); tightening earlier
+  // would eat `https://host:8080/`.
+  {
+    label: 'url userinfo',
+    regex: /(https?:\/\/)([^\s"'<>/?#]*@)/gi,
+    replacement: (m) => `${m[1]}<redacted>@`,
+    streamingTerminator: /[/?#\s"'<>]/,
+    streamingValueGroup: 2,
+  },
   // URL query secrets:  ?key=[redacted]  ?token=[redacted]  ?api_key=[redacted]  &access_token=[redacted]
   // (runs before the api-key-header rule so the URL form isn't mangled.)
   {
@@ -75,12 +94,13 @@ const PATTERNS: Pattern[] = [
     streamingValueGroup: 3,
   },
   // Common provider key prefixes
-  // OpenAI: sk-..., Anthropic: sk-ant-..., Google API: AIza..., GitHub: ghp_/gho_/ghu_/ghs_/ghr_
+  // OpenAI: sk-..., Anthropic: sk-ant-..., Google API: AIza...,
+  // GitHub: ghp_/gho_/ghu_/ghs_/ghr_/github_pat_
   // Slack tokens: xox[abprs]-...
   {
     label: 'provider api key',
     regex:
-      /\b(sk-[A-Za-z0-9_-]{16,}|sk-ant-[A-Za-z0-9_-]{16,}|AIza[0-9A-Za-z_-]{30,}|gh[opusr]_[A-Za-z0-9]{30,}|xox[abprs]-[A-Za-z0-9-]{16,})\b/g,
+      /\b(sk-[A-Za-z0-9_-]{16,}|sk-ant-[A-Za-z0-9_-]{16,}|AIza[0-9A-Za-z_-]{30,}|gh[opusr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{20,}|xox[abprs]-[A-Za-z0-9-]{16,})\b/g,
     streamingReversible: true,
   },
   // Long high-entropy hex/base64 strings (40+ chars) — best-effort catch.

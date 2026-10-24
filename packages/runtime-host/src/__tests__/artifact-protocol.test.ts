@@ -41,6 +41,65 @@ import { encodeArtifactProjection } from '../protocol/artifact.js';
 const revision = `sha256:${'a'.repeat(64)}` as const;
 
 describe('Artifact protocol', () => {
+  test('accepts closed Artifact change frames and rejects malformed invalidations', () => {
+    assert.deepEqual(
+      decodeHostFrame({
+        kind: 'artifact.changed',
+        reason: 'deleted',
+        sessionId: 'session-1',
+        artifactId: 'artifact-1',
+      }),
+      {
+        kind: 'artifact.changed',
+        reason: 'deleted',
+        sessionId: 'session-1',
+        artifactId: 'artifact-1',
+      },
+    );
+    assert.deepEqual(
+      decodeHostFrame({
+        kind: 'artifact.changed',
+        reason: 'session_purged',
+        sessionId: 'session-1',
+      }),
+      {
+        kind: 'artifact.changed',
+        reason: 'session_purged',
+        sessionId: 'session-1',
+      },
+    );
+
+    for (const frame of [
+      null,
+      undefined,
+      {
+        kind: 'artifact.changed',
+        reason: 'deleted',
+        sessionId: 'session-1',
+      },
+      {
+        kind: 'artifact.changed',
+        reason: 'deleted',
+        sessionId: 'session-1',
+        artifactId: 'artifact-1',
+        revision: 1,
+      },
+      {
+        kind: 'artifact.changed',
+        reason: 'session_purged',
+        sessionId: 'session-1',
+        artifactId: 'artifact-1',
+      },
+      {
+        kind: 'artifact.changed',
+        reason: 'unknown',
+        sessionId: 'session-1',
+      },
+    ]) {
+      assert.throws(() => decodeHostFrame(frame), isInvalidFrame);
+    }
+  });
+
   test('accepts closed Artifact operations and rejects open shapes', () => {
     for (const input of [
       { kind: 'list_start', sessionId: 'session-1' },
@@ -54,6 +113,11 @@ describe('Artifact protocol', () => {
     }
     assert.doesNotThrow(() =>
       request('artifact.delete', { sessionId: 'session-1', artifactId: 'artifact-1' }),
+    );
+    assert.doesNotThrow(() => response('artifact.delete', { kind: 'deleted' }));
+    assert.throws(
+      () => response('artifact.delete', { kind: 'deleted', artifact: validArtifact() }),
+      isInvalidFrame,
     );
 
     for (const input of [
@@ -243,19 +307,15 @@ describe('Artifact protocol', () => {
   test('keeps operation failures closed and typed', () => {
     assert.doesNotThrow(() => failure('artifact.delete', 'not_found', 'Artifact was not found'));
     assert.doesNotThrow(() =>
-      failure(
-        'artifact.delete',
-        'operation_conflict',
-        'Protected runtime evidence cannot be deleted through Runtime Host',
-      ),
-    );
-    assert.doesNotThrow(() =>
       failure('artifact.query', 'persistence_failed', 'Artifact projection is unavailable'),
     );
     assert.doesNotThrow(() => failure('artifact.query', 'not_found', 'Session was not found'));
     assert.throws(
       () => failure('artifact.query', 'operation_conflict', 'Protected runtime evidence'),
       isInvalidFrame,
+    );
+    assert.doesNotThrow(() =>
+      failure('artifact.delete', 'operation_conflict', 'Protected runtime evidence'),
     );
     assert.throws(() => failure('artifact.delete', 'outcome_unknown', 'Unknown'), isInvalidFrame);
   });
@@ -413,9 +473,8 @@ function validArtifact() {
     kind: 'file' as const,
     sizeBytes: 4,
     mimeType: 'text/plain',
-    source: 'fixture' as const,
+    source: 'tool_result' as const,
     summary: 'bounded',
-    status: 'live' as const,
   };
 }
 
@@ -426,7 +485,10 @@ function request(
   decodeClientFrame({ requestId: 'request', operation, input });
 }
 
-function response(operation: 'artifact.ingest' | 'artifact.query', result: unknown): void {
+function response(
+  operation: 'artifact.ingest' | 'artifact.query' | 'artifact.delete',
+  result: unknown,
+): void {
   decodeHostFrame({ requestId: 'response', operation, ok: true, result });
 }
 

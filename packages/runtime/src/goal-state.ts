@@ -268,6 +268,13 @@ export class GoalManager {
     return this.goals.get(sessionId)?.state;
   }
 
+  getSessionIdByGoalId(goalId: string): string | undefined {
+    for (const [sessionId, record] of this.goals) {
+      if (record.state.id === goalId) return sessionId;
+    }
+    return undefined;
+  }
+
   getActive(sessionId: string): GoalState | undefined {
     const goal = this.goals.get(sessionId)?.state;
     return goal?.status === 'active' ? goal : undefined;
@@ -284,6 +291,14 @@ export class GoalManager {
     if (this.goals.has(goal.sessionId)) {
       throw new Error(`Session ${goal.sessionId} already has a restored Goal`);
     }
+    this.goals.set(goal.sessionId, {
+      state: Object.freeze({ ...goal }),
+      controlLease: Object.freeze({ ...controlLease }),
+    });
+  }
+
+  adoptAuthority(goal: GoalState, controlLease: GoalControlLease): void {
+    if (goal.id !== controlLease.goalId) throw new Error('Invalid Goal authority');
     this.goals.set(goal.sessionId, {
       state: Object.freeze({ ...goal }),
       controlLease: Object.freeze({ ...controlLease }),

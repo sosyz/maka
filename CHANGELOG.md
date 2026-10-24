@@ -21,10 +21,98 @@
 
 ## Unreleased
 
-## 0.2.0 - Unreleased
+## 0.2.2 - Unreleased
 
 ### Added
 
+- A personal assistant with indexed memory, durable tasks and an inbox bot for coordinating work (#6004, #6124), and durable observation of event waits (#6113).
+- Import Cursor sessions through their SQLite history adapter (#6039).
+- Let Goals resume from durable event waits, including background ShellRun completion, and add condition waits plus web and IM access for the personal assistant (#6147, #6156, #6193, #6206).
+- Interact with running CLI Sessions, inspect their recaps and retain the selected model across commands (#6133, #6169, #6170).
+- Configured external agents in the model picker, alongside unified model and effort options (#6103, #5789).
+- Automatic rendering and archiving of chat images, and clearer project, task and execution-location controls (#5969, #6088).
+
+### Fixed
+
+- Preserve cached replies, new Side Chat sessions and question forms across session switches (#6129, #6111, #5854).
+- Recover failed message delivery and workspace Skill deletion, retain client tool outcomes, and release settled external executions whose results were rejected (#5058, #6009, #5458, #5823).
+- Render imported Codex user context without raw envelopes, scope WorkHub tool lookups to the owning turn, and include tool and human evidence in Goal context (#6117, #6096, #6087).
+- Keep fullscreen editing usable on short terminals, mask fine-grained GitHub tokens, and align connection URL validation with the Host (#6085, #6062, #6098).
+- Restore image attachments in Codex imports and preserve running tool state when reconnecting (#6118, #6145).
+- Invalidate deleted Artifact previews, allow new projects without a custom name, and keep conversations centered with classic scrollbars (#5394, #6073, #6102).
+- Resolve linked-worktree read boundaries through the common Git directory, and initialize vacuum mode when databases are created concurrently (#6105, #6136).
+- Preserve Windows browser launcher paths and SSH operator arguments, and validate project roots for the target platform (#6121, #6123, #6122).
+- Source patches no longer include the unchanged QuickJS WebAssembly binary; installation reuses it from the pinned npm dependency. Source verification also rejects Base64-encoded WASM.
+- Correct stale source-license component and dependency references, preserve the cursor files' upstream MIT scope, and identify the historical 0.2.0 RC1 in DISCLAIMER-WIP.
+- Update the standalone CLI's bundled Node runtime and refresh shipped dependencies for published security advisories (#6229, #6236).
+
+### Changed
+
+- Use one Composer model selector for native models and external agents, with shared search and thinking controls (#6158).
+- Bound transcript work on session switches and Read line-index memory; allow providers to own reasoning defaults (#5712, #5461, #6092).
+- Use dedicated directories for projectless tasks and preserve distinct titles for branched sessions (#5966, #4994).
+- Improve Computer Use cursor positioning and visibility; recover interrupted macOS notarization and validation requests and native Windows PTY exit codes (#5051, #5052, #6125, #6101, #6097, #6094).
+- Guard packaged dependency contents with a reviewed ledger and document the Linux support baseline (#5455, #6099).
+
+### Upgrade notes
+
+- CLI scripts that parse structured errors must pass `--json`: errors then appear only on stdout, without a duplicate on stderr. Without `--json`, failed `maka run` results print a brief error only on stderr. Use the exit code to detect failure (#6171).
+- Update Desktop, CLI and remote Runtime Hosts together. The Runtime Host compatibility epoch is 228 (217 in 0.2.1); mismatched peers cannot connect.
+- MCP and OAuth endpoints that redirect to a different origin must be configured with their final URL. The updated MCP SDK restricts cross-origin redirects (#6229).
+- Back up configuration and workspace data before upgrading if rollback is needed. This release adds durable assistant and event-wait state; older releases must not reuse data written by a newer Host without a verified downgrade path.
+- This release continues the TypeScript Runtime Host and Electron desktop. The Rust Host and GPUI desktop remain on the separate `rust-preview` development branch.
+
+## 0.2.1 - Unreleased
+
+### Added
+
+- WorkHub can inspect existing conversations, receive delegated task results automatically, and route remote channel conversations through the shared coordinator (#5886, #5595, #6051). Jev-assisted routing is opt-in (#5562).
+- Host storage usage and per-task sizes, archived-task cleanup by age and project, and opt-in archived-task retention (#5832, #5896, #5902, #5961).
+- Agent Graph output previews, session visit navigation with horizontal swipes, clickable terminal links, and a selectable Git comparison branch that persists per Session (#4751, #5688, #5033, #5120).
+- Resume interrupted or manually stopped turns from the Desktop composer, and opt-in next-prompt suggestions (#5206, #5904, #5629).
+- Connect the user's signed-in Chrome through opencli-mcp, and check local preview prerequisites before starting a preview (#5638, #5254).
+- Antigravity ACP plugin execution and restored sessions after restart; ACP operations for Goal, Plan, Artifact and Memory (#5224, #5670, #5734, #5685).
+- Filter usage by model call kind, replay DeepSeek hosted web-search responses, and include selected text in Computer Use snapshot observations (#5709, #5824, #5050).
+
+### Fixed
+
+- Enforce configured sender lists consistently across messaging platforms and preserve stored credentials when settings round-trip masked values (#6074).
+- Keep the composer context gauge from showing stale pre-compaction usage. The gauge returns to its localized Usage label until the provider measures a request after the compaction boundary (#5548).
+- Preserve interrupted tool settlement, session recovery and provider context handling across retries and restarts (#5610, #5621, #5587).
+- Report browser toolbar action failures and distinguish empty Git comparisons from review errors (#5955, #5967).
+- Desktop Edit & resend now keeps a selected message's quotes. Messages that carry attachments still cannot be edited (#5274).
+- Record aborted or usage-less auxiliary model calls as usage-unknown rather than zero (#5890).
+- Stop pipe-mode shell commands when their Runtime Host dies, instead of leaving them running without an owner (#5986).
+- Keep native Anthropic prompt caching effective across steps and turns by placing the cache breakpoint on replayed history (#6041).
+- Update shipped dependencies to clear published advisories in brace-expansion, fast-uri and axios (#5906).
+
+### Changed
+
+- Custom connections now use one provider type with a default API protocol and per-model overrides. Legacy connections migrate while retaining identifiers, credentials and model overrides (#5684).
+- TUI queue and retract shortcuts use Tab and Shift+Left in place of Alt chords (#5910).
+- Manual archiving now refuses a task while a WorkHub delegation or a live linked child task still points at it, instead of hiding it from WorkHub (#5957).
+- Reduced idle and streaming renderer work, paused transcript reads while the shell is covered, and bounded Host framing and storage queries (#5608, #6014, #5356, #5514).
+- Reclaim unused context-offload SQLite pages during Host maintenance; new runtime databases support incremental vacuum (#5855, #6044).
+- Removed the provider-dropping context note because differing upstream token counts could trigger it without evidence of dropped history. Historical sessions containing it still open (#5672).
+
+### Upgrade notes
+
+- Update Desktop, CLI and remote Runtime Hosts together. The Runtime Host compatibility epoch is 217 (176 in the 0.2.0 source release); mismatched peers cannot connect.
+- Back up configuration and workspace data before upgrading if rollback is needed. Custom connection catalogs migrate to schema v3, and new session records include fields older builds cannot decode; 0.2.0 cannot safely reuse data written by 0.2.1.
+- Review every messaging platform's sender list before enabling its channel. A nonempty list now admits only its listed platform user IDs, including WorkHub routing; an empty list retains unrestricted sender access (#6074).
+- Archived-task retention remains opt-in. Enabling it allows permanent deletion of eligible archived tasks; leave it disabled to retain them.
+
+## 0.2.0 - 2026-10-08
+
+### Added
+
+- Added external Session import to the TUI. It lists the Runtime Host's external
+  sources (Claude Code, Codex, OpenCode) and imports one Session as a native
+  Maka Session through the same Host catalog/import path the Desktop App uses,
+  opening the result without sending a model request. Sources with prior imports
+  offer an action to open the most recently imported task or create another
+  independent import. An uncertain result remains visible as a warning while
+  still allowing a user-initiated import again in both Desktop and TUI.
 - Added `/transcript` to browse long TUI sessions without depending on terminal
   scrollback, with line, page, and first/last navigation.
 
@@ -40,6 +128,12 @@
 
 ### Changed
 
+- Imported Sessions replay conversation text only — the user's words and the
+  model's — so an import can no longer publish an empty or partial history. A
+  transcript whose rows convert to nothing is refused before anything is
+  persisted, and a transcript that opens on an assistant reply keeps that turn.
+- Reading a Claude Code transcript for the Session catalog is bounded to a head
+  and tail window instead of reading each transcript to its end.
 - Made typed `request()` the sole direct Runtime Host operation API; removed the 17 forwarding
   aliases from direct and reconnecting connections while preserving status validation,
   subscriptions, capabilities, listeners, lifecycle, and close behavior.
@@ -47,7 +141,16 @@
   terminal coalescing, stop/drain, and durable continuation admission now have one production
   owner, immutable request snapshots remain enforced at AgentRun acceptance and backend dispatch,
   and SessionEvent-to-RuntimeEvent conversion remains a pure mapper.
-- Unified context management under one Runtime-owned policy. `MAKA_CONTEXT_*` environment overrides no longer tune or disable compaction and Tool Result pruning; model-visible archive placeholders are read on demand through bounded `ArchiveRead` calls instead of eager hydration. Previously supported overrides are ignored on upgrade: if Tool Result pruning was set to `off`, pruning is re-enabled, and there is currently no supported replacement opt-out.
+- Retired the Task Ledger domain: SessionTodo is now the sole authority for in-session work items, and the operational-state schema drops the `workflow_task_ledger_events` table on first open. **Unfinished Tasks are not migrated and are permanently deleted.** This affects workspaces last opened by `v0.1.0` through `v0.1.11`, `cli-v0.1.0-beta.1`, `v0.2.0-incubating-rc1`, or a `v0.2.0-dev` build; those releases wrote Tasks to a table that no shipped build ever bridged into SessionTodo. Before opening such a workspace with this build, finish or export the Tasks you still need, or copy the workspace's `runtime.sqlite` aside — the migration removes the only live copy, so afterwards recovery requires a backup made in advance.
+- A compaction rejected as too large for the summarizer's own window now retreats to the span the last accepted request's input covered, instead of halving the covered range. That span is the newest reply this route produced, found through the run headers, so it was accepted by this model on this connection and is provably within capacity; halving can overshoot (discarding verbatim history for nothing) or undershoot (paying another round trip), and a span another route accepted proves nothing at all. One retreat, then the fold fails open and the provider decides.
+- `token_usage` anchors now record the model and connection that produced them. A token count is a number in one model's tokenizer against one connection; carrying the route on the record lets any reader apply the rule the runtime already enforces, instead of pairing one model's usage with another model's window. The record decodes against a closed allowlist, so sessions written with these keys do not open in earlier releases, and the Runtime Host compatibility epoch moves to 107.
+- The provider-dropping note now also fires across the send boundary. A provider that truncates to a fixed window reports the same input on every later request while the user keeps adding turns, which a send of one or two steps cannot see from the inside; the first request of a send compares against the persisted anchor instead. Across the boundary the test is equality rather than "did not grow": inside a send Maka knows it only appended, while across it a manual compaction, a smaller tool set or an edited history all shrink the input legitimately, and none of them lands on exactly the same count. The note carries the two counts it compared, and is reported once per backend rather than once per send, because the condition persists once it starts.
+- Let the provider decide whether a request fits. Proactive compaction now uses only a user-declared Maka window and the previous accepted request's provider-reported `inputTokens + outputTokens`; no declaration means no proactive capacity threshold. `/models` and generated model metadata are display hints, not limits. `token_usage` records persist the last-request anchor under `lastRequestAnchor`; its new `{ inputTokens, outputTokens }` shape still decodes the retired `payloadChars` key from older sessions. Requests that are too large are compacted and retried once after a real provider rejection, then reported as a `context_overflow` provider error. Compaction is entered at most once per send, and a request rejected after a fold was actually applied is reported as still too large after compaction. A fold that failed open makes no such claim: that request went out with its full raw history. A reply cut at `finishReason: length` no longer triggers a fold, because the provider running out of window room and the provider's own lower output cap are indistinguishable from outside. Five system notes explain the provider-side cases: dropping context, a window worth declaring, an exchange past the declared window, a request accepted past the window the model reports (once per crossing, while nothing is declared), and a request still too large after compaction. The reply reserve that arms the proactive threshold is twice the last real reply, bounded at 8,000 tokens, rather than the model's maximum output. **Sessions this build writes do not open in earlier releases:** those decode `token_usage` against a closed allowlist, so the reshaped `lastRequestAnchor` key fails the record and, with it, the Session that contains it; downgrading therefore needs a copy of the workspace's `runtime.sqlite` taken before the upgrade. Nothing produces the `context_budget_exhausted` stop reason any more — a request that really is too large is compacted and retried once, then reported as a `context_overflow` provider error — though sessions that already recorded it still decode and present. The Runtime Host compatibility epoch moves to 106.
+- Unified context management under one Runtime-owned policy. `MAKA_CONTEXT_*` environment overrides no longer tune compaction or Tool Result pruning. Archived results are read on demand through bounded `Read` calls with a Maka resource path; `ArchiveRead` is removed. Read requires only `path`, with optional `offset` and `limit`; pass the complete `next` object to continue. Tool Result pruning has one `enabled` switch; the old tuning options are removed.
+- Moved Read image snapshots into the durable context-offload store with Runtime-owned
+  lifecycle identity, exact branch and revision copying, recovery-safe cleanup, and bounded
+  physical garbage collection after Session retirement.
+- Unified manual model registration and parameter overrides in the connection catalog, isolated by connection and saved atomically. Model capacity and automatic compaction now use separate fields. Redesigned the shared add/edit form, kept disabled models configurable, and removed bulk thinking edits and client catalog rebuilding. Legacy declarations migrate on the next save; Clients and Hosts must update together.
 
 ## 0.1.11 - 2026-08-18
 
@@ -445,6 +548,9 @@
 
 ### Removed
 
+- Removed the TUI's local foreign-Session scanner, the
+  `<foreign-session-digest>` handoff prompt, the second OpenCode reader, and the
+  `MAKA_IMPORT_*` switches. TUI and Desktop now share one import path.
 - Removed dead storage modules (#2104), consumer-less Desktop IPC bridge surface
   (#2065), and dead shell CSS recipes along with the check-dead-css blind spots
   that hid them (#2070).

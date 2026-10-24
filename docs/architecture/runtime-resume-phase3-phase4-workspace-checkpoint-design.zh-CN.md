@@ -19,6 +19,9 @@
 
 # Runtime Resume Phase 3–4 实施路线
 
+> **2026-10-16 退役说明：** 本文涉及工具专属 reconciliation、recovery bundle 写入及其后续 PR 的内容保留为历史设计，不再是当前实施要求。没有生产工具提供完整的 reconciliation 合同，公开 bundle writer 和预设工具恢复能力已清理。已有 recovery facts 仍保留读取、复制与投影重建兼容。当前合同是结束旧执行、保留未知事实、禁止自动重放，由新的明确用户轮检查现状；详见[当前恢复架构](./runtime-resume-architecture.zh-CN.md#未知结果与历史-recovery-bundle)。
+
+
 > 路线更新（2026-08-29）：旧 Git executable managed-workspace path 已删除，后续 workspace 主线从
 > **Gitoxide data plane** 重新建立 production admission。本文保留 Recovery/Continuation 已落地协议与旧路线的历史论证；
 > 新实现不再以通用 per-file checkpoint、native manifest、CAS object store 或旧 Git CLI owner 为前置。
@@ -30,6 +33,8 @@
 - 事实权威：immutable RuntimeEvents
 - 主要平台：Linux、macOS；Windows 有限支持
 - 拆分审计：`runtime-resume-extraction-ledger.zh-CN.md`
+- 跟踪：[生产级 Write/Edit 恢复 #4319](https://github.com/apache/maka/issues/4319)
+- 跟踪：[safe-boundary continuation 加固 #4324](https://github.com/apache/maka/issues/4324)
 
 ## 1. 四个正交平面
 
@@ -76,15 +81,16 @@ RuntimeEvent 是语义事实的唯一权威，但不能替代执行所有权的�
 11. strict args identity 明确处理 `__proto__` 并拒绝 sparse/accessor/custom array；
 12. 唯一 canonical RuntimeEvent codec 负责 decode、normalization、strict JSON、稳定 bytes 与
     lossless round-trip；SQLite/JSONL、未来 prefix digest 均复用它；
-13. JSONL immutable exact retry 物理去重，写前验证 Run header identity；
+13. JSONL immutable exact retry 物理去重，写前验证 invocation identity；
 14. SQLite 强制一个 invocation 只对应一个 `(sessionId, runId, turnId)`；
 15. journal ID 只由 store 派生；正式 schema 4 的无 dispatch legacy rows保守隔离。
 
 PR A 首版的 prospective gate 是 workspace-wide semantic fail-stop：任何 session 中已存在的
 canonical tool-ledger corruption 都会拒绝同一 SQLite workspace 后续所有 tool-bearing write。
-这会扩大故障域并在写事务内产生全历史扫描成本，但它是明确的 correctness-first 选择。后续只能
-用可从 immutable events 重建的增量 reducer 收缩到 candidate execution spine；不能用可变缓存
-替代事实权威。
+当前实现已把校验范围缩到 candidate invocation 及其显式父工具依赖闭包。每次写入在同一
+SQLite 事务视图下读取 immutable events，使用与整段扫描相同的 reducer 规则校验候选，
+随后丢弃临时状态。reducer 不跨事务缓存，不需要镜像失效版本、候选撤销日志或 LRU；
+SQLite 事务仍负责事实与投影的原子提交、回滚。无关 invocation 的损坏不会扩大当前写入的失败域。
 
 PR A 的证明矩阵包括：
 
@@ -167,7 +173,7 @@ composite replay 存在时，它是 tool-state 与 provider suffix 的唯一 gat
 
 最终同时冻结：
 
-- `providerProjectionVersion = 1`；
+- `providerProjectionVersion`（PR B 时冻结为 1；#4286 起为 2）；
 - composite `providerReplayDigest`；
 - segment boundary manifest。
 
@@ -182,7 +188,7 @@ schema 6 增加 `runtime_continuation_claims` 与 capability
 - immediate source execution identity、physical high-water、prefix digest；
 - provider projection version 与 provider replay digest；
 - fresh target session/invocation/run/turn；
-- target Run 的完整、严格解码 `AgentRunHeader`（含 V2 continuation source）；
+- target invocation 的完整、严格解码开场事实（含 continuation source）；
 - claim id、claimed-at、protocol version；
 - 可空、唯一的 continuation-start event id；
 - 与 start 同生存期的 store-owned `start_kind`：`runtime_admission | claim_repair`。
@@ -286,8 +292,8 @@ retry 入口。历史 `linked_child_resume` / `linked_child_provider_retry` desc
 `retriedFromRunId` 只保留重启关闭、查询和展示兼容，不会重新触发 provider。
 
 live continuation-start 同时绑定 claim id、boundary digest、immediate source identity/high-water/prefix
-digest、replay manifest、provider projection version 和 provider replay digest。V2 AgentRun header 的
-`continuationSource` 必须与首条 continuation-start 完全一致。若当前执行使用
+digest、replay manifest、provider projection version 和 provider replay digest。target invocation 开场事实里的
+continuation source 必须与首条 continuation-start 完全一致。若当前执行使用
 `t1_after_preflight_v1`，该 marker 也写在同一 event-seq 1；repair start 不得携带它。
 
 只有 `RuntimeKernel` 能 dispatch durable continuation。AgentRun 仅在 live start 返回
@@ -330,11 +336,11 @@ canonical continuation authority 读取失败时，best-effort startup 必须隔
 退回 generic/legacy repair。否则一个暂时读不到 claim 的 host 可能把 claim-owned target 当成普通
 中断 Run 修复，重新引入双重事实源。
 
-repair 是跨 SQLite canonical RuntimeEvent 与文件型 AgentRun operational projection 的 saga：
+repair 是跨 SQLite canonical RuntimeEvent 与 SQLite AgentRun operational projection
+（`core_agent_runs` / `core_agent_run_projections`，`createSqliteAgentRunStore`）的 saga：
 start、terminal fact 与 AgentRun terminal event 使用确定性 id；若 terminal fact 已提交而 header
-或 operational projection 未完成，下一次启动会复用同一 terminal 并补齐。SQLite canonical fact
-可以幂等，但文件 append 目前没有跨进程 CAS；两个 host 同时 repair 的 exactly-once 要由后续
-lease/fencing 或 append-if-absent 解决。
+或 operational projection 未完成，下一次启动会复用同一 terminal 并补齐。单库事务保证单个写入的
+原子性，但两个 host 同时 repair 的 exactly-once 仍要由后续 owner lease/fencing 解决。
 
 #### B2/B2.1 crash matrix
 
@@ -407,6 +413,8 @@ provider materializer/projection version
 permission/sandbox execution-policy digest（会影响可执行语义时）
 ```
 
+跟踪：[sandbox boundary negotiation #3731](https://github.com/apache/maka/issues/3731)。该 issue 只覆盖 permission/sandbox execution-policy 跨安全续接，不覆盖完整 execution profile 的其余字段。
+
 boundary 证明“继续哪一段事实”，execution profile 证明“按照哪套执行语义继续”。两者必须分开
 摘要并同时匹配；不能在执行时用当前 Session 配置重新生成 target header，从而把 plan 后的模型、
 prompt 或同名工具 schema 漂移悄悄合法化。
@@ -453,7 +461,7 @@ authority、同一 ledger transaction domain。lease 要携带 epoch/fencing tok
 | observation | 动作 |
 |---|---|
 | `matches_expected_state` | cleanup/finalize，合成 outcome，提交 PR A bundle |
-| `matches_prior_state` | park，reason=`redo_disabled_pending_cas` |
+| `matches_prior_state` | park，reason=`reconcile_matches_prior_state` |
 | `diverged` | park，不覆盖外部写入 |
 | `unreadable` | park，不猜测 |
 
@@ -474,8 +482,8 @@ authority、同一 ledger transaction domain。lease 要携带 epoch/fencing tok
 sandbox、one-call grant 和 abort boundary 的执行所有权。
 
 PR C 沿用 PR A 的 durable vocabulary：`matches_expected_state` 可 finalize；
-`matches_prior_state`、`diverged`、`unreadable` 均提交 terminal parked decision。UI 可以把
-`matches_prior_state` 映射为 `redo_disabled_pending_cas`，但不新增第二套 durable fact 名称。
+`matches_prior_state`、`diverged`、`unreadable` 均提交 terminal parked decision。UI 直接展示
+durable reason code（如 `reconcile_matches_prior_state`），不维护第二套展示层状态名。
 
 ### PR D — Host owner lifecycle
 
@@ -493,8 +501,8 @@ PR D 不改变 recovery semantics。它覆盖：
 - in-flight recovery 时退出；
 - double close；
 - Desktop 与 CLI 同 workspace 的 owner 冲突策略；
-- runtime-host 的 execution-store writer facade 在同一个 storage-root lease 下拥有并暴露 SQLite
-  continuation authority，而不是继续把 `FileRuntimeEventStore` 误当成 B2 authority；
+- runtime-host 的 execution-store writer facade 已在同一个 storage-root lease 下拥有并暴露 SQLite
+  continuation authority（早期设计中的 `FileRuntimeEventStore` 已从代码库移除，不存在回退路径）；
 - production composition test 证明 plan → claim → start → provider 与 startup repair 都经过同一个
   authority 实例。
 - owner lease 的 epoch/fencing 以及 AgentRun operational projection 的 append-if-absent/CAS；
@@ -515,8 +523,9 @@ continuation claim repair
 ```
 
 generic repair 必须识别 claim-owned target 并 defer，不能用普通 `app_restarted` Run 抢占 target
-identity。当前 PR B 交付 authority-capable SessionManager 与 SQLite 协议；在 PR D 把该 authority
-接入 runtime-host 生产组合并完成 owner/ordering 测试前，不得宣称 hosted auto-resume 已启用。
+identity。当前 PR B 交付 authority-capable SessionManager 与 SQLite 协议；该 authority 已接入
+runtime-host 生产组合（execution composition 直接使用 SQLite runtimeEventStore），hosted
+auto-resume 的默认启用状态仍以 feature flag 与启动诊断为准。
 
 ## 3. Native、attached 与 managed 的能力边界
 
@@ -538,6 +547,8 @@ receipt、worktree materialization 与 Runtime Host admission path 已删除。s
 projection reader/rebuild 与升级合同继续保留；它们是历史事实 authority，不是可执行 Git path。
 
 ## 4. Gitoxide managed workspace 后续边界
+
+跟踪：[Gitoxide workspace continuity #4325](https://github.com/apache/maka/issues/4325)
 
 后续强模式必须从 Gitoxide data plane 建立新的 production composition，并分别证明：
 

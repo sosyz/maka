@@ -17,18 +17,25 @@
  * under the License.
  */
 
+import { stubConversationServices, useComposerAttachments, useComposerQuotes } from '../../renderer/features/conversation/testing.js';
 import assert from 'node:assert/strict';
 import { afterEach, test } from 'node:test';
-import { act, createElement } from 'react';
+import { act, createElement, StrictMode, useEffect, useRef } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { parseHTML } from 'linkedom';
+import type { ChatModelChoice } from '@maka/core/chat-model-choice';
+import { QUOTE_COMMENT_MAX_LENGTH } from '@maka/core/events';
 import { LocaleProvider } from '@maka/ui';
 import { NEW_TASK_PENDING_KEY } from '../../renderer/pending-items.js';
+import { getDesktopConversationCopy } from '../../renderer/application/contracts/conversation-copy.js';
 import {
-  useComposerAttachments,
+  ConversationServicesProvider,
   type ComposerAttachmentService,
-} from '../../renderer/use-composer-attachments.js';
-import { useAppShellComposerQuotes } from '../../renderer/use-app-shell-composer-quotes.js';
+} from '../../renderer/features/conversation/index.js';
+import {
+  composerModelSupportsVision,
+  type NewChatModel,
+} from '../../renderer/features/conversation/testing.js';
 
 /**
  * #3408 for what the composer STAGES. The draft text is covered by
@@ -58,9 +65,14 @@ afterEach(async () => {
   Object.assign(globalThis, originalGlobals);
 });
 
-async function mountProbe<T>(useHook: (options: { draftKey: string }) => T): Promise<{
+async function mountProbe<T>(
+  useHook: (options: { draftKey: string }) => T,
+  strictMode = false,
+  releaseRecoveryAttachments: (ids: readonly string[]) => Promise<void> = async () => {},
+): Promise<{
   latest(): T;
-  render(draftKey: string): Promise<void>;
+  render(draftKey: string, locale?: 'en' | 'zh-CN'): Promise<void>;
+  unmount(): Promise<void>;
 }> {
   const { document, window } = parseHTML('<div id="root"></div>');
   Object.assign(globalThis, {
@@ -75,6 +87,22 @@ async function mountProbe<T>(useHook: (options: { draftKey: string }) => T): Pro
   assert.ok(container);
   const root = createRoot(container);
   mountedRoot = root;
+  const services = stubConversationServices({
+    listMessages: async () => [],
+    readFailedMessage: async () => { throw new Error('unused'); },
+    releaseRecoveryAttachments,
+    cancelMessage: async () => {}, reconcileMessage: async () => {}, subscribeChanges: () => () => {},
+    sessions: {
+      readSnapshot: async () => { throw new Error('unused'); },
+      readExecutionBoundary: async () => { throw new Error('unused'); },
+    },
+    runtimeHosts: { subscribeChanges: () => () => {} },
+    skills: { listInvocable: async () => [] },
+    workspace: { searchFiles: async () => ({ ok: false, reason: 'no_project' }) },
+    newTasks: { subscribeChanges: () => () => {}, listInvocableSkills: async () => [],
+      searchFiles: async () => ({ ok: false, reason: 'no_project' }) },
+    mcp: { subscribeChanges: () => () => {} },
+  });
 
   let latest: T | undefined;
   function Probe(props: { draftKey: string }) {
@@ -82,14 +110,13 @@ async function mountProbe<T>(useHook: (options: { draftKey: string }) => T): Pro
     return null;
   }
 
-  const render = async (draftKey: string) => {
+  const render = async (draftKey: string, locale: 'en' | 'zh-CN' = 'en') => {
     await act(async () => {
-      root.render(
-        createElement(LocaleProvider, {
-          locale: 'en',
-          children: createElement(Probe, { draftKey }),
-        }),
-      );
+      const content = createElement(LocaleProvider, {
+        locale,
+        children: createElement(ConversationServicesProvider, { services, children: createElement(Probe, { draftKey }) }),
+      });
+      root.render(strictMode ? createElement(StrictMode, { children: content }) : content);
     });
   };
 
@@ -99,6 +126,10 @@ async function mountProbe<T>(useHook: (options: { draftKey: string }) => T): Pro
       return latest;
     },
     render,
+    unmount: async () => {
+      await act(() => root.unmount());
+      mountedRoot = undefined;
+    },
   };
 }
 
@@ -113,6 +144,22 @@ const idleAttachmentService: ComposerAttachmentService = {
   pickFiles: async () => ({ ok: false, reason: 'cancelled' }),
   previewApproval: async () => ({ ok: false, reason: 'not used' }),
 };
+
+function recoveryContext(...approvalIds: string[]) {
+  return {
+    attachments: [],
+    stagedAttachments: approvalIds.map((approvalId) => ({
+      approvalId, name: 'recovered.txt', mimeType: 'text/plain', size: 1,
+    })),
+    directoryReferences: [],
+  };
+}
+
+async function mountRecoveryProbe(releaseRecoveryAttachments: (ids: readonly string[]) => Promise<void>) {
+  return mountProbe((options) => useComposerAttachments({
+    ...options, toastApi: { error() {} }, service: idleAttachmentService,
+  }), false, releaseRecoveryAttachments);
+}
 
 function stubFilePicker(): {
   service: ComposerAttachmentService;
@@ -131,12 +178,63 @@ function stubFilePicker(): {
   };
 }
 
+const PNG_MAGIC = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+function fileWithBytes(name: string, type: string, bytes: ArrayLike<number>): File {
+  return new File([Uint8Array.from(bytes)], name, { type });
+}
+
 function textFile(name: string): File {
-  return { name, type: 'text/plain', size: 12 } as unknown as File;
+  // Bytes that match no signature, so content sniffing leaves the declared
+  // text type in place rather than downgrading it.
+  return fileWithBytes(name, 'text/plain', new TextEncoder().encode('plain notes'));
+}
+
+/** A blob whose leading-byte read rejects, exercising the `sniffFileMimeType`
+ * catch: the declared image/PDF type must be downgraded, not reinstated. */
+function unreadableFile(name: string, type: string): File {
+  return {
+    name,
+    type,
+    size: 32,
+    slice: () => ({ arrayBuffer: () => Promise.reject(new Error('slice read failed')) }),
+  } as unknown as File;
+}
+
+/** A blob whose leading-byte read is held open, so a test can switch the active
+ * draft while `fileToPending` is mid-sniff — the window this PR's async made
+ * real. Bytes are PNG so it stages as an image once the read resolves. */
+function deferredImageFile(name: string): { file: File; resolveRead(): void } {
+  let release: () => void = () => {};
+  const arrayBuffer = () =>
+    new Promise<ArrayBuffer>((resolve) => {
+      release = () => resolve(new Uint8Array(PNG_MAGIC).buffer);
+    });
+  const file = {
+    name,
+    type: 'image/png',
+    size: PNG_MAGIC.length,
+    slice: () => ({ arrayBuffer }),
+  } as unknown as File;
+  return { file, resolveRead: () => release() };
+}
+
+function modelChoice(model: string, supportsVision: boolean): ChatModelChoice {
+  return {
+    connectionId: 'connection-test',
+    connectionSlug: 'test',
+    providerType: 'custom',
+    providerLabel: 'Test',
+    model,
+    label: model,
+    isDefault: model === 'text-model',
+    thinkingLevels: [],
+    supportsVision,
+  };
 }
 
 test('a Session keeps its own staged quotes, and the new-task bucket keeps its own', async () => {
-  const probe = await mountProbe(useAppShellComposerQuotes);
+  const probe = await mountProbe(useComposerQuotes);
 
   await probe.render(NEW_TASK_PENDING_KEY);
   await act(() => probe.latest().addQuote({ text: 'quoted for a new task' }));
@@ -149,11 +247,53 @@ test('a Session keeps its own staged quotes, and the new-task bucket keeps its o
     ['quoted for the Session'],
   );
 
+  await act(() => probe.latest().addQuote({
+    text: 'bounded session context',
+    label: 'Session: Research',
+    sourceSessionId: 'source-session',
+    sourceSessionName: 'Research',
+    sourceCapturedAt: 123,
+    sourceTruncated: true,
+  }));
+  assert.deepEqual(probe.latest().pendingQuotes.at(-1), {
+    text: 'bounded session context',
+    label: 'Session: Research',
+    sourceSessionId: 'source-session',
+    sourceSessionName: 'Research',
+    sourceCapturedAt: 123,
+    sourceTruncated: true,
+  });
+
   await probe.render(NEW_TASK_PENDING_KEY);
   assert.deepEqual(
     probe.latest().pendingQuotes.map((quote) => quote.text),
     ['quoted for a new task'],
   );
+});
+
+test('a staged quote carries its note, and editing the note leaves the quote in place', async () => {
+  const probe = await mountProbe(useComposerQuotes);
+  await probe.render('session-1');
+  await act(() => probe.latest().addQuote({ text: 'first excerpt' }));
+  await act(() => probe.latest().addQuote({ text: 'second excerpt', comment: '  why this one  ' }));
+  assert.deepEqual(
+    probe.latest().pendingQuotes.map((quote) => quote.comment),
+    [undefined, 'why this one'],
+  );
+
+  // The note is why the excerpt is staged, so emptying it must not reorder or
+  // drop the excerpt itself.
+  await act(() => probe.latest().updateQuoteComment(1, '   '));
+  assert.equal(probe.latest().pendingQuotes[1]?.comment, undefined);
+  assert.deepEqual(
+    probe.latest().pendingQuotes.map((quote) => quote.text),
+    ['first excerpt', 'second excerpt'],
+  );
+
+  await act(() =>
+    probe.latest().updateQuoteComment(0, 'y'.repeat(QUOTE_COMMENT_MAX_LENGTH + 5)),
+  );
+  assert.equal(probe.latest().pendingQuotes[0]?.comment?.length, QUOTE_COMMENT_MAX_LENGTH);
 });
 
 test('a completing send clears the attachments it submitted', async () => {
@@ -181,6 +321,122 @@ test('a completing send clears the attachments it submitted', async () => {
   assert.equal(probe.latest().pendingAttachments.length, 0);
 });
 
+test('live context follows restore, send cleanup, removal and draft ownership before rendering', async () => {
+  const probe = await mountProbe((options) => useComposerAttachments({
+    ...options, toastApi: { error() {} }, service: idleAttachmentService,
+  }));
+  await probe.render('first');
+  const first = probe.latest();
+  const attachment = {
+    kind: 'other' as const, name: 'old.txt', mimeType: 'text/plain', bytes: 1,
+    ref: { kind: 'workspace_file' as const, relativePath: 'old.txt' },
+  };
+  await act(() => {
+    first.restoreAttachments('first', [attachment]);
+    assert.equal(first.hasPendingContextNow(), true);
+    first.removeAttachment(0);
+    assert.equal(first.hasPendingContextNow(), false);
+    first.restoreMessageContext('first', undefined, {
+      attachments: [attachment], stagedAttachments: [], directoryReferences: [],
+    });
+    assert.equal(first.hasPendingContextNow(), true);
+  });
+  const submitted = probe.latest().pendingAttachments;
+  await probe.render('second');
+  assert.equal(probe.latest().hasPendingContextNow(), false);
+  await act(() => {
+    probe.latest().restoreAttachments('second', [attachment]);
+    first.clearSubmittedContext(submitted);
+    assert.equal(first.hasPendingContextNow(), false);
+    assert.equal(probe.latest().hasPendingContextNow(), true, 'an old send cannot clear the current draft');
+  });
+  const second = probe.latest();
+  await act(() => {
+    second.restoreAttachments('second', [{
+      ...attachment, name: 'new.txt', ref: { kind: 'workspace_file', relativePath: 'new.txt' },
+    }]);
+    second.clearSubmittedAttachments(second.pendingAttachments);
+    assert.equal(second.hasPendingContextNow(), true, 'newer attachments survive submitted-item cleanup');
+    second.clearAllAttachments();
+    assert.equal(second.hasPendingContextNow(), false);
+  });
+  assert.deepEqual(probe.latest().pendingAttachments, []);
+});
+
+test('AppShell composition shows the localized non-vision image notice once per task', async () => {
+  const calls: Array<{ title: string; description?: string }> = [];
+  let nextModel: NewChatModel | undefined = {
+    llmConnectionId: 'connection-test',
+    llmConnectionSlug: 'test',
+    model: 'text-model',
+  };
+  const choices = [modelChoice('text-model', false), modelChoice('vision-model', true)];
+  const probe = await mountProbe((options) =>
+    useComposerAttachments({
+      ...options,
+      toastApi: { error() {} },
+      imageNotice: {
+        notify(title, description) {
+          calls.push({ title, ...(description === undefined ? {} : { description }) });
+        },
+        supportsVision: () => composerModelSupportsVision({
+          active: undefined,
+          next: nextModel,
+          choices,
+        }),
+      },
+      service: idleAttachmentService,
+    }),
+  );
+  const image = fileWithBytes('chart.png', 'image/png', PNG_MAGIC);
+
+  await probe.render('session-en', 'en');
+  await act(() => probe.latest().attachFilePaths([image]));
+  await act(() => probe.latest().attachFilePaths([image]));
+  assert.equal(probe.latest().pendingAttachments.length, 2);
+  const en = getDesktopConversationCopy('en').actions;
+  assert.deepEqual(calls, [{
+    title: en.imageAttachmentNotDirectTitle,
+    description: en.imageAttachmentNotDirectDescription,
+  }]);
+
+  await probe.render('session-zh', 'zh-CN');
+  await act(() => probe.latest().attachFilePaths([image]));
+  const zh = getDesktopConversationCopy('zh-CN').actions;
+  assert.deepEqual(calls[1], {
+    title: zh.imageAttachmentNotDirectTitle,
+    description: zh.imageAttachmentNotDirectDescription,
+  });
+
+  probe.latest().imageNoticeLifecycle.transfer('session-zh', 'session-transferred');
+  await probe.render('session-transferred', 'zh-CN');
+  await act(() => probe.latest().attachFilePaths([image]));
+  assert.equal(calls.length, 2);
+
+  nextModel = undefined;
+  await probe.render('session-no-target');
+  await act(() => probe.latest().attachFilePaths([image]));
+  nextModel = {
+    llmConnectionId: 'connection-test',
+    llmConnectionSlug: 'test',
+    model: 'vision-model',
+  };
+  await probe.render('session-vision');
+  await act(() => probe.latest().attachFilePaths([image]));
+  assert.equal(calls.length, 2);
+
+  nextModel = {
+    llmConnectionId: 'connection-test',
+    llmConnectionSlug: 'test',
+    model: 'text-model',
+  };
+  await probe.render('session-reset');
+  await act(() => probe.latest().attachFilePaths([image]));
+  probe.latest().imageNoticeLifecycle.reset('session-reset');
+  await act(() => probe.latest().attachFilePaths([image]));
+  assert.equal(calls.length, 4);
+});
+
 test('retracted queue attachments can be restored and submitted without re-ingest', async () => {
   const probe = await mountProbe((options) =>
     useComposerAttachments({
@@ -191,8 +447,7 @@ test('retracted queue attachments can be restored and submitted without re-inges
   );
 
   await probe.render('session-1');
-  await act(() =>
-    probe.latest().restoreAttachments('session-1', [
+  const retained = [
       {
         kind: 'other',
         name: 'notes.txt',
@@ -204,11 +459,227 @@ test('retracted queue attachments can be restored and submitted without re-inges
           relativePath: 'attachments/notes.txt',
         },
       },
-    ]),
-  );
+    ] as const;
+  await act(() => probe.latest().restoreAttachments('session-1', retained));
 
   assert.equal(probe.latest().pendingAttachments[0]?.source.type, 'retained');
 });
+
+test('failed-message recovery preserves extension-based kinds without returning file contents', async () => {
+  const probe = await mountProbe((options) => useComposerAttachments({
+    ...options, toastApi: { error() {} }, service: idleAttachmentService,
+  }));
+  const content = new TextEncoder().encode('original attachment');
+  const stagedAttachments = [
+    { name: 'handler.ts', mimeType: 'text/plain', content },
+    { name: 'report.docx', mimeType: 'application/octet-stream', content },
+  ];
+  await probe.render('normal');
+  await act(() => probe.latest().attachFilePaths(stagedAttachments.map(
+    (item) => new File([item.content], item.name, { type: item.mimeType }),
+  )));
+  assert.deepEqual(probe.latest().pendingAttachments.map((item) => item.kind), ['code', 'doc']);
+  await probe.render('recovered');
+  await act(() => probe.latest().restoreMessageContext('recovered', undefined, {
+    attachments: [], stagedAttachments: stagedAttachments.map((item, index) => ({
+      approvalId: `local-recovery:${index}`, name: item.name, mimeType: item.mimeType, size: item.content.byteLength,
+    })), directoryReferences: [],
+  }));
+  assert.deepEqual(probe.latest().pendingAttachments.map((item) => item.kind), ['code', 'doc']);
+  for (const item of probe.latest().pendingAttachments) {
+    assert.equal(item.source.type, 'approval');
+    assert.equal('file' in item.source, false);
+    if (item.source.type === 'approval') assert.match(item.source.approvalId, /^local-recovery:/);
+  }
+});
+
+test('recovery releases follow every draft bucket and same-tick removals, not ordinary approvals', async () => {
+  const released: string[] = [];
+  const probe = await mountRecoveryProbe(async (ids) => { released.push(...ids); });
+  await probe.render('first');
+  const first = probe.latest();
+  await act(() => {
+    first.restoreMessageContext('first', undefined, recoveryContext('local-recovery:shared'));
+    first.restoreMessageContext('second', undefined, recoveryContext('local-recovery:shared', 'local-recovery:second'));
+    assert.equal(first.hasPendingContextNow(), true);
+    first.removeAttachment(0);
+    assert.equal(first.hasPendingContextNow(), false);
+    assert.deepEqual(released, [], 'another draft still owns the shared approval');
+  });
+  await probe.render('second');
+  await act(() => {
+    probe.latest().removeAttachment(0);
+    assert.deepEqual(released, ['local-recovery:shared']);
+  });
+  await act(() => {
+    probe.latest().restoreMessageContext('first', undefined, recoveryContext('ordinary-approval'));
+    probe.latest().restoreAttachments('first', [{
+      kind: 'other', name: 'retained.txt', mimeType: 'text/plain', bytes: 1,
+      ref: { kind: 'workspace_file', relativePath: 'retained.txt' },
+    }]);
+  });
+  await act(() => probe.latest().attachFilePaths([textFile('new.txt')]));
+  await act(() => probe.latest().clearAllAttachments());
+  assert.deepEqual(released, ['local-recovery:shared', 'local-recovery:second']);
+  await probe.unmount();
+  assert.equal(released.length, 2, 'cleared approvals are not released again on unmount');
+});
+
+for (const clearMethod of ['clearSubmittedAttachments', 'clearSubmittedContext'] as const) {
+  // This is a staging-key ownership probe, not permission to send a recovery
+  // token twice: Main independently consumes each recovery approval once.
+  test(`${clearMethod} preserves newer staging of the same source and another draft`, async () => {
+    const released: string[] = [];
+    const probe = await mountRecoveryProbe(async (ids) => { released.push(...ids); });
+    await probe.render('first');
+    await act(() => probe.latest().restoreMessageContext('first', undefined, recoveryContext('local-recovery:same')));
+    const first = probe.latest();
+    const submitted = first.pendingAttachments;
+    const endSend = first.retainAttachments(submitted);
+    await act(() => first.restoreMessageContext('first', undefined, recoveryContext('local-recovery:same')));
+    await probe.render('second');
+    await act(() => probe.latest().restoreMessageContext('second', undefined, recoveryContext('local-recovery:second')));
+    await act(() => {
+      first[clearMethod](submitted);
+      endSend();
+      assert.equal(first.hasPendingContextNow(), true, 'the new staging key survives even with the same source');
+      assert.equal(probe.latest().hasPendingContextNow(), true, 'the active draft is not the submitted draft');
+      assert.deepEqual(released, []);
+    });
+    await probe.render('first');
+    assert.equal(probe.latest().pendingAttachments.length, 1);
+    assert.notEqual(probe.latest().pendingAttachments[0]?.stagingKey, submitted[0]?.stagingKey);
+    await act(() => probe.latest().removeAttachment(0));
+    assert.deepEqual(released, ['local-recovery:same']);
+  });
+}
+
+test('concurrent send holds delay removed recovery approvals until the final send settles', async () => {
+  const released: string[] = [];
+  const probe = await mountRecoveryProbe(async (ids) => { released.push(...ids); });
+  await probe.render('session');
+  await act(() => probe.latest().restoreMessageContext('session', undefined, recoveryContext('local-recovery:sending')));
+  const attachments = probe.latest().pendingAttachments;
+  const firstSendEnds = probe.latest().retainAttachments(attachments);
+  const secondSendEnds = probe.latest().retainAttachments(attachments);
+  await act(() => {
+    probe.latest().removeAttachment(0);
+    assert.equal(probe.latest().hasPendingContextNow(), false);
+    assert.deepEqual(released, []);
+  });
+  firstSendEnds();
+  firstSendEnds();
+  assert.deepEqual(released, [], 'ending a lease twice cannot end another send lease');
+  secondSendEnds();
+  secondSendEnds();
+  assert.deepEqual(released, ['local-recovery:sending']);
+});
+
+test('failed sends retain staged recovery approvals for retry and successful sends release after finally', async () => {
+  const released: string[] = [];
+  const probe = await mountRecoveryProbe(async (ids) => { released.push(...ids); });
+  await probe.render('session');
+  await act(() => probe.latest().restoreMessageContext('session', undefined, recoveryContext('local-recovery:retry')));
+  const attachments = probe.latest().pendingAttachments;
+  const failedSend = async () => {
+    const endSend = probe.latest().retainAttachments(attachments);
+    try {
+      await Promise.reject(new Error('admission failed'));
+    } finally {
+      endSend();
+    }
+  };
+  await assert.rejects(failedSend(), /admission failed/);
+  assert.deepEqual(released, []);
+  assert.equal(probe.latest().hasPendingContextNow(), true);
+  await act(async () => {
+    const endSend = probe.latest().retainAttachments(attachments);
+    try {
+      await Promise.resolve();
+      probe.latest().clearSubmittedContext(attachments);
+      assert.deepEqual(released, [], 'cleanup cannot revoke an in-flight admission');
+    } finally {
+      endSend();
+    }
+  });
+  assert.deepEqual(released, ['local-recovery:retry']);
+});
+
+test('clearing every draft immediately releases unused approvals but defers a held send', async () => {
+  const released: string[] = [];
+  const probe = await mountRecoveryProbe(async (ids) => { released.push(...ids); });
+  await probe.render('session');
+  await act(() => {
+    probe.latest().restoreMessageContext('session', undefined, recoveryContext('local-recovery:sending'));
+    probe.latest().restoreMessageContext('other-draft', undefined, recoveryContext('local-recovery:unused'));
+  });
+  const endSend = probe.latest().retainAttachments(probe.latest().pendingAttachments);
+  await act(() => probe.latest().clearAllAttachments());
+  assert.equal(probe.latest().hasPendingContextNow(), false);
+  assert.deepEqual(released, ['local-recovery:unused']);
+  endSend();
+  assert.deepEqual(released, ['local-recovery:unused', 'local-recovery:sending']);
+});
+
+test('real unmount releases unused approvals but keeps in-flight sends until they settle', async () => {
+  const released: string[] = [];
+  const probe = await mountRecoveryProbe(async (ids) => { released.push(...ids); });
+  await probe.render('session');
+  await act(() => {
+    probe.latest().restoreMessageContext('session', undefined, recoveryContext('local-recovery:sending'));
+    probe.latest().restoreMessageContext('other-draft', undefined, recoveryContext('local-recovery:unused'));
+  });
+  const captured = probe.latest();
+  const endSend = captured.retainAttachments(captured.pendingAttachments);
+  await probe.unmount();
+  assert.deepEqual(released, ['local-recovery:unused']);
+  // A send callback can finish after the composer disappeared. It must not
+  // republish the unmounted draft buckets and reacquire already released tokens.
+  captured.clearSubmittedContext(captured.pendingAttachments);
+  endSend();
+  assert.deepEqual(released, ['local-recovery:unused', 'local-recovery:sending']);
+});
+
+test('StrictMode effect replay preserves recovered approvals until real unmount', async () => {
+  const released: string[] = [];
+  const probe = await mountProbe((options) => {
+    const attachments = useComposerAttachments({
+      ...options, toastApi: { error() {} }, service: idleAttachmentService,
+    });
+    const restored = useRef(false);
+    useEffect(() => {
+      if (restored.current) return;
+      restored.current = true;
+      attachments.restoreMessageContext(options.draftKey, undefined, recoveryContext('local-recovery:strict'));
+    }, [attachments, options.draftKey]);
+    return attachments;
+  }, true, async (ids) => { released.push(...ids); });
+  await probe.render('session');
+  assert.equal(probe.latest().pendingAttachments.length, 1);
+  assert.deepEqual(released, []);
+  await probe.unmount();
+  assert.deepEqual(released, ['local-recovery:strict']);
+});
+
+for (const failure of ['throw', 'reject'] as const) {
+  test(`recovery release ${failure} does not throw or retry through later draft cleanup`, async () => {
+    let calls = 0;
+    const probe = await mountRecoveryProbe((ids) => {
+      assert.deepEqual(ids, ['local-recovery:cleanup']);
+      calls += 1;
+      if (failure === 'throw') throw new Error('release unavailable');
+      return Promise.reject(new Error('release unavailable'));
+    });
+    await probe.render('session');
+    await act(() => probe.latest().restoreMessageContext('session', undefined, recoveryContext('local-recovery:cleanup')));
+    await act(() => {
+      probe.latest().removeAttachment(0);
+      probe.latest().clearAllAttachments();
+    });
+    await probe.unmount();
+    assert.equal(calls, 1);
+  });
+}
 
 test('files chosen in the native dialog land in the composer now on screen', async () => {
   const picker = stubFilePicker();
@@ -236,4 +707,96 @@ test('files chosen in the native dialog land in the composer now on screen', asy
     probe.latest().pendingAttachments.map((item) => item.displayName),
     ['chosen.txt'],
   );
+});
+
+test('files dropped while a session switch is mid-sniff land in the composer now on screen', async () => {
+  const probe = await mountProbe((options) =>
+    useComposerAttachments({
+      ...options,
+      toastApi: { error() {} },
+      service: idleAttachmentService,
+    }),
+  );
+  await probe.render(NEW_TASK_PENDING_KEY);
+
+  // fileToPending reads the leading bytes before staging; that read is async,
+  // so the surface can change before it resolves. The file must land where the
+  // user is looking now, not in the bucket bound before the read started.
+  const dropped = deferredImageFile('photo.png');
+  const attaching = probe.latest().attachFilePaths([dropped.file]);
+  await probe.render('session-1');
+  await act(async () => {
+    dropped.resolveRead();
+    await attaching;
+  });
+
+  assert.deepEqual(
+    probe.latest().pendingAttachments.map((item) => item.displayName),
+    ['photo.png'],
+  );
+});
+
+test('dropped files stage by content: a real image named .pdf notices, a disguised .png does not', async () => {
+  const calls: Array<{ title: string }> = [];
+  const probe = await mountProbe((options) =>
+    useComposerAttachments({
+      ...options,
+      toastApi: { error() {} },
+      imageNotice: {
+        notify(title) {
+          calls.push({ title });
+        },
+        // No selected target that supports vision, so a staged image notices.
+        supportsVision: () => false,
+      },
+      service: idleAttachmentService,
+    }),
+  );
+  await probe.render('session-1');
+
+  // A real image behind a `.pdf` name stages as an image — thumbnail path and
+  // the non-vision notice both key off the sniffed kind, not the extension.
+  await act(() =>
+    probe.latest().attachFilePaths([fileWithBytes('report.pdf', 'application/pdf', PNG_MAGIC)]),
+  );
+  assert.equal(probe.latest().pendingAttachments.at(-1)?.kind, 'image');
+  assert.equal(calls.length, 1);
+
+  // A non-image behind a `.png` name and an `image/png` claim does neither: the
+  // unverified claim is downgraded rather than trusted.
+  await act(() =>
+    probe.latest().attachFilePaths([
+      fileWithBytes('photo.png', 'image/png', new TextEncoder().encode('not an image')),
+    ]),
+  );
+  assert.equal(probe.latest().pendingAttachments.at(-1)?.kind, 'other');
+  assert.equal(calls.length, 1);
+});
+
+test('a failed leading-byte read downgrades the declared image claim rather than trusting it', async () => {
+  const calls: Array<{ title: string }> = [];
+  const probe = await mountProbe((options) =>
+    useComposerAttachments({
+      ...options,
+      toastApi: { error() {} },
+      imageNotice: {
+        notify(title) {
+          calls.push({ title });
+        },
+        supportsVision: () => false,
+      },
+      service: idleAttachmentService,
+    }),
+  );
+  await probe.render('session-1');
+
+  // `slice().arrayBuffer()` rejects: the catch must route an empty prefix
+  // through the downgrade, so an `image/png` claim it could not verify stages
+  // as an ordinary file and never fires the vision notice.
+  await act(() =>
+    probe.latest().attachFilePaths([unreadableFile('screenshot.png', 'image/png')]),
+  );
+  assert.equal(probe.latest().pendingAttachments.at(-1)?.kind, 'other');
+  assert.equal(probe.latest().pendingAttachments.at(-1)?.mimeType, 'application/octet-stream');
+  assert.equal(calls.length, 0);
 });

@@ -21,6 +21,7 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { access, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
+import { createServer as createHttpServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
@@ -29,6 +30,7 @@ import { bumpedAutoupdateVersion } from './desktop-update-contract.mjs';
 import { validateWindowsUpgradeBaseline } from './prepare-windows-upgrade-baseline.mjs';
 import {
   diffTreeManifests,
+  findRendererTarget,
   directoryTreeManifest,
   rendererLayoutMatchesViewport,
   rendererViewportMatchesNativeClient,
@@ -45,6 +47,7 @@ import {
 import {
   deleteUninstallRegistrationForInstall,
   readUninstallDisplayVersionsForInstall,
+  verifyRegistryMismatchRecoveryEvidence,
   verifyRestoredWindowsInstallation,
 } from './verify-windows-installer-rollback.mjs';
 import {
@@ -325,6 +328,22 @@ it('reuses the packaged renderer smoke without widening rollback verification', 
   ]);
 });
 
+it('accepts recoverable exit 103 evidence when no failed-upgrade aside was created', async () => {
+  const root = await makeTree({
+    'installed/Maka.exe': 'new version',
+    'installed.pre-upgrade-backup/.maka-backup-complete': 'version=1.2.3',
+    'installed.pre-upgrade-backup/RECOVERY-README.txt': 'rerun the installer',
+  });
+  const installDirectory = join(root, 'installed');
+  const backupDirectory = `${installDirectory}.pre-upgrade-backup`;
+
+  await verifyRegistryMismatchRecoveryEvidence(installDirectory, backupDirectory, '1.2.4', {
+    run: async () => ({ stdout: '1.2.4.0', stderr: '' }),
+  });
+
+  await assert.rejects(access(`${installDirectory}.failed-upgrade`), { code: 'ENOENT' });
+});
+
 async function makeTree(shape) {
   const root = await mkdtemp(join(tmpdir(), 'maka-harness-test-'));
   temporaryRoots.push(root);
@@ -491,6 +510,50 @@ describe('waitForDevToolsPort', () => {
     child.exitCode = 1;
     child.emit('exit');
     await assert.rejects(() => wait, /exited before announcing/);
+  });
+});
+
+describe('findRendererTarget', () => {
+  it('waits past startup, blank and dialog targets for the packaged main entry', async () => {
+    const startupTargets = [
+      {
+        type: 'page',
+        url: 'data:text/html,<title>Maka</title>',
+        webSocketDebuggerUrl: 'ws://startup',
+      },
+      { type: 'page', url: 'about:blank', webSocketDebuggerUrl: 'ws://blank' },
+      {
+        type: 'page',
+        url: 'https://example.test/dist-renderer/index.html',
+        webSocketDebuggerUrl: 'ws://web',
+      },
+    ];
+    const main = {
+      type: 'page',
+      url: 'file:///C:/Program%20Files/Maka/resources/app.asar/dist-renderer/index.html',
+      webSocketDebuggerUrl: 'ws://main',
+    };
+    let requests = 0;
+    const server = createHttpServer((_request, response) => {
+      response.setHeader('Content-Type', 'application/json');
+      response.end(JSON.stringify(++requests === 1 ? startupTargets : [...startupTargets, main]));
+    });
+    await new Promise((resolvePromise) => server.listen(0, '127.0.0.1', resolvePromise));
+    try {
+      assert.deepEqual(
+        await findRendererTarget(
+          server.address().port,
+          { exitCode: null },
+          {
+            timeoutMs: 2_000,
+          },
+        ),
+        main,
+      );
+    } finally {
+      server.closeAllConnections();
+      await new Promise((resolvePromise) => server.close(resolvePromise));
+    }
   });
 });
 

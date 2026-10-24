@@ -17,6 +17,14 @@
  * under the License.
  */
 
+/* `.agents-parchment-paper-surface` is reused by the composer body. The bare
+   class drops its border; Astryx ChatComposer owns composer chrome. */
+.agents-parchment-paper-surface {
+  border: 0;
+  background-color: var(--agents-content-area-bg);
+  box-shadow: none;
+}
+
 /* Turn-scoped interactions take over the composer's in-flow slot so the
    conversation and any live browser remain visible while Maka waits. */
 .maka-composer-interaction-slot {
@@ -102,6 +110,11 @@
   container-type: inline-size;
 }
 
+.maka-question-body {
+  display: grid;
+  gap: var(--space-1-5);
+}
+
 .maka-question-progress {
   font: var(--maka-text-supporting);
   flex: 0 0 auto;
@@ -110,23 +123,69 @@
   white-space: nowrap;
 }
 
-.maka-question-options {
+.maka-form-interaction-header p,
+.maka-form-interaction-field p {
+  margin: 0;
+}
+
+.maka-form-interaction-header p {
+  font: var(--maka-text-supporting);
+  color: var(--text-secondary);
+}
+
+.maka-form-interaction-fields {
   display: grid;
-  gap: var(--space-1-5);
+  gap: var(--space-2);
+  max-height: min(420px, 50vh);
+  padding-right: var(--space-1);
+  overflow-y: auto;
 }
 
-.maka-question-other-answer {
-  width: 100%;
-  min-width: 0;
-}
-
-.maka-interaction-actions.maka-question-actions {
+.maka-form-interaction-field {
   display: grid;
-  grid-template-columns: auto auto minmax(0, 1fr) auto;
+  gap: var(--space-1);
+  padding: var(--space-2);
+  border: var(--border-width-hairline) solid var(--border);
+  border-radius: var(--radius-control);
 }
 
-.maka-question-submit {
-  grid-column: 4;
+.maka-form-interaction-field-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-2);
+  color: var(--text-primary);
+}
+
+.maka-form-interaction-field-heading > :first-child {
+  font: var(--maka-text-body-medium);
+}
+
+.maka-form-interaction-field-heading > :last-child,
+.maka-form-interaction-field-description {
+  font: var(--maka-text-supporting);
+  color: var(--text-secondary);
+}
+
+.maka-form-interaction-checkboxes {
+  display: grid;
+  gap: var(--space-1);
+}
+
+.maka-form-interaction-error {
+  font: var(--maka-text-supporting);
+  color: var(--destructive-text);
+}
+
+.maka-form-interaction-actions,
+.maka-form-interaction-primary-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.maka-form-interaction-actions {
+  justify-content: space-between;
 }
 
 .maka-interaction-header {
@@ -163,16 +222,12 @@
     flex-direction: column;
   }
 
-  .maka-interaction-actions.maka-question-actions {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    flex-direction: initial;
-  }
-
-  .maka-question-actions > button {
+  .maka-form-interaction-actions,
+  .maka-form-interaction-primary-actions {
     width: 100%;
   }
 
-  .maka-question-submit {
-    grid-column: auto;
+  .maka-form-interaction-primary-actions {
+    justify-content: flex-end;
   }
 }

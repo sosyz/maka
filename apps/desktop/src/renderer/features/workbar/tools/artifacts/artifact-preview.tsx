@@ -36,12 +36,12 @@
  *               fallback `<p>` instructing the user to open in Finder when
  *               the embed plugin is unavailable.
  *
- * Failure modes come back as a small `FailureCard` so the user
- * always sees a Chinese-language explanation of *why* the preview is empty
- * instead of a blank surface:
+ * Failure modes come back as a `Banner` so the user always sees a
+ * Chinese-language explanation of *why* the preview is empty instead of a
+ * blank surface. The reason maps straight onto Banner's own status:
  *
- *   - `not_found` / `read_failed` → destructive ("路径可能已被外部删除")
- *   - `not_allowed`               → destructive ("路径检查未通过")
+ *   - `not_found` / `read_failed` → error ("路径可能已被外部删除")
+ *   - `not_allowed`               → error ("路径检查未通过")
  *   - `too_large`                 → info, includes byte count + Finder hint
  *   - `deleted`                   → info ("此 artifact 已删除")
  *   - `unsupported_mime`          → info, binary only
@@ -66,8 +66,8 @@ import {
 import { Banner } from '@astryxdesign/core/Banner';
 import { CodeBlock } from '@astryxdesign/core/CodeBlock';
 import { Spinner } from '@astryxdesign/core/Spinner';
-import { RegistryArtifactPreview } from './artifact-preview-registry-shell';
-import { getArtifactCopy, type ArtifactCopy } from '../../../../locales/artifact-copy';
+import { RegistryArtifactPreview } from './artifact-preview-registry-shell.js';
+import { getArtifactCopy, type ArtifactCopy } from '../../../../locales/artifact-copy.js';
 import { useWorkbarServices } from '../../services-context.js';
 
 export function ArtifactPreview(props: { record: ArtifactDescriptor; onShowInFolder?: () => void }) {
@@ -75,11 +75,12 @@ export function ArtifactPreview(props: { record: ArtifactDescriptor; onShowInFol
   const copy = getArtifactCopy(useUiLocale());
   switch (record.kind) {
     case 'file':
+      if (isUnsupportedOfficeFile(record)) return <OfficeFileFallback copy={copy} onShowInFolder={onShowInFolder} />;
       return <FilePreview record={record} copy={copy} />;
     case 'diff':
       return <DiffPreview record={record} copy={copy} />;
     case 'html':
-      return <HtmlPreview record={record} copy={copy} />;
+      return <HtmlPreview record={record} copy={copy} onShowInFolder={onShowInFolder} />;
     case 'image':
       // PR-UI-RENDER-3a: route image previews through the typed
       // registry shell so the resolution path (mime match / ext
@@ -93,6 +94,19 @@ export function ArtifactPreview(props: { record: ArtifactDescriptor; onShowInFol
   }
 }
 
+export function isUnsupportedOfficeFile(record: Pick<ArtifactDescriptor, 'kind' | 'name'>): boolean {
+  return record.kind === 'file' && /\.(?:docx|xlsx|pptx)$/i.test(record.name);
+}
+
+function OfficeFileFallback(props: { copy: ArtifactCopy; onShowInFolder?: () => void }) {
+  return <div className="maka-artifact-preview-failure">
+    <Banner status="info" role="status" title={props.copy.preview.officeUnsupported.title}
+      description={props.copy.preview.officeUnsupported.description} />
+    {props.onShowInFolder && <Button variant="secondary" size="sm"
+      label={props.copy.pane.openInFinder} onClick={props.onShowInFolder} />}
+  </div>;
+}
+
 // ---- text-backed previews --------------------------------------------------
 
 const TEXT_DISPLAY_LIMIT_BYTES = 256 * 1024;
@@ -104,11 +118,7 @@ function FilePreview(props: { record: ArtifactDescriptor; copy: ArtifactCopy }) 
   const result = useTextRead(props.record.sessionId, props.record.id);
   if (result.state === 'loading') return <PreviewLoading label={props.copy.preview.loadingFile} />;
   if (!result.value.ok) return <TextFailureCard record={props.record} reason={result.value.reason} copy={props.copy} />;
-  const text =
-    props.record.source === 'tool_result_archive' && result.value.text.length <= TEXT_DISPLAY_LIMIT_BYTES
-      ? prettyArchiveJson(result.value.text)
-      : result.value.text;
-  return <TextFilePreview name={props.record.name} text={text} copy={props.copy} />;
+  return <TextFilePreview name={props.record.name} text={result.value.text} copy={props.copy} />;
 }
 
 function TextFilePreview(props: { name: string; text: string; copy: ArtifactCopy }) {
@@ -156,14 +166,6 @@ function TextFilePreview(props: { name: string; text: string; copy: ArtifactCopy
   );
 }
 
-function prettyArchiveJson(text: string): string {
-  try {
-    return JSON.stringify(JSON.parse(text), null, 2);
-  } catch {
-    return text;
-  }
-}
-
 function DiffPreview(props: { record: ArtifactDescriptor; copy: ArtifactCopy }) {
   const result = useTextRead(props.record.sessionId, props.record.id);
   if (result.state === 'loading') return <PreviewLoading label={props.copy.preview.loadingDiff} />;
@@ -188,10 +190,10 @@ function DiffPreview(props: { record: ArtifactDescriptor; copy: ArtifactCopy }) 
   );
 }
 
-function HtmlPreview(props: { record: ArtifactDescriptor; copy: ArtifactCopy }) {
+function HtmlPreview(props: { record: ArtifactDescriptor; copy: ArtifactCopy; onShowInFolder?: () => void }) {
   const result = useTextRead(props.record.sessionId, props.record.id);
   if (result.state === 'loading') return <PreviewLoading label={props.copy.preview.loadingHtml} />;
-  if (!result.value.ok) return <TextFailureCard record={props.record} reason={result.value.reason} copy={props.copy} />;
+  if (!result.value.ok) return <TextFailureCard record={props.record} reason={result.value.reason} copy={props.copy} onShowInFolder={props.onShowInFolder} />;
   const bounded = boundPreviewText(result.value.text);
   if (bounded.isDisplayTruncated) {
     return (
@@ -347,31 +349,23 @@ function PreviewLoading(props: { label: string }) {
   );
 }
 
-function TextFailureCard(props: { record: ArtifactDescriptor; reason: TextFailureReason; copy: ArtifactCopy }) {
-  const { tone, title, description } = failureCopyText(props.record, props.reason, props.copy);
-  return <FailureCard tone={tone} title={title} description={description} />;
+function TextFailureCard(props: { record: ArtifactDescriptor; reason: TextFailureReason; copy: ArtifactCopy; onShowInFolder?: () => void }) {
+  const { status, title, description } = failureCopyText(props.record, props.reason, props.copy);
+  return (
+    <div className="maka-artifact-preview-failure">
+      <Banner status={status} role="status" title={title} description={description} />
+      {props.onShowInFolder ? (
+        <Button variant="secondary" size="sm" label={props.copy.pane.openInFinder} onClick={props.onShowInFolder}>
+          {props.copy.pane.openInFinder}
+        </Button>
+      ) : null}
+    </div>
+  );
 }
 
 function BinaryFailureCard(props: { record: ArtifactDescriptor; reason: BinaryFailureReason; copy: ArtifactCopy }) {
-  const { tone, title, description } = failureCopyBinary(props.record, props.reason, props.copy);
-  return <FailureCard tone={tone} title={title} description={description} />;
-}
-
-function FailureCard(props: {
-  tone: 'destructive' | 'info';
-  title: string;
-  description: string;
-}) {
-  return (
-    <Banner
-      className="maka-artifact-preview-fail"
-      data-tone={props.tone}
-      status={props.tone === 'destructive' ? 'error' : 'info'}
-      role="status"
-      title={props.title}
-      description={props.description}
-    />
-  );
+  const { status, title, description } = failureCopyBinary(props.record, props.reason, props.copy);
+  return <Banner status={status} role="status" title={title} description={description} />;
 }
 
 // ---- failure-reason → copy -------------------------------------------------
@@ -380,7 +374,8 @@ type TextFailureReason = Extract<ArtifactTextReadResult, { ok: false }>['reason'
 type BinaryFailureReason = Extract<ArtifactBinaryReadResult, { ok: false }>['reason'];
 
 interface FailureCopy {
-  tone: 'destructive' | 'info';
+  /** Banner's own status vocabulary — no second name for the same two values. */
+  status: 'error' | 'info';
   title: string;
   description: string;
 }
@@ -390,23 +385,18 @@ function failureCopyText(record: ArtifactDescriptor, reason: TextFailureReason, 
     case 'not_found':
     case 'read_failed':
       return {
-        tone: 'destructive',
+        status: 'error',
         ...copy.preview.readFailed,
       };
     case 'not_allowed':
       return {
-        tone: 'destructive',
+        status: 'error',
         ...copy.preview.notAllowed,
       };
     case 'too_large':
       return {
-        tone: 'info',
+        status: 'info',
         ...copy.preview.tooLarge(record.sizeBytes),
-      };
-    case 'deleted':
-      return {
-        tone: 'info',
-        ...copy.preview.deleted,
       };
   }
 }
@@ -414,7 +404,7 @@ function failureCopyText(record: ArtifactDescriptor, reason: TextFailureReason, 
 function failureCopyBinary(record: ArtifactDescriptor, reason: BinaryFailureReason, copy: ArtifactCopy): FailureCopy {
   if (reason === 'unsupported_mime') {
     return {
-      tone: 'info',
+      status: 'info',
       ...copy.preview.unsupportedMime,
     };
   }
@@ -444,7 +434,7 @@ function useTextRead(
       .catch((error: unknown) => {
         if (disposed) return;
         // Map Desktop transport failures (bridge throw, channel closed) onto the
-        // contract enum so the FailureCard can render a consistent message
+        // contract enum so the failure Banner can render a consistent message
         // instead of leaking an Electron error string to the user.
         const message = error instanceof Error ? error.message : String(error);
         const reason: TextFailureReason = message.includes('not_allowed')

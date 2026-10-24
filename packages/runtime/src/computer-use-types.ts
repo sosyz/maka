@@ -23,6 +23,8 @@ import type {
   ComputerUseEffect,
   ComputerUseErrorCode,
   ComputerUsePageIdentity,
+  ComputerUseSelectedText,
+  ComputerUseRect,
   CuAction,
   CuPoint,
 } from '@maka/core/computer-use';
@@ -68,8 +70,6 @@ export type CuDispatchOutcome =
 
 export interface CuRunResult {
   outcome: CuDispatchOutcome;
-  /** Final logical screen point resolved by the backend for pointer actions. */
-  resolvedScreenPoint?: CuPoint;
   /** Present for `screenshot`, and (by convention) after a mutating action so
    *  the model can SEE the result — the authoritative verification (S17). */
   screenshot?: CuScreenshot;
@@ -236,6 +236,14 @@ export interface CuObservation {
    * route. This says the list is a prefix, not an inventory.
    */
   truncated?: boolean;
+  /**
+   * Text currently selected in the target window, from the executor snapshot.
+   *
+   * `select_text` names a range; this is the only account of what came out of
+   * it. Absent when the executor reported none. Model rendering must truncate
+   * and must not persist this into the call record.
+   */
+  selectedText?: ComputerUseSelectedText;
   elements: CuObservedElement[];
   screenshot?: CuScreenshot;
 }
@@ -354,16 +362,29 @@ export interface CuOverlayHookContext {
    * the cursor rests at a fixed level instead.
    */
   targetWindowId?: number;
+  /**
+   * Screen rectangles stacked above the target window, from the last
+   * observation. Presentation-only: the cursor checks the point it is about
+   * to draw at, since a control near the top edge can be visible while the
+   * middle of the window is buried. Absent or empty means no evidence of
+   * cover, so a window-bound cursor may sink.
+   */
+  obscuringRects?: ComputerUseRect[];
 }
 
 export interface CuOverlayHook {
-  onActionBegin(action: CuAction, context: CuOverlayHookContext): CuPresentationFence | void;
+  onActionBegin(
+    action: CuPresentationAction,
+    context: CuOverlayHookContext,
+  ): CuPresentationFence | void;
   onActionEnd?(
-    action: CuAction,
+    action: CuPresentationAction,
     result: CuRunResult | undefined,
     context: CuOverlayHookContext,
   ): void | Promise<void>;
 }
+
+export type CuPresentationAction = { type: CuSemanticAction['type'] } | CuAction;
 
 /**
  * The host dispatch seam. Implemented in @maka/computer-use by the maka-cu

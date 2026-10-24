@@ -129,8 +129,6 @@ export function buildSubmitPlanTool(
         isPlanProposalLifecycleAdmissible,
         'Plan proposal cannot fit its execution lifecycle projection',
       ),
-    recoveryMode: 'idempotent',
-    nesting: 'direct_only',
     impl: async (input, context) => {
       const result = await planStore.submitProposal({
         operationId: planToolOperationId('submit', context),
@@ -169,8 +167,6 @@ export function buildUpdatePlanTool(
       steps: z.array(executionStepSchema).min(1).max(PLAN_MAX_STEPS),
       explanation: boundedTextSchema('Plan progress explanation').optional(),
     }),
-    recoveryMode: 'idempotent',
-    nesting: 'direct_only',
     impl: async (input, context) => {
       const result = await planStore.updateExecution({
         operationId: planToolOperationId('update', context),
@@ -194,8 +190,6 @@ export function buildCancelPlanTool(
     parameters: z.object({
       reason: boundedTextSchema('Plan cancellation reason', PLAN_LIFECYCLE_REASON_MAX_BYTES),
     }),
-    recoveryMode: 'idempotent',
-    nesting: 'direct_only',
     impl: async ({ reason }, context) => {
       const result = await planStore.cancelExecution({
         operationId: planToolOperationId('cancel', context),

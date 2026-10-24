@@ -17,21 +17,24 @@
  * under the License.
  */
 
-import { resolveSystemUiLocale } from '@maka/core/ui-locale';
+import { resolveSystemUiLocale, defineShippedUiMessageCatalog, resolveUiMessageCatalog } from '@maka/core/ui-locale';
 import {
   DEV_LOSER_EXIT_CODE,
   developmentLaunchResultFile,
   shouldShowLoserDialog,
 } from '@maka/core/dev-single-instance';
-import { app, clipboard, dialog, ipcMain } from 'electron';
+import { app, clipboard, dialog, ipcMain, protocol } from 'electron';
 import { join } from 'node:path';
+import { bootContext } from './boot-context.js';
 import { resolveBuildInfo } from './build-info.js';
 import { resolveUpdateTestUserDataDirectory } from './app-update-test-context.js';
+import { desktopDiagnosticUpdateChannel } from './app-update-attestation.js';
 import {
   captureDesktopDiagnosticEnvironment,
   copyDesktopDiagnosticReport,
   createDesktopPreviousMainProcessDiagnosticInput,
   installMainProcessLogCapture,
+  formatDesktopDiagnosticReport,
   mainProcessLogBuffer,
 } from './main-process-diagnostics.js';
 import {
@@ -40,9 +43,17 @@ import {
   type MainProcessRecoveryJournal,
 } from './main-process-recovery-journal.js';
 import { showFatalStartupError } from './native-diagnostic-dialog.js';
-import { isIsolatedE2e } from './startup-context.js';
+import { isIsolatedE2e, revealMode } from './startup-context.js';
 import { reportDevelopmentLaunchResult } from './dev-single-instance-result.js';
 import { registerPreviousMainProcessDiagnosticsIpc } from './desktop-diagnostics-ipc-main.js';
+import { showBrowserMessageBox } from './browser-message-box.js';
+import { installDesktopStartupBranding } from './desktop-shell-presentation.js';
+import {
+  clientPluginTransport,
+  MAKA_CLIENT_PLUGIN_SCHEME,
+  MAKA_CLIENT_PLUGIN_SCHEME_PRIVILEGES,
+  registerClientPluginProtocol,
+} from './client-plugin-transport.js';
 
 let recoveryJournal: MainProcessRecoveryJournal | undefined;
 installMainProcessLogCapture(mainProcessLogBuffer, () => recoveryJournal?.markDirty());
@@ -56,6 +67,19 @@ installMainProcessLogCapture(mainProcessLogBuffer, () => recoveryJournal?.markDi
 // socket/pipe namespace, and single-instance lock) without touching any
 // path logic. See https://github.com/maka-agent/maka-agent/issues/2252.
 app.setName(app.isPackaged ? 'Maka' : 'Maka Dev');
+
+protocol.registerSchemesAsPrivileged([
+  {
+    scheme: MAKA_CLIENT_PLUGIN_SCHEME,
+    privileges: MAKA_CLIENT_PLUGIN_SCHEME_PRIVILEGES,
+  },
+]);
+
+// Electron otherwise quits implicitly when the last BrowserWindow closes.
+// Startup and fatal-recovery surfaces can be the only window, so keep process
+// lifetime explicit; runtime-host-boot installs the normal platform policy
+// after startup, and every early terminal path calls app.exit itself.
+app.on('window-all-closed', () => {});
 
 const updateTestUserData = resolveUpdateTestUserDataDirectory({
   feedUrl: process.env.MAKA_UPDATE_TEST_FEED,
@@ -76,9 +100,9 @@ if (isIsolatedE2e && process.env.MAKA_E2E_USER_DATA_DIR) {
 }
 
 // Electron does not enforce single-instance by default. Must run before any
-// workspace/store setup below -- a losing second process exits immediately,
-// before touching shared state. See the 'second-instance' listener in
-// runtime-host-boot.ts for what the surviving process does about it.
+// workspace/store setup below -- a losing second process never touches shared
+// state. See the 'second-instance' listener in runtime-host-boot.ts for what
+// the surviving process does about it.
 if (!app.requestSingleInstanceLock()) {
   if (!app.isPackaged) {
     // Dev: losing the lock must NOT pretend to have started (exit 0 would be
@@ -87,18 +111,42 @@ if (!app.requestSingleInstanceLock()) {
     // one-shot result file. A direct launcher explicitly promises to consume
     // the exit code; a TCC launcher proves it has a consumer only when the
     // result write succeeds. Any other entry (Dock, Spotlight, Quit & Reopen)
-    // gets a native box — fail toward the dialog. Linux pre-ready showErrorBox
-    // degrades to stderr (no GUI); documented in electron.d.ts. Packaged builds
-    // keep the existing UX (double-click focuses the first window) — the gate
-    // is a semantic boundary.
+    // waits for ready and gets the same product-styled temporary window as
+    // startup recovery. Packaged builds keep the existing UX (double-click
+    // focuses the first window) — the gate is a semantic boundary.
     const resultReported = reportDevelopmentLaunchResult(process.argv, { status: 'loser' });
     if (!resultReported && shouldShowLoserDialog(process.argv)) {
-      dialog.showErrorBox(
-        'Maka Dev',
-        `Another instance holds the Maka Dev profile (${app.getPath('userData')}). Quit it and retry.`,
-      );
-    }
-    app.exit(DEV_LOSER_EXIT_CODE);
+      const profilePath = app.getPath('userData');
+      void app
+        .whenReady()
+        .then(() => {
+          const locale = resolveSystemUiLocale(app.getPreferredSystemLanguages());
+          const copy = DEV_SINGLETON_COPY[locale];
+          return showBrowserMessageBox(
+            {
+              type: 'warning',
+              title: copy.title,
+              message: copy.message,
+              detail: copy.detail(profilePath),
+              buttons: [copy.exit],
+              defaultId: 0,
+              cancelId: 0,
+            },
+            undefined,
+            { locale, revealMode },
+          );
+        })
+        .catch((error) => {
+          console.error('[dev] styled single-instance dialog failed:', error);
+          dialog.showErrorBox(
+            'Maka Dev',
+            `Another instance holds the Maka Dev profile (${profilePath}). Quit it and retry.`,
+          );
+        })
+        .finally(() => {
+          app.exit(DEV_LOSER_EXIT_CODE);
+        });
+    } else app.exit(DEV_LOSER_EXIT_CODE);
   } else {
     app.exit(0);
   }
@@ -141,6 +189,10 @@ if (!app.requestSingleInstanceLock()) {
       captureDesktopDiagnosticEnvironment({
         appVersion: app.getVersion(),
         buildMode: buildInfo.mode,
+        updateChannel: desktopDiagnosticUpdateChannel({
+          isPackaged: app.isPackaged,
+          appPath: app.getAppPath(),
+        }),
         buildCommit: buildInfo.commit,
         locale: app.getLocale(),
         workspacePath: join(app.getPath('userData'), 'workspaces', 'default'),
@@ -159,30 +211,58 @@ if (!app.requestSingleInstanceLock()) {
   // store/db write".
   app
     .whenReady()
-    .then(() => {
+    .then(async () => {
       console.log('[startup] app ready');
-      return import('./runtime-host-boot.js');
+      installDesktopStartupBranding(revealMode);
+      // Register before constructing the main BrowserWindow. Client Plugin
+      // scripts are requested by the first renderer paint, while the much
+      // heavier Runtime Host module graph is deliberately loaded afterwards.
+      await registerClientPluginProtocol(protocol, clientPluginTransport);
+      // early-window holds the light slice (storage root, settings, window
+      // controller) and fires the renderer load; the heavy Runtime Host
+      // module graph starts only once the window exists — evaluating ~1100
+      // files on the shared main thread would otherwise starve the window's
+      // async prelude and Chromium plumbing.
+      const earlyWindow = await import('./early-window.js');
+      await earlyWindow.firstWindowConstructed;
+      const boot = await import('./runtime-host-boot.js');
+      // Wait until the boot module has synchronously registered every handler
+      // used by the renderer's gated IPC.  Runtime Host reconciliation stays
+      // asynchronous so a slow or unavailable Host cannot block first paint.
+      await boot.runtimeHostBootReady;
+      bootContext.markIpcReady();
+      return boot;
     })
     .catch(async (error: unknown) => {
       console.error('[startup] fatal:', error);
+      bootContext.failIpcReady(error);
       try {
         // E2E runs must not hang on a modal error box (same reasoning as the
         // fixture-fatal path in runtime-host-boot.ts: print a parseable line and exit fast).
         if (!isIsolatedE2e) {
           const buildInfo = resolveBuildInfo(app.isPackaged, app.getAppPath());
+          const locale = resolveSystemUiLocale(app.getPreferredSystemLanguages());
           await showFatalStartupError(error, {
-            locale: resolveSystemUiLocale(app.getPreferredSystemLanguages()),
+            locale,
             environment: () =>
               captureDesktopDiagnosticEnvironment({
                 appVersion: app.getVersion(),
                 buildMode: buildInfo.mode,
+                updateChannel: desktopDiagnosticUpdateChannel({
+                  isPackaged: app.isPackaged,
+                  appPath: app.getAppPath(),
+                }),
                 buildCommit: buildInfo.commit,
                 locale: app.getLocale(),
                 workspacePath: join(app.getPath('userData'), 'workspaces', 'default'),
               }),
             mainLogs: () => mainProcessLogBuffer.snapshot(),
             writeClipboard: (report) => clipboard.writeText(report),
-            showMessageBox: (options) => dialog.showMessageBox(options),
+            showMessageBox: (options) =>
+              showBrowserMessageBox(options, undefined, {
+                locale,
+                revealMode,
+              }),
           });
         }
       } finally {
@@ -191,3 +271,29 @@ if (!app.requestSingleInstanceLock()) {
       }
     });
 }
+
+const DEV_SINGLETON_COPY = resolveUiMessageCatalog(defineShippedUiMessageCatalog<{
+  title: string;
+  message: string;
+  detail(profilePath: string): string;
+  exit: string;
+}>()({
+  'zh-CN': {
+    title: 'Maka Dev 已在运行',
+    message: '另一个 Maka Dev 实例正在使用此开发配置。',
+    detail: (profilePath: string) => `开发配置：${profilePath}\n\n请先退出正在运行的实例，然后重试。`,
+    exit: '退出',
+  },
+  'zh-TW': {
+    title: 'Maka Dev 已在執行',
+    message: '另一個 Maka Dev 執行個體正在使用此開發設定。',
+    detail: (profilePath: string) => `開發設定：${profilePath}\n\n請先退出正在執行的執行個體，然後重試。`,
+    exit: '退出',
+  },
+  en: {
+    title: 'Maka Dev is already running',
+    message: 'Another Maka Dev instance is using this development profile.',
+    detail: (profilePath: string) => `Development profile: ${profilePath}\n\nQuit the running instance, then retry.`,
+    exit: 'Exit',
+  },
+}));

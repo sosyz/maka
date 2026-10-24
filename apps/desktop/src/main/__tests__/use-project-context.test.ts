@@ -17,6 +17,7 @@
  * under the License.
  */
 
+import { deferred } from '@maka/core/test-only/async-primitives';
 import assert from 'node:assert/strict';
 import { mkdir, mkdtemp } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
@@ -37,15 +38,6 @@ const NO_PROJECT_CAPABILITIES = {
   setLocalDefault: false,
   viewClientPath: false,
 } as const;
-
-function deferred<T>() {
-  let resolve!: (value: T) => void;
-  const promise = new Promise<T>((settle) => {
-    resolve = settle;
-  });
-  return { promise, resolve };
-}
-
 test('discards a pending Project projection after the default Host changes', async () => {
   const projectContext = await importProjectContext();
   const { root } = installReactRenderer();
@@ -78,25 +70,29 @@ test('discards a pending Project projection after the default Host changes', asy
         return pendingContext.promise;
       },
       subscribeChanges: () => () => {},
-      getLocalSnapshot: async () => ({
-        projects: [],
-        capabilities: NO_PROJECT_CAPABILITIES,
-      }),
-      subscribeLocalChanges: () => () => {},
     },
   };
-  let projects: ProjectRecord[] = [];
-  let selectedProjectId: string | null | undefined;
+  let projectInfo: unknown;
+  let currentProjectId: string | null | undefined;
 
   function Probe() {
     const context = projectContext.useAppShellProjectContext({
-      uiLocale: 'en',
       rendererMountedRef: { current: true },
-      onProjectSelected: () => {},
-      toastApi: { success: () => {}, error: () => {} },
+      titlebar: {
+        sharedSessionActive: false,
+        activeSession: undefined,
+        sharedSessionDialog: {
+          shareActionLabel: 'Share',
+          openSession: () => {},
+        } as never,
+        moveToDedicatedDirectory: async () => undefined,
+        openProjectFolder: () => {},
+        copy: {} as never,
+        toastApi: { toast: () => '' } as never,
+      },
     });
-    projects = context.projects;
-    selectedProjectId = context.selectedProjectId;
+    projectInfo = context.projectInfo;
+    currentProjectId = context.currentProjectId;
     return null;
   }
 
@@ -121,8 +117,8 @@ test('discards a pending Project projection after the default Host changes', asy
     await commitGuardChecked.promise;
   });
 
-  assert.deepEqual(projects, []);
-  assert.equal(selectedProjectId, undefined);
+  assert.equal(projectInfo, null);
+  assert.equal(currentProjectId, undefined);
 });
 
 afterEach(() => {
@@ -140,7 +136,7 @@ async function importProjectContext(): Promise<typeof ProjectContext> {
     platform: 'node',
     format: 'esm',
     target: 'node20',
-    external: ['react'],
+    packages: 'external',
     logLevel: 'silent',
   });
   return (await import(`${pathToFileURL(outfile).href}?t=${Date.now()}`)) as typeof ProjectContext;

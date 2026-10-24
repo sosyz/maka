@@ -17,6 +17,12 @@
  * under the License.
  */
 
+import type { UsageScreenRequest, UsageScreenResult } from '@maka/core/settings';
+import {
+  decodeUsageScreenRequest,
+  decodeUsageScreenResult,
+  assertUsageScreenResult,
+} from './usage-screen.js';
 import {
   comparePricingModelKeys,
   normalizePricingModelKey,
@@ -61,6 +67,7 @@ const LLM_USAGE_QUERY_FIELDS = new Set([
   'providerId',
   'modelId',
   'status',
+  'callKinds',
 ]);
 const TOOL_USAGE_QUERY_FIELDS = new Set(['range', 'toolName', 'status']);
 const USAGE_BUCKET_FIELDS = new Set([
@@ -102,6 +109,7 @@ const LLM_USAGE_LOG_FIELDS = new Set([
   'status',
   'errorClass',
   'sessionId',
+  'sessionTitle',
   'turnId',
 ]);
 const TOOL_USAGE_LOG_FIELDS = new Set([
@@ -121,6 +129,7 @@ const TOOL_USAGE_LOG_FIELDS = new Set([
   'bytesOut',
   'startedAt',
   'sessionId',
+  'sessionTitle',
   'turnId',
 ]);
 const TOOL_RESULT_SUMMARY_FIELDS = new Set([
@@ -167,6 +176,8 @@ export interface LlmUsageLogProjection {
   readonly status: 'success' | 'error' | 'aborted';
   readonly errorClass?: string;
   readonly sessionId?: string;
+  /** Human-readable session title, resolved on the Host; absent for untitled sessions. */
+  readonly sessionTitle?: string;
   readonly turnId?: string;
 }
 
@@ -187,12 +198,15 @@ export interface ToolUsageLogProjection {
   readonly bytesOut: number;
   readonly startedAt: number;
   readonly sessionId?: string;
+  /** Human-readable session title, resolved on the Host; absent for untitled sessions. */
+  readonly sessionTitle?: string;
   readonly turnId?: string;
 }
 
 export type UsageLogProjection = LlmUsageLogProjection | ToolUsageLogProjection;
 
 export type UsageQueryInput =
+  | UsageScreenRequest
   | { readonly kind: 'summary'; readonly query: LlmUsageQuery }
   | {
       readonly kind: 'buckets';
@@ -224,6 +238,7 @@ export type UsageQueryInput =
     };
 
 export type UsageQueryResult =
+  | UsageScreenResult
   | {
       readonly kind: 'summary';
       readonly summary: UsageSummaryV2;
@@ -346,6 +361,7 @@ export const USAGE_PRICING_OPERATION_SPECS = {
 
 export function decodeUsageQueryInput(value: unknown): UsageQueryInput {
   const input = requireRecord(value, 'usage query input');
+  if (input.kind === 'screen' || input.kind === 'activity') return decodeUsageScreenRequest(value);
   if (input.kind === 'summary') {
     const exact = requireExactRecord(input, 'usage summary input', ['kind', 'query']);
     return { kind: 'summary', query: decodeLlmUsageQuery(exact.query) };
@@ -394,6 +410,12 @@ export function decodeUsageQueryInput(value: unknown): UsageQueryInput {
 
 export function decodeUsageQueryResult(value: unknown): UsageQueryResult {
   const result = requireRecord(value, 'usage query result');
+  if (
+    ['screen', 'activity', 'revision_changed', 'screen_response_too_large'].includes(
+      String(result.kind),
+    )
+  )
+    return decodeUsageScreenResult(value);
   if (result.kind === 'summary') {
     const exact = requireExactRecord(result, 'usage summary result', [
       'kind',
@@ -606,6 +628,23 @@ export function decodePricingMutateResult(value: unknown): PricingMutateResult {
 }
 
 function assertUsageQueryOutputForInput(input: UsageQueryInput, output: UsageQueryResult): void {
+  if (input.kind === 'screen' || input.kind === 'activity') {
+    if (
+      output.kind !== 'screen' &&
+      output.kind !== 'activity' &&
+      output.kind !== 'revision_changed' &&
+      output.kind !== 'screen_response_too_large'
+    )
+      throw invalidProtocolFrame('Invalid Usage screen result');
+    return assertUsageScreenResult(input, output);
+  }
+  if (
+    output.kind === 'screen' ||
+    output.kind === 'activity' ||
+    output.kind === 'revision_changed' ||
+    output.kind === 'screen_response_too_large'
+  )
+    throw invalidProtocolFrame('Invalid legacy Usage result');
   if (output.kind !== input.kind) {
     throw invalidProtocolFrame('Usage response kind does not match its request');
   }
@@ -671,7 +710,18 @@ function decodeLlmUsageQuery(value: unknown): LlmUsageQuery {
     ...optionalQueryText(query, 'providerId'),
     ...optionalQueryText(query, 'modelId'),
     ...(query.status === undefined ? {} : { status: decodeUsageStatus(query.status) }),
+    ...(query.callKinds === undefined ? {} : { callKinds: decodeCallKinds(query.callKinds) }),
   };
+}
+
+function decodeCallKinds(value: unknown): readonly ModelCallKind[] {
+  if (!Array.isArray(value)) throw invalidProtocolFrame('Invalid usage query callKinds');
+  return value.map((entry) => {
+    if (typeof entry !== 'string' || !MODEL_CALL_KINDS.includes(entry as ModelCallKind)) {
+      throw invalidProtocolFrame('Invalid usage query callKind');
+    }
+    return entry as ModelCallKind;
+  });
 }
 
 function decodeToolUsageQuery(value: unknown): ToolUsageQuery {
@@ -810,15 +860,22 @@ function decodeUsagePagePosition(
 }
 
 function decodeUsageSummary(value: unknown): UsageSummaryV2 {
-  const summary = requireExactRecord(value, 'usage summary', [
-    'range',
-    'totalRequests',
-    'totalCostUsd',
-    'totalTokens',
-    'cacheHitRequests',
-    'cacheCreateRequests',
-    'errorRequests',
-  ]);
+  const summary = requireRecord(value, 'usage summary');
+  assertOptionalExactKeys(
+    summary,
+    'usage summary',
+    [
+      'range',
+      'totalRequests',
+      'totalCostUsd',
+      'totalTokens',
+      'cacheHitRequests',
+      'cacheCreateRequests',
+      'errorRequests',
+      'totalDurationMs',
+    ],
+    ['toolUsage'],
+  );
   const range = requireExactRecord(summary.range, 'usage summary range', ['from', 'to']);
   const tokens = requireExactRecord(summary.totalTokens, 'usage summary tokens', [
     'input',
@@ -848,6 +905,19 @@ function decodeUsageSummary(value: unknown): UsageSummaryV2 {
     cacheHitRequests: requireCount(summary.cacheHitRequests, 'usage cache hit requests'),
     cacheCreateRequests: requireCount(summary.cacheCreateRequests, 'usage cache create requests'),
     errorRequests: requireCount(summary.errorRequests, 'usage error requests'),
+    totalDurationMs: requireCount(summary.totalDurationMs, 'usage total duration'),
+    // Optional for a data reason, not a version one: tool rows that predate
+    // connection attribution cannot answer a `connectionSlug` filter, so the
+    // Host omits the split for that query rather than send an unscoped total.
+    ...(summary.toolUsage !== undefined ? { toolUsage: decodeToolUsage(summary.toolUsage) } : {}),
+  };
+}
+
+function decodeToolUsage(value: unknown): NonNullable<UsageSummaryV2['toolUsage']> {
+  const toolUsage = requireExactRecord(value, 'usage tool usage', ['requests', 'durationMs']);
+  return {
+    requests: requireCount(toolUsage.requests, 'usage tool requests'),
+    durationMs: requireCount(toolUsage.durationMs, 'usage tool duration'),
   };
 }
 
@@ -857,7 +927,7 @@ function decodeUsageSummary(value: unknown): UsageSummaryV2 {
  * legacy table, and how many stored records could not be read. A total
  * crossing the wire without this cannot be presented honestly.
  */
-function decodeUsageProvenance(value: unknown): UsageProvenance {
+export function decodeUsageProvenance(value: unknown): UsageProvenance {
   const provenance = requireExactRecord(value, 'usage provenance', [
     'coverage',
     'legacyRecords',
@@ -992,6 +1062,7 @@ function decodeLlmUsageLog(value: unknown): LlmUsageLogProjection {
     status: decodeUsageLogStatus(row.status),
     ...optionalProjectionText(row, 'errorClass'),
     ...optionalProjectionText(row, 'sessionId'),
+    ...optionalProjectionText(row, 'sessionTitle'),
     ...optionalProjectionText(row, 'turnId'),
   };
 }
@@ -1030,6 +1101,7 @@ function decodeToolUsageLog(value: unknown): ToolUsageLogProjection {
     bytesOut: requireCount(row.bytesOut, 'tool usage log bytes out'),
     startedAt: nonnegativeFinite(row.startedAt, 'tool usage log start time'),
     ...optionalProjectionText(row, 'sessionId'),
+    ...optionalProjectionText(row, 'sessionTitle'),
     ...optionalProjectionText(row, 'turnId'),
   };
 }

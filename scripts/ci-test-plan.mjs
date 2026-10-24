@@ -35,6 +35,11 @@ const FULL_SUITE_FILES = new Set([
 ]);
 
 const RELEASE_CONTRACT_FILES = new Set([
+  // Branch protection. `product-release.test.mjs` parses it and asserts the
+  // required contexts and the release-environment admission rules, and that
+  // suite runs behind `check:release` — so this selection is what proves a
+  // change to the merge gate still satisfies its own policy test.
+  '.asf.yaml',
   'apps/desktop/src/main/app-update-test-context.ts',
   'apps/desktop/build/entitlements.mac.inherit.plist',
   'apps/desktop/build/entitlements.mac.plist',
@@ -48,31 +53,78 @@ const RELEASE_CONTRACT_FILES = new Set([
   '.github/workflows/release-cli-finalize.yml',
   '.github/workflows/release-cli-stage.yml',
   '.github/workflows/release.yml',
+  '.github/workflows/release-linux-check.yml',
   '.github/workflows/release-windows-check.yml',
-  'scripts/package-macos-arm64.mjs',
+  '.github/workflows/windows-recovery.yml',
+  'scripts/audit-shipped-dependencies.mjs',
+  'scripts/audit-shipped-dependencies.test.mjs',
+  'scripts/package-macos.mjs',
+  'scripts/staple-macos-artifact.mjs',
+  'scripts/staple-macos-artifact.test.mjs',
   'scripts/package-macos-autoupdate-next.mjs',
   'scripts/package-macos-arm64-cli.mjs',
+  'scripts/package-linux.mjs',
   'scripts/package-windows-autoupdate-next.mjs',
   'scripts/package-windows-x64.mjs',
   'scripts/prepare-windows-upgrade-baseline.mjs',
-  'scripts/generate-third-party-notices.test.mjs',
   'scripts/prepare-windows-upgrade-baseline.test.mjs',
+  'scripts/generate-third-party-notices.test.mjs',
   'scripts/product-release.test.mjs',
+  'scripts/qualify-released-cli-state-root.test.mjs',
   'scripts/release-eval-smoke-sitecustomize.py',
   'scripts/release-version.mjs',
+  'scripts/third-party-closure.test.mjs',
   'scripts/verify-macos-arm64-cli.mjs',
-  'scripts/verify-macos-arm64-dmg.mjs',
+  'scripts/verify-macos-dmg.mjs',
   'scripts/verify-macos-autoupdate.mjs',
+  'scripts/verify-linux.mjs',
+  'scripts/verify-linux-harness.test.mjs',
+  'scripts/desktop-release-targets.mjs',
+  'scripts/desktop-release-targets.test.mjs',
   'scripts/desktop-update-contract.mjs',
   'scripts/product-nightly.mjs',
   'scripts/product-nightly.test.mjs',
   'scripts/verify-packaged-app.mjs',
+  'scripts/verify-packaged-app.test.mjs',
+  'scripts/macos-update-archive.test.mjs',
   'scripts/verify-windows-autoupdate.mjs',
   'scripts/verify-windows-installer-lifecycle.mjs',
   'scripts/verify-windows-x64.mjs',
   'scripts/windows-upgrade-baseline.json',
   'scripts/windows-package-source-closure.mjs',
   'scripts/windows-package-source-closure.test.mjs',
+  // Reads the filter that closure test compares against, and `check:release`
+  // is the only gate that runs it against `release-windows-check.yml`.
+  'scripts/workflow-pull-request-paths.mjs',
+]);
+
+// What decides whether a build can read durable state an earlier release wrote.
+// `operations.ts` is here because it owns the operation vocabulary: the rename
+// that stranded workspaces holding an older credential (#4420) changed that file
+// and none of the decoders, so a trigger listing only decoders would not have
+// run on the very change it exists to catch.
+const DURABLE_STATE_DECODER_FILES = new Set([
+  'packages/core/src/goal.ts',
+  'packages/runtime-host/src/protocol/operations.ts',
+  'packages/runtime-host/src/server/access-authority.ts',
+  'packages/runtime-host/src/server/access-credential-store.ts',
+  'packages/storage/src/operational-state-store.ts',
+  'packages/storage/src/root-authority.ts',
+  'packages/storage/src/state-root-composition.ts',
+  'scripts/qualify-released-cli-state-root.mjs',
+  'scripts/released-cli-state-root-fixture.mjs',
+]);
+
+// The DeepSeek Harness is an external linux/amd64 tree whose admission
+// authority is a fingerprint of its installed contents. Changes to any build
+// input or to that authority must rebuild the exact tree in hosted CI and
+// compare its manifest digest with the committed value.
+const DEEPSEEK_HARNESS_TOOLCHAIN_FILES = new Set([
+  'packages/eval/harbor/deepseek-harness-toolchain/package.json',
+  'packages/eval/harbor/deepseek-harness-toolchain/package-lock.json',
+  'packages/eval/harbor/deepseek-harness-toolchain/patch-subprocess-local.mjs',
+  'packages/eval/src/toolchain-verification.ts',
+  'scripts/prepare-deepseek-harness-toolchain.mjs',
 ]);
 
 const TYPECHECK_ONLY_FILES = new Set([
@@ -98,6 +150,7 @@ const CLI_PACKAGE_FILES = new Set([
 
 const ASF_SOURCE_FILES = new Set([
   '.github/workflows/asf-source-candidate.yml',
+  '.github/workflows/model-metadata-upkeep.yml',
   'DISCLAIMER-WIP',
   'LICENSE',
   'NOTICE',
@@ -106,11 +159,14 @@ const ASF_SOURCE_FILES = new Set([
   'docs/code-origin-audit.md',
   'package.json',
   'packages/eval/harbor/deepseek-harness-profile/cordis.patch.yml',
+  'scripts/apply-dependency-patches.mjs',
+  'scripts/apply-dependency-patches.test.mjs',
   'scripts/asf-license-headers.mjs',
   'scripts/asf-license-headers.test.mjs',
   'scripts/asf-source-release.mjs',
   'scripts/asf-source-release.test.mjs',
   'scripts/asf-source-workflow-policy.test.mjs',
+  'scripts/model-metadata-upkeep-workflow-policy.test.mjs',
   'scripts/model-metadata/models-dev-api.snapshot.json',
   'scripts/source-legal-inventory.test.mjs',
   'scripts/sync-model-metadata.mjs',
@@ -138,6 +194,11 @@ const CLI_PACKAGE_WORKSPACES = [
 
 function isCliPackagePath(path) {
   if (CLI_PACKAGE_FILES.has(path) || path.startsWith('patches/')) return true;
+  // `release:cli:pack` builds the direct-peer addon into the tarball and runs
+  // `cargo deny` against that policy, so this crate ships and CLI packaging is
+  // the JavaScript gate that proves it still does.
+  if (path === 'deny.toml' || path.startsWith('native/runtime-host-peer/')) return true;
+  if (isDocumentation(path)) return false;
   if (path.startsWith('scripts/release-cli-')) return true;
   if (path.startsWith('tsconfig') && path.endsWith('.json')) return true;
   return CLI_PACKAGE_WORKSPACES.some(
@@ -156,13 +217,18 @@ function isReleaseContractPath(path) {
 
 const DEDICATED_WORKSPACE_LANES = new Set(['packages/runtime-host']);
 
+const SITE_SENTENCE_FILES = new Set(['README.md', 'README.zh-CN.md']);
+
 // Scripts the Electron e2e job runs. Editing one of these changes what that
 // job verifies, so it has to re-run — a unit test on the runner is not
 // evidence that the run it drives still works.
 const E2E_DRIVING_SCRIPTS = new Set([
   'apps/desktop/scripts/browser-observe-act-smoke.mjs',
+  'apps/desktop/scripts/workhub-browser-presentation-smoke.mjs',
   'scripts/audit-alignment.mjs',
   'scripts/ax-tree-audit.mjs',
+  'scripts/fixture-env.mjs',
+  'scripts/run-desktop-e2e-parallel.mjs',
 ]);
 
 // Scripts / paths that can break the built Storybook catalog. Product stories
@@ -177,6 +243,14 @@ const STORYBOOK_DRIVING_SCRIPTS = new Set([
 // .storybook/preview.tsx imports THEME_PALETTES from this module. Narrower
 // than "any packages/core change".
 const STORYBOOK_CORE_SETTINGS = 'packages/core/src/settings.ts';
+
+const ASTRYX_INVENTORY_CONTRACT_FILES = new Set([
+  'docs/astryx-surface-file-inventory.md',
+  'docs/astryx-surface-file-inventory.paths',
+  'scripts/check-astryx-surface-inventory.mjs',
+  'scripts/check-astryx-surface-inventory.test.mjs',
+  'scripts/generate-astryx-surface-inventory.mjs',
+]);
 
 function isStorybookCatalogPath(path) {
   if (path === 'apps/desktop/.storybook' || path.startsWith('apps/desktop/.storybook/'))
@@ -207,6 +281,7 @@ function isUiProductSourcePath(path) {
 
 function isStorybookPath(path) {
   if (STORYBOOK_DRIVING_SCRIPTS.has(path) || path === STORYBOOK_CORE_SETTINGS) return true;
+  if (isDocumentation(path)) return false;
   if (path === 'apps/desktop/src/renderer' || path.startsWith('apps/desktop/src/renderer/')) {
     // Renderer unit tests do not change Storybook mount code.
     return !isPackageTestPath(path);
@@ -221,23 +296,38 @@ function isStorybookPath(path) {
  * Electron e2e should pay cold install/boot only when the real window surface
  * or e2e driver changed — not when only packages/ui unit tests changed.
  */
-function isAstryxSurfaceInventoryPath(path) {
-  if (
-    path === 'docs/astryx-surface-file-inventory.md' ||
-    path === 'docs/astryx-surface-file-inventory.paths' ||
-    path === 'scripts/generate-astryx-surface-inventory.mjs' ||
-    path === 'scripts/check-astryx-surface-inventory.mjs'
-  ) {
-    return true;
-  }
-  if (path === 'apps/desktop/src/renderer' || path.startsWith('apps/desktop/src/renderer/')) {
-    return !isPackageTestPath(path);
-  }
-  return isUiProductSourcePath(path);
+function shouldRunAstryxSurfaceInventory(path) {
+  if (ASTRYX_INVENTORY_CONTRACT_FILES.has(path)) return true;
+  if (isDocumentation(path)) return false;
+  const desktopRenderer =
+    path === 'apps/desktop/src/renderer' || path.startsWith('apps/desktop/src/renderer/');
+  return desktopRenderer ? !isPackageTestPath(path) : isUiProductSourcePath(path);
+}
+
+/**
+ * The two app-icon drift tests read exactly this surface: the committed
+ * artwork, the generator that must still reproduce it, the `APP_ICONS` catalog
+ * they check it against, the packaged-resource list that has to keep naming
+ * every file, and the packaging config, which the drift test opens by path to
+ * prove the bundle icon is still `DEFAULT_APP_ICON`. Regenerating the artwork
+ * costs about a minute, which every unrelated code change used to pay.
+ */
+const APP_ICON_FILES = new Set([
+  'apps/desktop/electron-builder.config.mjs',
+  'packages/core/src/settings.ts',
+  'scripts/generate-app-icons.py',
+  'scripts/generate-app-icons.test.mjs',
+  'scripts/verify-packaged-app.mjs',
+  'scripts/verify-packaged-app-icons.test.mjs',
+]);
+
+function isAppIconPath(path) {
+  return APP_ICON_FILES.has(path) || path.startsWith('apps/desktop/assets/app-icons/');
 }
 
 function isE2eProductPath(path) {
   if (E2E_DRIVING_SCRIPTS.has(path)) return true;
+  if (isDocumentation(path)) return false;
   if (path === 'apps/desktop' || path.startsWith('apps/desktop/')) {
     // Storybook catalog under desktop never needs a real Electron window.
     if (isStorybookCatalogPath(path)) return false;
@@ -258,7 +348,6 @@ const STORAGE_STRESS_FILES = new Set([
   'packages/storage/src/sqlite-session-metadata-schema.ts',
   'packages/storage/src/sqlite-usage-schema.ts',
   'packages/storage/src/sqlite-workflow-schema.ts',
-  'packages/storage/src/__tests__/agent-run-store.test.ts',
   'packages/storage/src/__tests__/root-authority.test.ts',
   'packages/storage/src/__tests__/sqlite-recovery-concurrency.test.ts',
   'packages/storage/src/__tests__/fixtures/sqlite-recovery-concurrency-child.ts',
@@ -341,11 +430,17 @@ export function planTests(changedFiles, options = {}) {
   const full = forceFull || files.some((path) => FULL_SUITE_FILES.has(path));
   if (full) {
     const workspaces = [...graph.dirs];
+    const workflow = files.includes('.github/workflows/ci.yml');
     return {
+      // Neither verdict follows a dependency bump, but the workflow file owns
+      // both steps' commands, so editing it still runs them.
+      appIcons: forceFull || workflow || files.some((path) => isAppIconPath(path)),
       asfSource: true,
       astryxSurface: true,
       cliPackage: true,
       code: true,
+      deepseekHarnessToolchain:
+        forceFull || workflow || files.some((path) => DEEPSEEK_HARNESS_TOOLCHAIN_FILES.has(path)),
       e2e: true,
       full: true,
       releaseContract: true,
@@ -354,6 +449,7 @@ export function planTests(changedFiles, options = {}) {
       // Stress multipliers and native child-process lock probes run only when
       // their owning storage seam changes; making --full imply stress turned
       // every unrelated merge into a 10K-chunk pressure run.
+      stateRootCompat: true,
       storageStress: false,
       storybook: true,
       workspaces,
@@ -365,6 +461,18 @@ export function planTests(changedFiles, options = {}) {
   let code = false;
   let unknownCode = false;
   for (const path of files) {
+    // The READMEs must open with the sentence the website uses, and the
+    // website's test is what checks that, so a README change runs that
+    // workspace even though it is documentation.
+    if (SITE_SENTENCE_FILES.has(path)) {
+      code = true;
+      directWorkspaces.add('website');
+      continue;
+    }
+    // Documentation can live inside a workspace. Classify it before generic
+    // workspace and product-surface membership; dedicated legal, release, and
+    // generated-authority gates still inspect the complete file list below.
+    if (isDocumentation(path)) continue;
     // Catalog/config changes are fully exercised by Storybook's build + render
     // smoke. They do not change the shipped Electron app, so do not route them
     // through workspace tests or real-window E2E merely because they live
@@ -392,7 +500,31 @@ export function planTests(changedFiles, options = {}) {
       code = true;
       continue;
     }
-    if (path.startsWith('.github/') || isDocumentation(path)) continue;
+    // Rust. Each of these crates has an admission lane that owns `cargo fmt`
+    // and `cargo test` for it, and `native/runtime-host-peer` additionally
+    // reaches CLI packaging through `isCliPackagePath` above. Nothing under
+    // either is read by lint, typecheck, Storybook, or a real window, so
+    // falling through to the guard below made this directory the largest
+    // single source of full-suite runs.
+    //
+    // Named one crate at a time rather than by the `native/` prefix: what
+    // earns the exemption is having a lane, not being written in Rust. A new
+    // native root has neither until someone adds one, and until then the
+    // guard below is the only thing that would test it at all.
+    //
+    // `deny.toml` is the lint policy both crates share and travels with them.
+    if (
+      path.startsWith('native/gitoxide-helper/') ||
+      path.startsWith('native/runtime-host-peer/') ||
+      path === 'deny.toml'
+    ) {
+      continue;
+    }
+    // Branch protection selects no workspace, but it is not unknown either:
+    // `RELEASE_CONTRACT_FILES` above routes it to `product-release.test.mjs`,
+    // the suite that parses it and asserts the required contexts.
+    if (path === '.asf.yaml') continue;
+    if (path.startsWith('.github/')) continue;
     code = true;
     unknownCode = true;
   }
@@ -406,10 +538,12 @@ export function planTests(changedFiles, options = {}) {
 
   const cliPackage = files.some((path) => isCliPackagePath(path));
   return {
+    appIcons: files.some((path) => isAppIconPath(path)),
     asfSource: files.some((path) => isAsfSourcePath(path)),
-    astryxSurface: files.some((path) => isAstryxSurfaceInventoryPath(path)),
+    astryxSurface: files.some((path) => shouldRunAstryxSurfaceInventory(path)),
     cliPackage,
     code,
+    deepseekHarnessToolchain: files.some((path) => DEEPSEEK_HARNESS_TOOLCHAIN_FILES.has(path)),
     // Electron E2E + alignment audit (same job). Product desktop/ui sources and
     // e2e drivers only — a storage/runtime change must not drag cold Electron
     // boots, and packages/ui unit-test-only PRs must not either.
@@ -421,6 +555,14 @@ export function planTests(changedFiles, options = {}) {
     // the cli workspace runs in the dependency closure, not only for direct
     // cli/runtime edits (e.g. a storage-only change still selects cli via runtime).
     runtimeSandbox: workspaces.includes('packages/cli'),
+    // The released forward roll: a build under test reads durable state a
+    // published predecessor wrote. Selected by the decoders and the operation
+    // vocabulary they decode against, plus the SQLite schemas.
+    stateRootCompat: files.some(
+      (path) =>
+        DURABLE_STATE_DECODER_FILES.has(path) ||
+        /^packages\/storage\/src\/sqlite-[^/]*schema[^/]*\.ts$/u.test(path),
+    ),
     storageStress,
     // Storybook build + smoke: catalog/harness only. Not every desktop/ui/core
     // PR — product ship gates are typecheck, unit, and Electron e2e. See
@@ -433,14 +575,17 @@ export function planTests(changedFiles, options = {}) {
 
 export function formatGitHubOutputs(plan) {
   return [
+    `app_icons=${plan.appIcons}`,
     `asf_source=${plan.asfSource}`,
-    `astryx_surface=${plan.astryxSurface}`,
+    `astryx_surface=${Boolean(plan.astryxSurface)}`,
     `cli_package=${plan.cliPackage}`,
     `code=${plan.code}`,
+    `deepseek_harness_toolchain=${plan.deepseekHarnessToolchain}`,
     `e2e=${plan.e2e}`,
     `runtime_host=${plan.runtimeHost}`,
     `runtime_sandbox=${plan.runtimeSandbox}`,
     `release_contract=${plan.releaseContract}`,
+    `state_root_compat=${plan.stateRootCompat}`,
     `storage_stress=${plan.storageStress}`,
     `storybook=${plan.storybook}`,
     `standard_workspaces=${plan.standardWorkspaces.join(',')}`,
@@ -463,10 +608,16 @@ function parseArgs(args) {
 }
 
 export function changedFilesBetween(base, head, exec = execFileSync) {
-  return exec('git', ['diff', '--no-renames', '--name-only', '--diff-filter=ACMRD', base, head], {
+  const options = {
     cwd: defaultRepoRoot,
     encoding: 'utf8',
-  })
+  };
+  const mergeBase = exec('git', ['merge-base', base, head], options).trim();
+  return exec(
+    'git',
+    ['diff', '--no-renames', '--name-only', '--diff-filter=ACMRDT', mergeBase, head],
+    options,
+  )
     .split('\n')
     .filter(Boolean);
 }

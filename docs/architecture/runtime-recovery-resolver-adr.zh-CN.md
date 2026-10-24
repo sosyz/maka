@@ -19,6 +19,9 @@
 
 # ADR：RuntimeEvent 唯一事实源与 RecoveryResolver 唯一判定权威
 
+> **2026-10-16 退役说明：** 本文涉及工具专属 reconciliation、recovery bundle 写入及其后续 PR 的内容保留为历史设计，不再是当前实施要求。没有生产工具提供完整的 reconciliation 合同，公开 bundle writer 和预设工具恢复能力已清理。已有 recovery facts 仍保留读取、复制与投影重建兼容。当前合同是结束旧执行、保留未知事实、禁止自动重放，由新的明确用户轮检查现状；详见[当前恢复架构](./runtime-resume-architecture.zh-CN.md#未知结果与历史-recovery-bundle)。
+
+
 - 状态：Accepted，Phase 2.5 开始实施
 - 日期：2026-07-17
 - 范围：Runtime Resume Phase 2.5–3
@@ -85,19 +88,20 @@ Planner、CLI、UI 和未来 reconciler 不得各自组合事实。它们只消�
 |---|---|
 | call + matching response，无 dispatch | completed；表示 T1 前合成结果，legacy 下 response 本身也是完成证据 |
 | call + dispatch + matching response | completed |
-| call + dispatch，无 response | indeterminate / reconcile_required |
+| call + dispatch，无 response | indeterminate，Resolver 置 `requiresReconciliation`，reason 记 `dispatch_without_response` |
 | call，无 dispatch、无 response，首事件声明新协议 | definitely_not_dispatched |
 | call，无 dispatch、无 response，legacy/unknown protocol | indeterminate |
 | dispatch 存在但对应 call 不存在 | corruption |
 | response 存在但对应 call 不存在 | corruption |
 | dispatch/response 的 operation、tool call、tool name 或执行身份冲突 | corruption |
 | 同一 operation 出现多个不一致 dispatch 或 response | corruption |
+| call（含 dispatch 后无 response）且 operation 已带 recovery decision fact | 以 recovery bundle 结算：disposition 为 completed 则 completed（reason `recovery_bundle_completed`），否则 parked 并沿用 fact 的 reasonCode；fact 本身损坏按 corruption 处理 |
 
-Resolver 必须 fail-closed：未知组合不能退化成自动重试。Phase 3 首个恢复写入者应追加 `tool_recovery_decided` RuntimeEvent；后续 reconcile 结果同样追加事件，不回写历史事实。
+Resolver 必须 fail-closed：未知组合不能退化成自动重试。Phase 3 恢复写入者经原子 recovery bundle 事务提交 `actions.toolRecovery` decision fact（`maka.tool.recovery_decision`，protocol `tool_recovery_v1`）；后续 reconcile 结果同样追加事件，不回写历史事实。
 
 ### 5. Journal 是可重建投影，不是第二份账本
 
-Phase 2.5 保留现有表以降低查询成本，但状态缩窄为当前确有写入路径的 `prepared | outcome_committed`。未来 `indeterminate`、`reconciled`、`parked` 若需要查询状态，先定义对应 RuntimeEvent，再扩展 projector。
+Phase 2.5 保留现有表以降低查询成本，状态缩窄为写入路径可达的集合（现为 `prepared | reconcile_observed | outcome_committed | recovery_completed | recovery_parked`，另有事务放弃/中断路径写入的 `abandoned` 与 `interrupted_unknown`；完整联合见 `ToolJournalState`，其中 `reconcile_observed` 由 reconcile 追加事件写入）。未来新状态若需要查询表示，先定义对应 RuntimeEvent，再扩展 projector。
 
 新协议的重建验收标准：清空 `tool_journal_events` 与 `tool_operations` 后，从 RuntimeEvent 投影得到相同 operation identity、dispatch/result event refs、recovery mode 与 current state。
 
@@ -108,6 +112,12 @@ Phase 2.5 保留现有表以降低查询成本，但状态缩窄为当前确有�
 ```text
 [{ invocationId, runId, turnId, highWater, prefixDigest }]
 ```
+
+> 实现注记（2026-10-10）：落地时 manifest 没有放在 `actions.stateDelta.replaySources`，而是由
+> `continuation_start_v2` payload 的 `replayManifestDigest` 与 claim row 的 boundary cursor
+> （`RuntimeBoundaryCursor`（V1|V2）的 `segments`：`{protocol, identity{sessionId, invocationId,
+> runId, turnId}, position{lastEventSeq, eventCount, lastEventId}, prefixDigest}`）承载。
+> `ToolJournalState` 亦已扩展 `abandoned` 与 `interrupted_unknown` 两个成员。
 
 - `prefixDigest` 对原始不可变前缀做摘要：按 durable 顺序使用 event id 与完整 payload 的规范化序列化；
 - 不摘要 provider replay 投影，因为投影逻辑会随版本演进；
@@ -139,7 +149,7 @@ Phase 2.5 保留现有表以降低查询成本，但状态缩窄为当前确有�
 1. Phase 2.5：增加 dispatch RuntimeEvent 和运行时 protocol marker；Journal 改为其同步投影。
 2. Phase 2.5：实现稳定 revalidation error code，清理无生产调用的旧接口与虚设状态。
 3. Phase 3：实现纯 RecoveryResolver 与完整决策表。
-4. Phase 3：提交 `tool_recovery_decided`，先支持 park/reconcile_required，不直接自动重跑有副作用工具。
+4. Phase 3：经 recovery bundle 提交 terminal decision fact（disposition `parked` / `completed`），先支持 park/reconcile，不直接自动重跑有副作用工具。
 5. Phase 3：加入 replay manifest、全 source digest revalidation 与投影重建工具。
 
 ## 验收不变量

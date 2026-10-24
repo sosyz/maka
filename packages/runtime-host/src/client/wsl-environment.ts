@@ -19,6 +19,11 @@
 
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import {
+  decodeRuntimeHostPosixOperatorCommand,
+  runtimeHostOperatorInvocation,
+  type RuntimeHostPosixOperatorCommand,
+} from '../operator/operator-command.js';
+import {
   INTERACTIVE_RUNTIME_HOST_COMPOSITION_ID,
   RUNTIME_HOST_PROTOCOL_VERSION,
   requireHostRootId,
@@ -40,7 +45,6 @@ import {
   formatRuntimeHostWslStderr,
   listRuntimeHostWslDistributions,
   normalizeRuntimeHostWslDistribution,
-  normalizeRuntimeHostWslOperatorPath,
   resolveSystemRuntimeHostWslExecutable,
   RUNTIME_HOST_WSL_STDERR_MAX_BYTES,
   spawnRuntimeHostWslProcess,
@@ -56,14 +60,13 @@ const DEFAULT_RUNTIME_HOST_WSL_READY_TIMEOUT_MS = 45_000;
 export {
   listRuntimeHostWslDistributions,
   normalizeRuntimeHostWslDistribution,
-  normalizeRuntimeHostWslOperatorPath,
   resolveSystemRuntimeHostWslExecutable,
   type RuntimeHostWslProcessFactory,
 } from './wsl-control.js';
 
 export interface RuntimeHostWslEnvironmentInput {
   readonly distribution: string;
-  readonly operatorPath: string;
+  readonly operator: RuntimeHostPosixOperatorCommand;
   readonly rootId: string;
   readonly clientInstanceId: string;
   readonly signal?: AbortSignal;
@@ -81,19 +84,22 @@ export async function connectRuntimeHostWslEnvironment(
 ): Promise<RuntimeHostConnection> {
   input.signal?.throwIfAborted();
   const distribution = normalizeRuntimeHostWslDistribution(input.distribution);
-  const operatorPath = normalizeRuntimeHostWslOperatorPath(input.operatorPath);
+  const operator = decodeRuntimeHostPosixOperatorCommand(input.operator);
   const rootId = requireHostRootId(input.rootId);
   const processFactory = overrides.processFactory ?? spawnRuntimeHostWslProcess;
-  const child = processFactory(overrides.wslExecutable ?? resolveSystemRuntimeHostWslExecutable(), [
-    '--distribution',
-    distribution,
-    '--exec',
-    operatorPath,
+  const invocation = runtimeHostOperatorInvocation(operator, [
     'connect',
     '--framed',
     '--root-id',
     rootId,
     '--repair-root-after-remount',
+  ]);
+  const child = processFactory(overrides.wslExecutable ?? resolveSystemRuntimeHostWslExecutable(), [
+    '--distribution',
+    distribution,
+    '--exec',
+    invocation.executable,
+    ...invocation.args,
   ]);
   const resource = new WslProcessByteStream(child);
   const transport = new FramedByteStreamTransport(resource);
@@ -168,6 +174,10 @@ class WslProcessByteStream implements RuntimeHostByteStream, RuntimeHostConnecti
 
   onError(listener: (error: Error) => void): void {
     this.child.once('error', listener);
+    // Pipe errors are emitted independently of the write callback and the
+    // ChildProcess error event. Route them through the transport failure fence.
+    this.child.stdin.on('error', listener);
+    this.child.stdout.on('error', listener);
   }
 
   write(chunk: Buffer): Promise<void> {

@@ -17,8 +17,30 @@
  * under the License.
  */
 
+import type { ClientCapabilitySessionGrantKey } from '@maka/core/client-capability-grant';
+
 export {
   HostClientCapabilityCoordinator,
   type ClientCapabilitySnapshot,
 } from '../server/client-capability-coordinator.js';
 export { RuntimePolicyActivationGate } from '../server/runtime-policy-activation-gate.js';
+
+export function clientCapabilityCoordinatorTestAdmission() {
+  return {
+    isSessionRetired: async () => false,
+    interactions: {
+      requestClientCapabilityApproval: async () => {
+        throw new Error('Unexpected Client Capability approval request');
+      },
+    },
+    grants: {
+      readClientCapabilitySessionGrant: async (key: ClientCapabilitySessionGrantKey) => ({
+        version: 1 as const,
+        ...key,
+        grantedAt: 0,
+      }),
+    },
+  };
+}
+
+export { withClientCapabilityFormHost } from './client-capability-form-host.js';

@@ -27,7 +27,7 @@
 
 import type { BotAttachmentKind } from '@maka/core/bot-events';
 import type { BotChannelSettings } from '@maka/core/bot-chat-settings';
-import { generalizedErrorMessage } from '@maka/core/redaction';
+import { truncateUtf16Safe } from '@maka/core/text-sanitize';
 import { BaseBotAdapter, botReadinessFromSettings } from './base-adapter.js';
 import type {
   BotPlatform,
@@ -64,28 +64,6 @@ function utf16Len(s: string): number {
 }
 
 /**
- * Return the longest prefix of `s` whose UTF-16 length is ≤ `cap`,
- * respecting surrogate-pair boundaries (we never slice a
- * multi-code-unit character in half). We iterate codepoint-by-
- * codepoint instead of binary-searching slices: the cost of
- * mistakenly splitting an emoji is far worse than the O(n) cost.
- */
-function prefixWithinUtf16(s: string, cap: number): string {
-  if (utf16Len(s) <= cap) return s;
-  let used = 0;
-  let end = 0;
-  for (let i = 0; i < s.length; ) {
-    const code = s.codePointAt(i)!;
-    const units = code > 0xffff ? 2 : 1;
-    if (used + units > cap) break;
-    used += units;
-    i += units;
-    end = i;
-  }
-  return s.slice(0, end);
-}
-
-/**
  * Split `text` into UTF-16-bounded chunks for Telegram delivery.
  * Prefers breaking on a newline within the last ~10% of the chunk;
  * falls back to a hard prefix cut when the chunk has no newline.
@@ -100,7 +78,7 @@ function splitForTelegram(text: string): string[] {
   const pieces: string[] = [];
   let remaining = text;
   while (utf16Len(remaining) > cap) {
-    let chunk = prefixWithinUtf16(remaining, cap);
+    let chunk = truncateUtf16Safe(remaining, cap);
     const minBoundary = Math.floor(chunk.length * 0.9);
     const nl = chunk.lastIndexOf('\n');
     if (nl >= minBoundary) chunk = chunk.slice(0, nl);
@@ -153,18 +131,6 @@ function normalizeTelegramPrivateChatId(value: string): number | undefined {
   if (!/^[1-9]\d*$/.test(trimmed)) return undefined;
   const numeric = Number(trimmed);
   return Number.isSafeInteger(numeric) ? numeric : undefined;
-}
-
-/**
- * PR-BOT-USER-ALLOWLIST-0: runtime allowlist gate. `undefined` or empty
- * means no restriction; any other set is enforced as exact match against
- * the platform-native user id. The settings normalize layer already
- * trims, dedups, and caps the persisted array, so this function only
- * has to do membership.
- */
-function isAllowedUser(allowedUserIds: ReadonlyArray<string> | undefined, userId: string): boolean {
-  if (!allowedUserIds || allowedUserIds.length === 0) return true;
-  return allowedUserIds.includes(userId);
 }
 
 /**
@@ -264,12 +230,10 @@ function classifyTelegramSendResponse(response: any): TelegramSendClassification
 
 export const __TEST__ = {
   utf16Len,
-  prefixWithinUtf16,
   splitForTelegram,
   buildTelegramSendBody,
   normalizeTelegramReplyToMessageId,
   normalizeTelegramPrivateChatId,
-  isAllowedUser,
   classifyTelegramSendResponse,
   createTelegramReplyStream,
   telegramDraftId,
@@ -291,7 +255,7 @@ export class TelegramBotBridge extends BaseBotAdapter implements SendCapable {
       return;
     }
     if (!this.settings.token.trim()) {
-      this.reason = 'no-token';
+      this.reason = 'token_missing';
       this.readiness = 'scaffolded';
       return;
     }
@@ -335,7 +299,10 @@ export class TelegramBotBridge extends BaseBotAdapter implements SendCapable {
       }
       if (classification.kind !== 'ok') {
         this.readiness = this.readiness === 'operational' ? 'degraded' : 'credentials_valid';
-        this.reason = classification.kind === 'retry' ? 'rate-limited' : classification.description;
+        this.recordFailure(
+          classification.kind === 'retry' ? 'rate-limited' : classification.description,
+          classification.kind === 'retry' ? 'rate-limited' : 'send-failed',
+        );
         this.emitStatusChange();
         return null;
       }
@@ -374,7 +341,7 @@ export class TelegramBotBridge extends BaseBotAdapter implements SendCapable {
     return createTelegramReplyStream({
       chatId,
       streamId: options.streamId,
-      prepareDraftText: (text) => prefixWithinUtf16(text, TELEGRAM_MAX_UTF16_PER_MESSAGE),
+      prepareDraftText: (text) => truncateUtf16Safe(text, TELEGRAM_MAX_UTF16_PER_MESSAGE),
       sendDraft: async (draftId, text) => {
         const response = await telegramApi(token, 'sendMessageDraft', {
           chat_id: privateChatId,
@@ -410,7 +377,10 @@ export class TelegramBotBridge extends BaseBotAdapter implements SendCapable {
     try {
       const me = await telegramApi(this.settings.token, 'getMe');
       if (!me.ok) {
-        this.reason = me.description ?? 'get-me-failed';
+        this.recordFailure(
+          me.description ?? 'get-me-failed',
+          me.error_code === 401 ? 'token_invalid' : 'get-me-failed',
+        );
         this.readiness = 'configured';
         this.emitStatusChange();
         return;
@@ -429,7 +399,7 @@ export class TelegramBotBridge extends BaseBotAdapter implements SendCapable {
       this.emitStatusChange();
       void this.pollTelegram();
     } catch (error) {
-      this.reason = generalizedErrorMessage(error);
+      this.recordFailure(error);
       this.readiness =
         this.readiness === 'operational' ? 'degraded' : botReadinessFromSettings(this.settings);
       this.emitStatusChange();
@@ -469,27 +439,23 @@ export class TelegramBotBridge extends BaseBotAdapter implements SendCapable {
   private handleTelegramMessage(message: any): void {
     if (!message?.from) return;
     const userId = String(message.from.id);
-    // PR-BOT-USER-ALLOWLIST-0: drop unauthorized senders silently when an
-    // allowlist is configured. No bounce reply — that would let scanners
-    // enumerate the policy by toggling IDs. Status fields are NOT updated
-    // for dropped messages so the bridge's `lastEventAt` continues to
-    // reflect authentic activity from authorized users only.
-    if (!isAllowedUser(this.settings.allowedUserIds, userId)) return;
-    this.lastEventAt = Date.now();
+    const attachmentKind = telegramAttachmentKind(message);
+    if (
+      !this.emitIncomingMessage({
+        platform: 'telegram',
+        userId,
+        userName: message.from.username ?? message.from.first_name ?? userId,
+        chatId: String(message.chat?.id ?? ''),
+        isGroup: message.chat?.type === 'group' || message.chat?.type === 'supergroup',
+        text: message.text ?? message.caption ?? '',
+        sourceMessageId: String(message.message_id ?? ''),
+        receivedAt: Date.now(),
+        ...(attachmentKind ? { attachmentKind } : {}),
+      })
+    )
+      return;
     this.readiness = 'operational';
     this.reason = undefined;
-    const attachmentKind = telegramAttachmentKind(message);
-    this.emitIncomingMessage({
-      platform: 'telegram',
-      userId,
-      userName: message.from.username ?? message.from.first_name ?? userId,
-      chatId: String(message.chat?.id ?? ''),
-      isGroup: message.chat?.type === 'group' || message.chat?.type === 'supergroup',
-      text: message.text ?? message.caption ?? '',
-      sourceMessageId: String(message.message_id ?? ''),
-      receivedAt: this.lastEventAt,
-      ...(attachmentKind ? { attachmentKind } : {}),
-    });
     this.emitStatusChange();
   }
 

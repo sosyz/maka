@@ -18,6 +18,7 @@
  */
 
 import type { Meta, StoryObj } from '@storybook/react-vite';
+import { expect, waitFor } from 'storybook/test';
 import { Spinner } from '@astryxdesign/core/Spinner';
 
 // The two functional animations the product keeps: a spinner and the streaming
@@ -42,7 +43,7 @@ export const RetainedFunctionalMotion: Story = {
       <style>{'@keyframes maka-shimmer { 0% { background-position: -200% 0; } 100% { background-position: 200% 0; } }'}</style>
       <div style={{ alignItems: 'center', display: 'grid', gap: 8, justifyItems: 'center' }}>
         <Spinner style={{ height: 20, width: 20 }} />
-        <span style={{ color: 'var(--foreground-secondary)', fontSize: 12, fontWeight: 600 }}>Spinner</span>
+        <span style={{ color: 'var(--muted-foreground)', fontSize: 12, fontWeight: 600 }}>Spinner</span>
       </div>
       <div style={{ alignItems: 'center', display: 'grid', gap: 8, justifyItems: 'center' }}>
         <span
@@ -57,8 +58,30 @@ export const RetainedFunctionalMotion: Story = {
             width: 96,
           }}
         />
-        <span style={{ color: 'var(--foreground-secondary)', fontSize: 12, fontWeight: 600 }}>Shimmer</span>
+        <span style={{ color: 'var(--muted-foreground)', fontSize: 12, fontWeight: 600 }}>Shimmer</span>
       </div>
     </div>
   ),
+  play: async ({ canvasElement }) => {
+    const spinner = canvasElement.querySelector<HTMLElement>('.astryx-spinner')!;
+    // Chromium repaints an animating SVG on the main thread every frame, so the
+    // only animation must be the HTML box's rotation, stepping, not gliding.
+    expect(spinner.getAnimations({ subtree: true })).toHaveLength(1);
+    expect(spinner.getAnimations()).toHaveLength(1);
+    expect(getComputedStyle(spinner).animationTimingFunction).toBe('steps(16)');
+    // Pinned to the timeline origin, spinners mounted apart step on the same
+    // frames instead of each adding its own.
+    await waitFor(() => expect(spinner.getAnimations()[0]?.startTime).toBe(0));
+    // A list re-sorting its rows moves a mounted spinner, which restarts its
+    // animation without remounting it. At timeline time 0 an unpinned restart
+    // would also start at 0, so wait for the clock to move first.
+    await waitFor(() => expect(document.timeline.currentTime).toBeGreaterThan(0));
+    const [mounted] = spinner.getAnimations();
+    spinner.parentElement!.prepend(spinner);
+    await waitFor(() => {
+      const [restarted] = spinner.getAnimations();
+      expect(restarted).not.toBe(mounted);
+      expect(restarted?.startTime).toBe(0);
+    });
+  },
 };

@@ -17,6 +17,7 @@
  * under the License.
  */
 
+import { readBoundedResponseText } from '@maka/core/bounded-response';
 import { Readability } from '@mozilla/readability';
 import { parseHTML } from 'linkedom';
 import TurndownService from 'turndown';
@@ -105,7 +106,11 @@ export function createLocalWebFetchExecutor(input: LocalWebFetchInput): WebFetch
             : String(response.status);
           throw new Error(`WebFetch HTTP error: ${status}`);
         }
-        const body = await readBoundedText(response);
+        const body = await readBoundedResponseText(
+          response,
+          WEB_FETCH_RESPONSE_MAX_BYTES,
+          responseLimitError,
+        );
         const contentType = response.headers.get('content-type')?.toLowerCase() ?? '';
         const content =
           contentType.includes('text/html') || contentType.includes('application/xhtml+xml')
@@ -123,51 +128,11 @@ export function createLocalWebFetchExecutor(input: LocalWebFetchInput): WebFetch
   };
 }
 
-async function readBoundedText(response: Response): Promise<string> {
-  const contentLength = Number(response.headers.get('content-length'));
-  if (Number.isFinite(contentLength) && contentLength > WEB_FETCH_RESPONSE_MAX_BYTES) {
-    await response.body?.cancel();
-    throw responseLimitError();
-  }
-  if (!response.body) return '';
-
-  const reader = response.body.getReader();
-  const decoder = responseTextDecoder(response);
-  let bytes = 0;
-  let text = '';
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      bytes += value.byteLength;
-      if (bytes > WEB_FETCH_RESPONSE_MAX_BYTES) {
-        await reader.cancel();
-        throw responseLimitError();
-      }
-      text += decoder.decode(value, { stream: true });
-    }
-    return text + decoder.decode();
-  } finally {
-    reader.releaseLock();
-  }
-}
-
-function responseTextDecoder(response: Response): TextDecoder {
-  const contentType = response.headers.get('content-type') ?? '';
-  const charset = /(?:^|;)\s*charset\s*=\s*"?([^;"\s]+)/i.exec(contentType)?.[1];
-  if (!charset) return new TextDecoder();
-  try {
-    return new TextDecoder(charset);
-  } catch {
-    return new TextDecoder();
-  }
-}
-
 function responseLimitError(): Error {
   return new Error('WebFetch response exceeds the 5 MB response limit.');
 }
 
-function assertAllowedTarget(url: URL): void {
+export function assertAllowedTarget(url: URL): void {
   if (url.protocol !== 'http:' && url.protocol !== 'https:') {
     throw new Error('WebFetch URL must use HTTP or HTTPS.');
   }
@@ -195,21 +160,32 @@ function htmlToMarkdown(html: string, pageUrl: string): string {
   assertSafeHtmlNesting(html);
   const { document } = parseHTML(html);
   const baseHref = document.querySelector('base[href]')?.getAttribute('href');
-  let linkBaseUrl = pageUrl;
+  let baseUrl = pageUrl;
   if (baseHref) {
     try {
-      linkBaseUrl = new URL(baseHref, pageUrl).toString();
+      baseUrl = new URL(baseHref, pageUrl).toString();
     } catch {
       // Fall back to the response URL for a malformed page-authored base URL.
     }
   }
-  for (const element of document.querySelectorAll<HTMLElement>('[href]')) {
-    const href = element.getAttribute('href');
-    if (!href) continue;
-    try {
-      element.setAttribute('href', new URL(href, linkBaseUrl).toString());
-    } catch {
-      // Keep malformed page-authored links as-is.
+  const documentBase = document.querySelector('base') ?? document.createElement('base');
+  documentBase.setAttribute('href', baseUrl);
+  if (!documentBase.parentNode) document.head?.prepend(documentBase);
+  // Turndown renders both `<a href>` and `<img src>` as Markdown links, so each
+  // has to carry an absolute URL: a relative path stops meaning anything once
+  // the model reads the Markdown apart from the page it was extracted from.
+  for (const [selector, attribute] of [
+    ['[href]', 'href'],
+    ['img[src]', 'src'],
+  ] as const) {
+    for (const element of document.querySelectorAll<HTMLElement>(selector)) {
+      const value = element.getAttribute(attribute);
+      if (!value) continue;
+      try {
+        element.setAttribute(attribute, new URL(value, baseUrl).toString());
+      } catch {
+        // Keep malformed page-authored values as-is.
+      }
     }
   }
   const article = new Readability(document as unknown as Document).parse();

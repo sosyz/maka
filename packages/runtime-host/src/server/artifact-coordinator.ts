@@ -17,10 +17,13 @@
  * under the License.
  */
 
+import type { ChatImageDeliveryService } from './chat-image-delivery.js';
+import { JsonArrayPageBudget } from './json-array-page-budget.js';
+
 import { createHash } from 'node:crypto';
 import { attachmentKindFromMimeType } from '@maka/core/attachments';
 import type { AttachmentRef } from '@maka/core/events';
-import type { ArtifactRecord } from '@maka/core/artifacts';
+import { isArtifactSharedSessionReadable, type ArtifactRecord } from '@maka/core/artifacts';
 import {
   authenticateInteractiveArtifactStoreWriter,
   sanitizeArtifactName,
@@ -51,8 +54,6 @@ import { ConnectionBoundChunkUploads } from './connection-bound-chunk-uploads.js
 const MAX_ACTIVE_ARTIFACT_UPLOADS = 16;
 const MAX_STAGED_ARTIFACT_UPLOAD_BYTES = 128 * 1024 * 1024;
 const ARTIFACT_UPLOAD_TTL_MS = 5 * 60 * 1000;
-const SHARED_ARTIFACT_SOURCES = new Set(['user_upload', 'tool_result']);
-
 interface ArtifactUploadMetadata {
   readonly attachmentKind: AttachmentRef['kind'];
   readonly name: string;
@@ -63,6 +64,13 @@ interface ArtifactUploadMetadata {
 /** Session-scoped Host projection and deletion authority for Artifacts. */
 export class HostArtifactCoordinator {
   readonly handlers: ArtifactOperationHandlerMap = {
+    'artifact.image.resolve': async (input, context) => {
+      if (context.principalKind === 'session_guest' || !this.imageDelivery)
+        return { ok: true, result: { status: 'unavailable' } };
+      if ((await this.#sessions.probeSessionRemoval(input.sessionId)).kind !== 'present')
+        return { ok: false, error: { code: 'not_found', message: 'Session was not found' } };
+      return { ok: true, result: await this.imageDelivery.resolve(input) };
+    },
     'artifact.ingest': (input, context) =>
       this.#sessionAdmission.run(input.sessionId, () => this.#ingest(input, context)),
     'artifact.query': (input, context) =>
@@ -79,6 +87,7 @@ export class HostArtifactCoordinator {
     | Pick<RuntimeHostAccessAuthority, 'activeSessionGrant'>
     | undefined;
   readonly #uploads: ConnectionBoundChunkUploads<ArtifactUploadMetadata>;
+  readonly #onArtifactDeleted: ((sessionId: string, artifactId: string) => void) | undefined;
 
   constructor(
     store: InteractiveArtifactStoreWriter,
@@ -87,12 +96,15 @@ export class HostArtifactCoordinator {
     sessions: SessionPresenceReader,
     now: () => number = Date.now,
     sessionAccessAuthority?: Pick<RuntimeHostAccessAuthority, 'activeSessionGrant'>,
+    onArtifactDeleted?: (sessionId: string, artifactId: string) => void,
+    private readonly imageDelivery?: ChatImageDeliveryService,
   ) {
     this.#store = authenticateInteractiveArtifactStoreWriter(store);
     this.#requestDrain = requestDrain;
     this.#sessionAdmission = sessionAdmission;
     this.#sessions = sessions;
     this.#sessionAccessAuthority = sessionAccessAuthority;
+    this.#onArtifactDeleted = onArtifactDeleted;
     this.#uploads = new ConnectionBoundChunkUploads(
       {
         maxActive: MAX_ACTIVE_ARTIFACT_UPLOADS,
@@ -120,7 +132,7 @@ export class HostArtifactCoordinator {
       }
       const entry = await this.#store.getInSession(sessionId, attachment.ref.relativePath);
       const record = entry.record;
-      if (!record || record.status !== 'live') return 'Attachment Artifact was not found';
+      if (!record) return 'Attachment Artifact was not found';
       if (
         record.name !== attachment.name ||
         record.mimeType !== attachment.mimeType ||
@@ -148,6 +160,8 @@ export class HostArtifactCoordinator {
   ): Promise<OperationOutcome<'artifact.ingest'>> {
     try {
       if ((await this.#sessions.probeSessionRemoval(input.sessionId)).kind !== 'present') {
+        // Session removal can race an upload; release only this owner's staged bytes.
+        this.#uploads.abort(uploadKey(input.sessionId, input.uploadId), context);
         return ingestFailure('not_found', 'Session was not found');
       }
       switch (input.kind) {
@@ -311,7 +325,7 @@ export class HostArtifactCoordinator {
     );
     const record = entry.record;
     if (!record) return { kind: 'missing' };
-    if (record.status !== 'live' || record.source !== 'user_upload' || record.turnId !== uploadId) {
+    if (record.source !== 'user_upload' || record.turnId !== uploadId) {
       return { kind: 'conflict' };
     }
     return { kind: 'committed', record };
@@ -363,7 +377,7 @@ export class HostArtifactCoordinator {
           maxBytes: ARTIFACT_READ_CHUNK_MAX_BYTES,
         });
         if (!chunk.ok) {
-          if (chunk.reason === 'not_found' || chunk.reason === 'deleted') {
+          if (chunk.reason === 'not_found') {
             return notFound('artifact.query', 'Artifact was not found');
           }
           if (chunk.reason === 'out_of_range') {
@@ -443,9 +457,7 @@ export class HostArtifactCoordinator {
     );
     if (!grant) return;
     const entry = await this.#store.getInSession(input.sessionId, input.artifactId);
-    return entry.record?.status === 'live' &&
-      entry.record.source !== undefined &&
-      SHARED_ARTIFACT_SOURCES.has(entry.record.source)
+    return entry.record && isArtifactSharedSessionReadable(entry.record)
       ? grant.grantId
       : undefined;
   }
@@ -488,16 +500,14 @@ export class HostArtifactCoordinator {
           ok: false,
           error: {
             code: 'operation_conflict',
-            message: 'Protected runtime evidence cannot be deleted through Runtime Host',
+            message: 'Runtime-owned evidence cannot be deleted independently of its workflow',
           },
         };
       }
+      this.#onArtifactDeleted?.(input.sessionId, input.artifactId);
       return {
         ok: true,
-        result: encodeArtifactDeleteResult({
-          kind: 'deleted',
-          artifact: encodeArtifactProjection(deleted.record),
-        }),
+        result: encodeArtifactDeleteResult({ kind: 'deleted' }),
       };
     } catch {
       this.#requestDrain();
@@ -514,18 +524,17 @@ function createPage(
   offset: number,
 ): ArtifactQueryResult {
   const pageArtifacts: ArtifactProjection[] = [];
+  const budget = new JsonArrayPageBudget(ARTIFACT_RESULT_MAX_BYTES, {
+    kind: 'page',
+    sessionId,
+    revision,
+    artifacts: [],
+    nextCursor: null,
+  });
   for (const record of records) {
     const artifact = encodeArtifactProjection(record);
-    const candidateArtifacts = [...pageArtifacts, artifact];
-    const nextOffset = offset + candidateArtifacts.length;
-    const candidate: ArtifactQueryResult = {
-      kind: 'page',
-      sessionId,
-      revision,
-      artifacts: candidateArtifacts,
-      nextCursor: nextOffset < total ? String(nextOffset) : null,
-    };
-    if (Buffer.byteLength(JSON.stringify(candidate), 'utf8') > ARTIFACT_RESULT_MAX_BYTES) {
+    const nextOffset = offset + pageArtifacts.length + 1;
+    if (!budget.tryAppend(artifact, nextOffset < total ? String(nextOffset) : null)) {
       if (pageArtifacts.length === 0) {
         throw new Error('A canonical Artifact cannot fit in one page');
       }

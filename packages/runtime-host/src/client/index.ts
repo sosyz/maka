@@ -17,12 +17,19 @@
  * under the License.
  */
 
+export * from './host-handoff.js';
+export { formatHostHandoff, type HostHandoffPresentation } from './host-handoff-copy.js';
 export {
   RuntimeHostManagedActivationError,
   activateRuntimeHostManagedDeployment,
   type ActivateRuntimeHostManagedDeploymentInput,
   type RuntimeHostManagedActivationErrorCode,
 } from './managed-activation.js';
+export {
+  decodeRuntimeHostWebRtcStunPolicy,
+  resolveRuntimeHostWebRtcStunUrls,
+  type RuntimeHostWebRtcStunPolicy,
+} from '../webrtc-stun-policy.js';
 export { openRuntimeHostManagedStdioBridge } from './managed-stdio-bridge.js';
 export {
   connectRuntimeHost,
@@ -31,6 +38,7 @@ export {
   RuntimeHostOperationError,
   RuntimeHostRequestInterruptedError,
   type RuntimeHostConnection,
+  type RuntimeHostPeerConnectionPath,
   type DirectRequestOperationKey,
 } from './connection.js';
 export {
@@ -39,21 +47,32 @@ export {
   type RuntimeHostRetirementPreparation,
 } from './host-retirement.js';
 export {
+  forceTerminateObservedRegisteredRuntimeHost,
+  type ObservedRegisteredRuntimeHost,
+  type ObservedRegisteredRuntimeHostTerminationAuthority,
+} from './registered-host-termination.js';
+export type { RuntimeHostProcessIdentity } from './process-identity.js';
+export {
   LOCAL_RUNTIME_HOST_PROFILE,
   RUNTIME_HOST_ACCESS_CREDENTIAL_MAX_BYTES,
   createClientRuntimeHostCredentialStore,
   createClientRuntimeHostProfileCatalog,
   createFileRuntimeHostProfileCatalog,
+  createRuntimeHostCapabilityProviderCredentialStore,
   createRuntimeHostProfileCredentialStore,
   connectRuntimeHostProfile,
+  sameEnvironmentRuntimeHostDeployment,
   connectRemoteRuntimeHostProfile,
   decodeEnvironmentRuntimeHostProfile,
   decodePersistedRuntimeHostProfile,
   decodeRemoteRuntimeHostProfile,
+  migrateRuntimeHostProfileOperatorCommand,
   remoteRuntimeHostUnavailableError,
   runtimeHostProfileAccess,
+  runtimeHostProfileTargetFingerprint,
   sameRemoteRuntimeHostProfileTarget,
   sameResolvedRuntimeHostProfileTarget,
+  subscribeClientRuntimeHostProfileCatalogChanges,
   type EnvironmentRuntimeHostProfile,
   type PersistedRuntimeHostProfile,
   type RemoteRuntimeHostProfile,
@@ -62,6 +81,11 @@ export {
   type RuntimeHostProfile,
   type RuntimeHostProfileAccess,
   type RuntimeHostProfileCatalog,
+  type RuntimeHostConnectionPhase,
+  type RuntimeHostRemoteProfileIncarnation,
+  type RuntimeHostCapabilityProviderCredentialStore,
+  RuntimeHostProfileConnectionError,
+  type RuntimeHostProfileConnectionFailureReason,
   type RuntimeHostProfileDocument,
 } from './host-profile.js';
 export {
@@ -73,6 +97,7 @@ export {
 export {
   RuntimeHostSshOperatorActivationError,
   activateRuntimeHostSshOperator,
+  runtimeHostSshOperatorRemoteCommand,
   type RuntimeHostSshOperatorActivationInput,
 } from './ssh-operator-activation.js';
 export {
@@ -86,6 +111,7 @@ export {
 } from './ssh-tunnel.js';
 export {
   RuntimeHostPermanentReconnectError,
+  createRuntimeHostReconnectLifecycle,
   startRuntimeHostReconnectLifecycle,
   type RuntimeHostReconnectBackoff,
   type RuntimeHostReconnectLifecycle,
@@ -97,6 +123,8 @@ export {
 } from './remote-compatibility-error.js';
 export {
   RuntimeHostSubscriptionError,
+  SessionRemovedSubscriptionError,
+  subscriptionClosedError,
   type DecodedSessionTranscriptPage,
   type RuntimeHostSessionSubscription,
 } from './session-subscription.js';
@@ -108,36 +136,48 @@ export {
   connectRuntimeHostWslEnvironment,
   listRuntimeHostWslDistributions,
   normalizeRuntimeHostWslDistribution,
-  normalizeRuntimeHostWslOperatorPath,
   resolveSystemRuntimeHostWslExecutable,
   type RuntimeHostWslEnvironmentInput,
   type RuntimeHostWslProcessFactory,
 } from './wsl-environment.js';
 export {
   RuntimeHostCatalogReadError,
+  RuntimeHostSessionCatalogRevisionChangedError,
   readRuntimeHostConnectionCatalog,
   readRuntimeHostInvocableSkills,
   readRuntimeHostProjectDetails,
   readRuntimeHostResources,
   readRuntimeHostProjects,
+  readRuntimeHostSessionCatalogPage,
   readRuntimeHostSessions,
   readRuntimeHostSkillCatalog,
+  type RuntimeHostSessionCatalogPage,
+  type RuntimeHostSessionCatalogPageCursor,
+  type RuntimeHostConnectionCatalogEntry,
+  type RuntimeHostConnectionCatalogSnapshot,
 } from './catalog-reader.js';
 export {
+  DEFAULT_ELECTION_DEADLINE_MS,
+  ELECTION_DEADLINE_MS_ENV_VAR,
+  IDLE_GRACE_MS_ENV_VAR,
   connectOrSpawnRuntimeHost,
+  electionDeadlineMsFromEnvironment,
   type CandidateExitDetails,
   type ConnectOrSpawnRuntimeHostInput,
   type ConnectOrSpawnRuntimeHostResult,
   type RuntimeHostElectionDiagnostic,
   type RuntimeHostSpawnedProcess,
 } from './connect-or-spawn.js';
-export { waitForRuntimeHostReady } from './wait-for-ready.js';
+export { abortable, waitForRuntimeHostReady } from './wait-for-ready.js';
 export {
   createRuntimeHostCandidateLaunchBarrier,
   type RuntimeHostCandidateLaunchBarrier,
 } from './candidate-launch-barrier.js';
 export { runHostedExecution, type RunHostedExecutionInput } from './hosted-execution.js';
-export { type ClientCapabilityProvider } from './client-capability.js';
+export {
+  type ClientCapabilityProvider,
+  type ClientCapabilityRegistrationOptions,
+} from './client-capability.js';
 export {
   readRuntimeHostAgentGraphEpochs,
   type AgentGraphEpochDirectory,
@@ -152,12 +192,16 @@ export { consumeAccessCredentialDelivery } from '../control/access-credential-de
 export {
   decodeRuntimeHostOwnerConnectionCode,
   encodeRuntimeHostOwnerConnectionCode,
+  issueRuntimeHostOwnerConnectionCode,
+  REMOTE_DESKTOP_OWNER_ACCESS_POLICY,
+  type IssueRuntimeHostOwnerConnectionCodeInput,
   type RuntimeHostOwnerConnectionCode,
 } from './owner-connection-code.js';
-export { ensureRuntimeHostPeerIdentity } from '../transport/peer-native.js';
+export { ensureRuntimeHostPeerIdentity, RuntimeHostPeerError } from '../transport/peer-native.js';
 export {
   createRuntimeHostPeerClient,
   createRuntimeHostPeerClientFromEnvironment,
+  RuntimeHostPeerReachabilityUnavailableError,
   type RuntimeHostPeerClient,
   type RuntimeHostPeerConnectInput,
 } from './peer-client.js';

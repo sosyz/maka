@@ -18,7 +18,7 @@
  */
 
 import { _electron as electron, test as base, expect } from '@playwright/test';
-import type { ElectronApplication, Page } from '@playwright/test';
+import type { ElectronApplication, Locator, Page, TestInfo } from '@playwright/test';
 import { execFile } from 'node:child_process';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -32,7 +32,11 @@ import {
   tryAcquireInteractiveRootOwner,
 } from '@maka/storage/root-authority';
 import { openInteractiveRuntimePolicyStoresForWrite } from '@maka/storage/runtime-policy-stores';
-import { buildFixtureEnv, isCiLinuxDisplay } from '../../../scripts/fixture-env.mjs';
+import {
+  buildFixtureEnv,
+  inactiveWindowPlatformArgs,
+  isCiLinuxDisplay,
+} from '../../../scripts/fixture-env.mjs';
 import { closeElectronApplication } from '../../../scripts/electron-lifecycle.mjs';
 
 const DESKTOP_ROOT = process.cwd();
@@ -72,18 +76,25 @@ export async function ensureSidebarExpanded(page: Page): Promise<void> {
 }
 
 /**
- * Wait for the default Host's Coordination Session and the WorkHub projection
- * to agree that the surface is ready. A mounted WorkHub main is not sufficient:
- * it is also rendered while the Host reconnects and the projection reloads.
+ * Wait until Enter can submit this non-empty draft to its selected target.
+ * The control reflects local admission readiness, not Host connectivity.
+ * Merely mounting the editor does not mean target selection has finished.
  */
-export async function waitForWorkHubReady(page: Page, workCount: number): Promise<void> {
-  await expect
-    .poll(async () => {
-      const snapshot = await page.evaluate(() => window.maka.runtimeHostProfiles.getSnapshot());
-      return snapshot.entries.find(({ isDefault }) => isDefault)?.readiness;
-    })
-    .toBe('ready');
-  await expect(page.getByText(`${workCount} 项工作`, { exact: true })).toBeVisible();
+export async function awaitSendReady(page: Page | Locator): Promise<void> {
+  await expect(page.locator('.maka-composer button[type="submit"]')).toBeEnabled({
+    timeout: 20_000,
+  });
+}
+
+/** The persistent WorkHub WebContentsView is a distinct renderer, not part of the main DOM. */
+export async function getWorkHubPage(app: ElectronApplication): Promise<Page> {
+  let view: Page | undefined;
+  await expect.poll(() => {
+    view = app.context().pages().find((candidate) => new URL(candidate.url()).searchParams.get('surface') === 'workhub');
+    return Boolean(view);
+  }).toBe(true);
+  await expect(view!.locator('.workHubLive .maka-composer-editor')).toBeVisible();
+  return view!;
 }
 
 /**
@@ -173,7 +184,7 @@ async function seedE2eConnection(userDataDir: string): Promise<void> {
   }
 }
 
-async function seedE2eLocale(userDataDir: string, locale: 'zh' | 'en'): Promise<void> {
+async function seedE2eLocale(userDataDir: string, locale: 'zh-CN' | 'zh-TW' | 'en'): Promise<void> {
   const workspaceRoot = path.join(userDataDir, 'workspaces', 'default');
   await createSettingsStore(workspaceRoot).update({
     personalization: { uiLocale: locale },
@@ -194,6 +205,24 @@ async function seedRailRenderSessions(userDataDir: string): Promise<void> {
         model: 'claude-sonnet-4-5-20250929',
         permissionMode: 'ask',
         name: `Rail row ${index}`,
+        labels: [],
+      });
+    }
+  } finally {
+    await store.close?.();
+  }
+}
+
+async function seedOnboardingPerfSessions(userDataDir: string, count: number): Promise<void> {
+  const store = createSessionStore(path.join(userDataDir, 'workspaces', 'default'));
+  try {
+    for (let index = 0; index < count; index += 1) {
+      await store.create({
+        cwd: path.join(userDataDir, 'project'),
+        llmConnectionSlug: 'e2e',
+        model: 'claude-sonnet-4-5-20250929',
+        permissionMode: 'ask',
+        name: `Onboarding perf row ${index}`,
         labels: [],
       });
     }
@@ -266,7 +295,7 @@ async function seedE2eInvocableSkills(userDataDir: string): Promise<void> {
     mkdir(path.join(projectSkillRoot, 'project-only'), { recursive: true }),
     mkdir(path.join(projectSkillRoot, 'host-incompatible'), { recursive: true }),
     mkdir(path.join(projectSkillRoot, 'agent-write'), { recursive: true }),
-    mkdir(path.join(projectSkillRoot, 'deep-research-only'), { recursive: true }),
+    mkdir(path.join(projectSkillRoot, 'unavailable-tool'), { recursive: true }),
     mkdir(path.join(workspaceSkillRoot, 'workspace-only'), { recursive: true }),
     mkdir(path.join(userSkillRoot, 'user-only'), { recursive: true }),
   ]);
@@ -292,8 +321,8 @@ async function seedE2eInvocableSkills(userDataDir: string): Promise<void> {
       'utf8',
     ),
     writeFile(
-      path.join(projectSkillRoot, 'deep-research-only', 'SKILL.md'),
-      `---\nname: Deep Research Only\ndescription: Requires a tool available only in Deep Research mode.\nrequired-tools: [deep_research_status]\n---\n# Deep Research Only`,
+      path.join(projectSkillRoot, 'unavailable-tool', 'SKILL.md'),
+      `---\nname: Unavailable Tool\ndescription: Requires a tool unavailable on this Host.\nrequired-tools: [unavailable_fixture_tool]\n---\n# Unavailable Tool`,
       'utf8',
     ),
     writeFile(
@@ -379,27 +408,30 @@ async function seedCurrentProject(workspaceRoot: string, projectRoot: string): P
  * and `launchE2eApp` outside the try, so a readiness timeout left a zombie
  * Electron and a leaked `maka-e2e-*` directory.
  */
-async function withE2eWindow(
+export async function withE2eWindow(
   {
     seed,
     readinessSelector,
+    readinessTimeoutMs = 20_000,
     e2eFixtureScenario,
     locale,
     platform,
     showWindow,
-    scrollMotion,
     invocableSkills,
     gitReviewExtraFiles,
     parentRemovalSessions,
     railRenderSessions,
+    onboardingPerfSessions,
     newTaskProject,
+    tracePath,
+    testInfo,
   }: {
     seed: boolean;
     readinessSelector: string;
+    /** Raise only for a scenario whose seeding is itself heavy enough to delay the first paint. */
+    readinessTimeoutMs?: number;
     e2eFixtureScenario?: string;
-    locale?: 'zh' | 'en';
-    /** Opt this window back into animated scrolling; see `scroll-motion-policy`. */
-    scrollMotion?: 'auto' | 'smooth';
+    locale?: 'zh-CN' | 'zh-TW' | 'en';
     /** #1312: force app:info's platform so the window boots natively into that platform's `data-os` cascade. */
     platform?: 'darwin' | 'win32' | 'linux';
     /** Show fixtures whose contract depends on compositor-paced frames. */
@@ -408,9 +440,13 @@ async function withE2eWindow(
     gitReviewExtraFiles?: number;
     parentRemovalSessions?: boolean;
     railRenderSessions?: boolean;
+    onboardingPerfSessions?: number;
     newTaskProject?: boolean;
+    tracePath?: string;
+    /** Attaches captured main/renderer console output when the test fails. */
+    testInfo?: TestInfo;
   },
-  use: (page: Page, context: { userDataDir: string }) => Promise<void>,
+  use: (page: Page, context: { userDataDir: string; app: ElectronApplication; restart(beforeReady?: (app: ElectronApplication) => Promise<void>): Promise<Page> }) => Promise<void>,
 ): Promise<void> {
   const userDataDir = await mkdtemp(path.join(tmpdir(), 'maka-e2e-'));
   // Lives inside the throwaway userData dir so the existing teardown removes
@@ -418,12 +454,16 @@ async function withE2eWindow(
   const homeDir = path.join(userDataDir, 'home');
   await mkdir(homeDir, { recursive: true });
   let app: ElectronApplication | undefined;
+  let traceStarted = false;
   const mainLogs: string[] = [];
   const rendererLogs: string[] = [];
   try {
     if (seed) await seedE2eConnection(userDataDir);
     if (parentRemovalSessions) await seedParentRemovalSessions(userDataDir);
     if (railRenderSessions) await seedRailRenderSessions(userDataDir);
+    if (onboardingPerfSessions !== undefined) {
+      await seedOnboardingPerfSessions(userDataDir, onboardingPerfSessions);
+    }
     if (invocableSkills) await seedE2eInvocableSkills(userDataDir);
     if (gitReviewExtraFiles !== undefined) {
       await seedE2eGitReviewProject(userDataDir, gitReviewExtraFiles);
@@ -432,17 +472,20 @@ async function withE2eWindow(
     // Legacy E2E specs assert Chinese labels and should not inherit the CI
     // host locale. E2e-fixture workspaces use the explicit renderer override.
     if (locale && !e2eFixtureScenario) await seedE2eLocale(userDataDir, locale);
+    // xvfb throttles a hidden window's compositor to ~1fps. Geometry fixtures
+    // opt in locally; on CI Linux every fixture is visible, because the display
+    // there is headless and no one is watching it.
+    const visibleWindow = showWindow || isCiLinuxDisplay();
     app = await electron.launch({
-      args: ['.'],
+      // A visible fixture window is revealed inactively, which needs XWayland
+      // on a native Wayland session.
+      args: ['.', ...(visibleWindow ? inactiveWindowPlatformArgs() : [])],
       cwd: DESKTOP_ROOT,
       env: buildFixtureEnv(userDataDir, homeDir, {
         scenario: e2eFixtureScenario,
         locale,
         platform,
-        scrollMotion,
-        // xvfb throttles a hidden window's compositor to ~1fps. Geometry
-        // fixtures opt in locally; every fixture is visible on isolated CI X.
-        showWindow: showWindow || isCiLinuxDisplay(),
+        showWindow: visibleWindow,
       }),
     });
     app.on('console', (message) => {
@@ -465,9 +508,20 @@ async function withE2eWindow(
       rendererLogs.push(`[pageerror] ${error.stack ?? error.message}`);
       if (rendererLogs.length > 30) rendererLogs.shift();
     });
+    const watchCrash = (crashed: Page) => crashed.on('crash', () => {
+      rendererLogs.push(`[crash] ${crashed.url()}`);
+      if (rendererLogs.length > 30) rendererLogs.shift();
+    });
+    for (const existing of app.context().pages()) watchCrash(existing);
+    app.context().on('page', watchCrash);
+    if (tracePath) {
+      await mkdir(path.dirname(tracePath), { recursive: true });
+      await app.context().tracing.start({ snapshots: true });
+      traceStarted = true;
+    }
     // Centralize the cold-start wait so test bodies are flake-free under retries:0.
     try {
-      await page.waitForSelector(readinessSelector, { timeout: 20_000 });
+      await page.waitForSelector(readinessSelector, { timeout: readinessTimeoutMs });
       if (invocableSkills) {
         await waitForInvocableSkills(page, ['project-only', 'workspace-only']);
       }
@@ -477,49 +531,104 @@ async function withE2eWindow(
       const rendererDetail = rendererLogs.length > 0 ? `\nRenderer console:\n${rendererLogs.join('\n')}` : '';
       throw new Error(`${detail}${mainDetail}${rendererDetail}`, { cause: error });
     }
-    await use(page, { userDataDir });
+    try {
+      await use(page, { userDataDir, app, restart: async (beforeReady) => {
+      await closeElectronApplication(app!, 5_000);
+      app = await electron.launch({
+        args: ['.', ...(visibleWindow ? inactiveWindowPlatformArgs() : [])],
+        cwd: DESKTOP_ROOT,
+        env: buildFixtureEnv(userDataDir, homeDir, { scenario: e2eFixtureScenario, locale, platform, showWindow: visibleWindow }),
+      });
+      const restored = await app.firstWindow();
+      restored.on('crash', () => {
+        rendererLogs.push(`[crash] ${restored.url()}`);
+        if (rendererLogs.length > 30) rendererLogs.shift();
+      });
+      app.context().on('page', watchCrash);
+      await beforeReady?.(app);
+      await restored.waitForSelector(readinessSelector, { timeout: readinessTimeoutMs });
+      return restored;
+    } });
+    } catch (error) {
+      if (testInfo) {
+        // Assertion failures never reach the readiness-wait catch above, so
+        // the captured consoles would otherwise be lost with the page.
+        await testInfo.attach('renderer-console', {
+          body: rendererLogs.length > 0 ? rendererLogs.join('\n') : '(no renderer console output)',
+          contentType: 'text/plain',
+        });
+        await testInfo.attach('main-console', {
+          body: mainLogs.length > 0 ? mainLogs.join('\n') : '(no main console output)',
+          contentType: 'text/plain',
+        });
+      }
+      throw error;
+    }
   } finally {
     try {
-      if (app) await closeElectronApplication(app, 5_000);
+      try {
+        if (app && tracePath && traceStarted) {
+          await app.context().tracing.stop({ path: tracePath });
+        }
+      } finally {
+        if (app) await closeElectronApplication(app, 5_000);
+      }
     } finally {
       await rm(userDataDir, { recursive: true, force: true });
     }
   }
 }
 
-export const test = base.extend<{
+type E2eTestFixtures = {
+  sessionLocalWindow: { page: Page; app: ElectronApplication; restart(beforeReady?: (app: ElectronApplication) => Promise<void>): Promise<Page> };
   window: Page;
-  onboardingWindow: Page;
   gitReviewWindow: { page: Page; projectRoot: string };
   invocableSkillsWindow: Page;
-  linkColorWindow: Page;
   projectSidebarWindow: Page;
+  renameFocusWindow: { page: Page; app: ElectronApplication };
   parentRemovalWindow: Page;
   railRenderWindow: Page;
-  promptRailWindow: Page;
   partialHistoryWindow: Page;
-  promptRailMotionWindow: Page;
-  requestHeaderRowWindow: Page;
+  largeHistoryWindow: { page: Page; app: ElectronApplication };
   newTaskTargetWindow: Page;
-}>({
-  // Seeded: a pre-staged connection clears onboarding so the composer is ready.
-  window: async ({}, use) => {
-    await withE2eWindow({ seed: true, readinessSelector: COMPOSER_INPUT, locale: 'zh' }, use);
-  },
-  onboardingWindow: async ({}, use) => {
-    await withE2eWindow({
-      seed: false,
-      readinessSelector: '[data-maka-contract="onboarding-card"]',
-      locale: 'zh',
-      showWindow: true,
-    }, use);
-  },
-  gitReviewWindow: async ({}, use) => {
+  directoryReferenceWindow: { page: Page; folder: string };
+  accessibilityNarrativeWindow: Page;
+};
+
+export const test = base.extend<E2eTestFixtures>({
+  sessionLocalWindow: async ({}, use, testInfo) => {
     await withE2eWindow(
-      {
+      { testInfo, seed: true, readinessSelector: COMPOSER_INPUT, locale: 'zh-CN', showWindow: true },
+      async (page, { app, restart }) => use({ page, app, restart }),
+    );
+  },
+  directoryReferenceWindow: async ({}, use, testInfo) => {
+    await withE2eWindow(
+      { testInfo, seed: true, readinessSelector: COMPOSER_INPUT, locale: 'zh-CN', showWindow: true },
+      async (page, { userDataDir, app }) => {
+        const folder = path.join(userDataDir, 'referenced-source');
+        await mkdir(path.join(folder, 'nested'), { recursive: true });
+        await writeFile(path.join(folder, 'README.md'), 'DO_NOT_READ_FILE_CONTENTS');
+        await writeFile(path.join(folder, 'nested', 'deep.txt'), 'DO_NOT_DESCEND');
+        // Replace only the OS chooser. IPC, Host admission, message delivery,
+        // event persistence and rendering still run through the real stack.
+        await app.evaluate(({ dialog }, selectedPath) => {
+          dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [selectedPath] });
+        }, folder);
+        await use({ page, folder });
+      },
+    );
+  },
+  // Seeded: a pre-staged connection clears onboarding so the composer is ready.
+  window: async ({}, use, testInfo) => {
+    await withE2eWindow({ testInfo, seed: true, readinessSelector: COMPOSER_INPUT, locale: 'zh-CN' }, use);
+  },
+  gitReviewWindow: async ({}, use, testInfo) => {
+    await withE2eWindow(
+      { testInfo,
         seed: true,
         readinessSelector: COMPOSER_INPUT,
-        locale: 'zh',
+        locale: 'zh-CN',
         gitReviewExtraFiles: 0,
       },
       async (page, context) => {
@@ -531,115 +640,119 @@ export const test = base.extend<{
     );
   },
   // Project + workspace Skills for draft/chip journeys.
-  invocableSkillsWindow: async ({}, use) => {
-    await withE2eWindow({
+  invocableSkillsWindow: async ({}, use, testInfo) => {
+    await withE2eWindow({ testInfo,
       seed: true,
       readinessSelector: COMPOSER_INPUT,
-      locale: 'zh',
+      locale: 'zh-CN',
       invocableSkills: true,
     }, use);
   },
-  linkColorWindow: async ({}, use) => {
-    await withE2eWindow({
-      seed: false,
-      readinessSelector: '.settingsBotConfigDocLink',
-      e2eFixtureScenario: 'settings-bots-onboarding',
-    }, use);
-  },
-  // A real project with several sessions. Shown because the contract under
-  // test is native focus order across independently interactive row controls.
   // Seeded connection so the composer is ready, plus one registered Project so
   // the workspace picker under it has a second target to move to.
-  newTaskTargetWindow: async ({}, use) => {
-    await withE2eWindow({
+  newTaskTargetWindow: async ({}, use, testInfo) => {
+    await withE2eWindow({ testInfo,
       seed: true,
       readinessSelector: COMPOSER_INPUT,
-      locale: 'zh',
+      locale: 'zh-CN',
       newTaskProject: true,
       showWindow: true,
     }, use);
   },
-  projectSidebarWindow: async ({}, use) => {
-    await withE2eWindow({
+  // A real project with several sessions. Hidden: a shown key window receives
+  // the physical cursor's mouse-moved events, which cancel the delayed hover
+  // card mid-test. CDP input needs no visible window, and the focus-order
+  // test drives synthetic Tab that never reaches native focus either way.
+  projectSidebarWindow: async ({}, use, testInfo) => {
+    await withE2eWindow({ testInfo,
       seed: false,
       readinessSelector: '[data-maka-contract="search-modal"][open]',
       e2eFixtureScenario: 'sidebar-search-modal-open',
-      locale: 'zh',
-      showWindow: true,
+      locale: 'zh-CN',
     }, use);
   },
-  parentRemovalWindow: async ({}, use) => {
+  // Visible because the contract under test is native keyboard delivery into
+  // the focused renderer element, not Playwright's synthetic page keyboard.
+  renameFocusWindow: async ({}, use, testInfo) => {
+    await withE2eWindow({ testInfo,
+      seed: false,
+      readinessSelector: '[data-maka-contract="search-modal"][open]',
+      e2eFixtureScenario: 'sidebar-search-modal-open',
+      locale: 'zh-CN',
+      showWindow: true,
+    }, async (page, { app }) => use({ page, app }));
+  },
+  parentRemovalWindow: async ({}, use, testInfo) => {
     await withE2eWindow(
-      {
+      { testInfo,
         seed: true,
         readinessSelector: COMPOSER_INPUT,
-        locale: 'zh',
+        locale: 'zh-CN',
         parentRemovalSessions: true,
       },
       use,
     );
   },
-  railRenderWindow: async ({}, use) => {
+  railRenderWindow: async ({}, use, testInfo) => {
     await withE2eWindow(
-      {
+      { testInfo,
         seed: true,
         readinessSelector: COMPOSER_INPUT,
-        locale: 'zh',
+        locale: 'zh-CN',
         railRenderSessions: true,
       },
       use,
     );
   },
-  // A multi-prompt transcript for the prompt anchor rail. Shown, because every
-  // assertion in prompt-rail.spec.ts is geometry the compositor has to settle.
-  promptRailWindow: async ({}, use) => {
-    await withE2eWindow({
-      seed: false,
-      // A rendered turn, deliberately not the rail: Playwright treats a
-      // zero-area element as hidden, so gating readiness on a tick would turn
-      // every rail regression into a 20s cold-start timeout instead of the
-      // assertion that names it.
-      readinessSelector: '[data-turn-id]',
-      e2eFixtureScenario: 'chat-prompt-rail',
-      showWindow: true,
-    }, use);
-  },
-  // A transcript larger than the bounded Desktop range. Clicking an unloaded
-  // prompt exercises the real load-around path and its partial-history UI.
-  partialHistoryWindow: async ({}, use) => {
-    await withE2eWindow({
+  // A transcript larger than the Desktop history budget, so earlier Turns load
+  // only through the load-earlier control.
+  partialHistoryWindow: async ({}, use, testInfo) => {
+    await withE2eWindow({ testInfo,
       seed: false,
       readinessSelector: '[data-turn-id]',
       e2eFixtureScenario: 'chat-partial-history',
-      locale: 'zh',
+      locale: 'zh-CN',
       showWindow: true,
     }, use);
   },
-  // The same transcript, scrolling the way the shipped app scrolls. Separate
-  // from `promptRailWindow` because it is only the jump that needs a scroll
-  // still in flight, and paying for one everywhere costs several seconds per
-  // window and settles less predictably.
-  promptRailMotionWindow: async ({}, use) => {
-    await withE2eWindow({
-      seed: false,
-      readinessSelector: '[data-turn-id]',
-      e2eFixtureScenario: 'chat-prompt-rail',
-      showWindow: true,
-      scrollMotion: 'smooth',
-    }, use);
+  // Three transcripts past the real 64 MiB history budget, for weighing what
+  // holding the loaded history costs the renderer. Writing them is hundreds of
+  // MiB of durable transcript, which is why the cold-start wait is raised.
+  largeHistoryWindow: async ({}, use, testInfo) => {
+    await withE2eWindow(
+      { testInfo,
+        seed: false,
+        readinessSelector: '[data-turn-id]',
+        readinessTimeoutMs: 300_000,
+        e2eFixtureScenario: 'chat-large-history',
+        locale: 'zh-CN',
+        showWindow: true,
+      },
+      async (page, { app }) => use({ page, app }),
+    );
   },
-  // Settings → 模型, where `no-models` is the seeded openai-compatible relay —
-  // the connection type whose detail page owns the custom request headers
-  // editor. Shown, because what this window is for is a rendered box
-  // measurement and a throttled compositor is not a layout the user has.
-  requestHeaderRowWindow: async ({}, use) => {
-    await withE2eWindow({
-      seed: false,
-      readinessSelector: '.settingsSurface',
-      e2eFixtureScenario: 'settings-models',
-      locale: 'zh',
-      showWindow: true,
-    }, use);
+  // A data-backed conversation with settled tool evidence and the workbar open
+  // beside it. Shown because the accessibility journey follows real native
+  // focus order through the transcript into the composer controls.
+  accessibilityNarrativeWindow: async ({}, use, testInfo) => {
+    await withE2eWindow(
+      { testInfo,
+        seed: false,
+        readinessSelector: '[data-turn-id]',
+        e2eFixtureScenario: 'turn-narrative',
+        locale: 'zh-CN',
+        showWindow: true,
+      },
+      async (page) => {
+        // `[data-turn-id]` can render before the deferred fixture application
+        // finishes opening its seeded Review face. Handing the page to a test
+        // at that point lets a test-opened face lose to the later fixture
+        // action. The visible seeded panel is the convergence point for both
+        // the transcript and the fixture-owned workbar state.
+        await expect(page.getByRole('region', { name: 'Git 变更' })).toBeVisible();
+        await use(page);
+      },
+    );
   },
 });
 

@@ -65,7 +65,6 @@ import {
   DEFAULT_SHELL_RUN_FLUSH_INTERVAL_MS,
   MAX_FOREGROUND_BASH_TIMEOUT_MS,
   MAX_SHELL_RUN_TIMEOUT_MS,
-  SHELL_RUN_CONTEXT_SUMMARY_LIMIT,
   ShellRunPtyControlClosedError,
   parseShellRunResourceRef,
   shellRunResourceRef,
@@ -254,6 +253,35 @@ interface SessionCloseLease {
 export class ShellRunProcessManager
   implements RuntimeResourceReader, BackgroundTaskStopper, PtyControlWriter
 {
+  private readonly changeListeners = new Map<string, Set<() => void>>();
+
+  /** Observation hints only; listeners never own processes or completion cleanup. */
+  subscribeChanges(
+    sessionId: string,
+    ref: string,
+    signal: AbortSignal,
+    changed: () => void,
+  ): { close(): void } {
+    const target = parseShellRunResourceRef(ref);
+    if (!target) throw new Error('Invalid background task reference');
+    if (signal.aborted) return { close() {} };
+    const key = JSON.stringify([sessionId, target.shellRunId]);
+    const listeners = this.changeListeners.get(key) ?? new Set<() => void>();
+    const listener = () => changed();
+    let closed = false;
+    const close = () => {
+      if (closed) return;
+      closed = true;
+      signal.removeEventListener('abort', close);
+      listeners.delete(listener);
+      if (listeners.size === 0) this.changeListeners.delete(key);
+    };
+    this.changeListeners.set(key, listeners);
+    listeners.add(listener);
+    signal.addEventListener('abort', close, { once: true });
+    return { close };
+  }
+
   private readonly live = new Map<string, LiveShellRun>();
   private readonly sessionCloseLeases = new Map<string, Set<symbol>>();
   private readonly sessionTerminationEpochs = new Map<string, number>();
@@ -391,7 +419,7 @@ export class ShellRunProcessManager
     let resizeChanged = false;
     let operationFailed = false;
     let exitBeforeControlCut = false;
-    const controlCut = live.collector.mutateAndSnapshotAtCut(() => {
+    const mutation = (): void => {
       if (input.abortSignal?.aborted) {
         throw abortError('WriteStdin aborted before the control operation was committed');
       }
@@ -434,14 +462,24 @@ export class ShellRunProcessManager
           this.handleIntegrityFailure(live, asError(error, 'PTY input write failed'));
         }
       }
-    });
-    const persistedControl = this.persistObservation(
-      live,
-      controlCut.then(
-        (snapshot) => (operationFailed || exitBeforeControlCut ? undefined : snapshot),
-        () => undefined,
-      ),
-    );
+    };
+    // Client control replies carry no output, so the keystroke path only needs
+    // the ordered mutation, not the snapshot + persist. The record still
+    // refreshes through output-driven flushes; a resize changes the screen
+    // without output, so that one is persisted eagerly.
+    const clientControl = input.caller === 'client';
+    const controlCut = clientControl
+      ? live.collector.mutateAtCut(mutation).then(() => undefined)
+      : live.collector.mutateAndSnapshotAtCut(mutation);
+    const persistedControl = clientControl
+      ? undefined
+      : this.persistObservation(
+          live,
+          controlCut.then(
+            (snapshot) => (operationFailed || exitBeforeControlCut ? undefined : snapshot),
+            () => undefined,
+          ),
+        );
     try {
       await controlCut;
     } catch (error) {
@@ -467,22 +505,27 @@ export class ShellRunProcessManager
       return shellRunContent(record, operation);
     }
     let record: ShellRunRecord;
-    try {
-      record = await persistedControl;
-    } catch (error) {
-      if (live.integrityFailure && !live.persistFailure) {
-        record = await this.markObserved(await live.finished.join());
-        return shellRunContent(
-          record,
-          ptyControlOperation(input, {
-            inputQueued,
-            resizeApplied,
-            resizeChanged,
-            failed: true,
-          }),
-        );
+    if (persistedControl) {
+      try {
+        record = await persistedControl;
+      } catch (error) {
+        if (live.integrityFailure && !live.persistFailure) {
+          record = await this.markObserved(await live.finished.join());
+          return shellRunContent(
+            record,
+            ptyControlOperation(input, {
+              inputQueued,
+              resizeApplied,
+              resizeChanged,
+              failed: true,
+            }),
+          );
+        }
+        throw error;
       }
-      throw error;
+    } else {
+      record = live.record;
+      if (resizeChanged) void this.persistObservation(live).catch(() => undefined);
     }
     if (live.integrityFailure && !live.persistFailure) {
       record = await this.markObserved(await live.finished.join());
@@ -496,15 +539,19 @@ export class ShellRunProcessManager
         }),
       );
     }
-    // persistObservation decides whether to join finalization at call time.
-    // A real PTY can exit while that persist is still in flight, leaving a
-    // running snapshot here even though finalizeOnce has already started.
-    if (live.driverExit || live.finalizeOnce) {
-      record = await this.markObserved(await live.finished.join());
-      return shellRunContent(record, operation);
-    }
-    if (isTerminalShellRunStatus(record.status)) record = await this.markObserved(record);
-    return shellRunContent(record, operation);
+    // The snapshot was captured before persistence. Exit can begin during that
+    // await, so every control response goes through the same final-record
+    // reconciliation rather than returning a stale running snapshot.
+    record = await this.reconcilePtyControlRecord(live, record);
+    return clientControl ? compactShellRunContent(record) : shellRunContent(record, operation);
+  }
+
+  private async reconcilePtyControlRecord(
+    live: LiveShellRun,
+    snapshot: ShellRunRecord,
+  ): Promise<ShellRunRecord> {
+    const record = live.driverExit || live.finalizeOnce ? await live.finished.join() : snapshot;
+    return isTerminalShellRunStatus(record.status) ? this.markObserved(record) : record;
   }
 
   async readRuntimeResource(
@@ -573,38 +620,13 @@ export class ShellRunProcessManager
     return shellRunContent(record, { kind: 'stop', applied });
   }
 
-  async buildContextSummary(sessionId: string): Promise<string | undefined> {
-    const records = (await this.actionableRecords(sessionId)).filter(
-      (record) => record.visibility !== 'user',
-    );
-    if (records.length === 0) return undefined;
-    const visible = records.slice(0, SHELL_RUN_CONTEXT_SUMMARY_LIMIT);
-    const lines = [
-      'Background tasks for this session:',
-      ...visible.map((record) => {
-        const completed =
-          record.completedAt !== undefined ? ` completedAt=${record.completedAt}` : '';
-        return `- ref=${shellRunResourceRef(record.shellRunId)} mode=${record.output.mode} status=${record.status} cwd=${record.cwd} updatedAt=${record.updatedAt}${completed} command=${JSON.stringify(record.command)}`;
-      }),
-    ];
-    const overflow = records.length - visible.length;
-    if (overflow > 0)
-      lines.push(`- ${overflow} more background task(s) not shown in this turn tail.`);
-    const hasControllablePty = records.some((record) => {
-      const live = this.liveResource(sessionId, record.shellRunId);
-      return live?.mode === 'pty' && isPtyControlOpen(live);
-    });
-    lines.push(
-      hasControllablePty
-        ? 'Use Read on a ref for its bounded output snapshot; use WriteStdin to control a running PTY task.'
-        : 'Use Read on a ref for its bounded output snapshot.',
-    );
-    return lines.join('\n');
-  }
-
   async listSessionUpdates(sessionId: string): Promise<ShellRunUpdate[]> {
     const records = await this.input.store.listSessionShellRuns(sessionId);
     return records.map(shellRunUpdate);
+  }
+
+  listRecoverySessionIds(): Promise<string[] | undefined> {
+    return this.input.store.listShellRunRecoverySessionIds?.() ?? Promise.resolve(undefined);
   }
 
   async getSessionUpdate(sessionId: string, ref: string): Promise<ShellRunUpdate | undefined> {
@@ -623,11 +645,19 @@ export class ShellRunProcessManager
     if (!target) return null;
     const live = this.live.get(target.shellRunId);
     if (!live || live.sessionId !== sessionId || live.mode !== 'pty') return null;
+    // The collector dies before the process exit lands: an integrity failure or
+    // startup cleanup leaves it throwing while `live` still looks attachable.
+    // Report the resource as gone so the caller repairs the stale record.
+    if (live.driverExit || live.finalizeOnce || live.integrityFailure) return null;
+    if (!live.collector.available) return null;
+    // Flush pending bytes first so the snapshot sequence always names the last
+    // published event the buffer already contains.
+    this.publishPtyData(live);
     return {
       sessionId,
       ref,
       sequence: live.rawSequence,
-      buffer: live.rawBuffer,
+      buffer: live.rawBuffer.slice(-PTY_RAW_REPLAY_CHARS),
       size: live.collector.currentSize(),
     };
   }
@@ -980,7 +1010,7 @@ export class ShellRunProcessManager
       sourceToolCallId: input.sourceToolCallId,
       ...(input.visibility === undefined ? {} : { visibility: input.visibility }),
       cwd: input.cwd,
-      command: redactSecrets(input.command),
+      command: input.command,
       status: 'starting',
       startedAt,
       updatedAt: startedAt,
@@ -1002,6 +1032,7 @@ export class ShellRunProcessManager
   private async markRunning(live: LiveShellRun): Promise<void> {
     live.record = await this.input.store.updateShellRun(live.sessionId, live.shellRunId, {
       status: 'running',
+      ...this.processPidPatch(live),
       output: (await this.snapshotAtCut(live, false)).output,
       updatedAt: this.input.now(),
     });
@@ -1010,6 +1041,12 @@ export class ShellRunProcessManager
     } else if (this.currentGeneration(live) > 0) {
       this.scheduleAutomaticFlush(live);
     }
+  }
+
+  private processPidPatch(live: LiveShellRun): Pick<ShellRunPatch, 'pid'> {
+    // A pipe command runs under an owning supervisor; report the command itself.
+    const pid = live.mode === 'pipes' ? live.driver.commandPid : live.driver.pid;
+    return pid !== undefined && Number.isSafeInteger(pid) && pid > 0 ? { pid } : {};
   }
 
   private onPipeData(live: LivePipeShellRun, stream: 'stdout' | 'stderr', data: string): void {
@@ -1022,14 +1059,18 @@ export class ShellRunProcessManager
 
   private onPtyData(live: LivePtyShellRun, data: string): void {
     if (live.driverExit || live.finalizeOnce) return;
-    live.rawBuffer = `${live.rawBuffer}${data}`.slice(-PTY_RAW_REPLAY_CHARS);
+    // Amortize the tail trim: slicing on every tiny node-pty event copies the
+    // whole 16K replay buffer per event.
+    live.rawBuffer += data;
+    if (live.rawBuffer.length > PTY_RAW_REPLAY_CHARS * 2) {
+      live.rawBuffer = live.rawBuffer.slice(-PTY_RAW_REPLAY_CHARS);
+    }
     live.collector.accept(data);
     for (const chunk of splitPtyData(data)) {
       const combined = `${live.pendingRawData}${chunk}`;
       if (live.pendingRawData && encodedPtyDataBytes(combined) > PTY_RAW_PUBLISH_MAX_BYTES) {
         this.publishPtyData(live);
       }
-      live.rawSequence += 1;
       live.pendingRawData += chunk;
       if (encodedPtyDataBytes(live.pendingRawData) >= PTY_RAW_PUBLISH_TARGET_BYTES) {
         this.publishPtyData(live);
@@ -1050,6 +1091,7 @@ export class ShellRunProcessManager
     const data = live.pendingRawData;
     if (!data) return;
     live.pendingRawData = '';
+    live.rawSequence += 1;
     const event: ShellRunPtyDataEvent = {
       sessionId: live.sessionId,
       ref: shellRunResourceRef(live.shellRunId),
@@ -1171,12 +1213,13 @@ export class ShellRunProcessManager
       failureStage = 'persist';
       if (live.persistFailure && !options.bestEffort) throw live.persistFailure;
       const current = live.record;
-      const candidate: ShellRunRecord = { ...current, ...patch, output: snapshot.output };
+      // ConPTY can publish its PID after admission, even without new output.
+      const update = { ...patch, ...this.processPidPatch(live), output: snapshot.output };
+      const candidate: ShellRunRecord = { ...current, ...update };
       let updated = current;
       if (!isDeepStrictEqual(candidate, current)) {
         updated = await this.input.store.updateShellRun(live.sessionId, live.shellRunId, {
-          ...patch,
-          output: snapshot.output,
+          ...update,
           updatedAt: this.input.now(),
         });
         live.record = updated;
@@ -1815,18 +1858,16 @@ export class ShellRunProcessManager
     }
   }
 
-  private async actionableRecords(sessionId: string): Promise<ShellRunRecord[]> {
-    const records = await this.input.store.listSessionShellRuns(sessionId);
-    return records
-      .filter(
-        (record) =>
-          isActiveShellRunStatus(record.status) ||
-          (record.observedAt === undefined && isTerminalShellRunStatus(record.status)),
-      )
-      .sort(compareActionableShellRuns);
-  }
-
   private notifyShellRunUpdate(record: ShellRunRecord): void {
+    for (const changed of this.changeListeners.get(
+      JSON.stringify([record.sessionId, record.shellRunId]),
+    ) ?? []) {
+      try {
+        changed();
+      } catch {
+        /* A hint consumer cannot interrupt other owners. */
+      }
+    }
     try {
       this.input.onShellRunUpdate?.(shellRunUpdate(record));
     } catch {
@@ -2042,16 +2083,6 @@ function startupCleanupError(startupError: Error, cleanupFailure: unknown): Erro
   );
 }
 
-function compareActionableShellRuns(a: ShellRunRecord, b: ShellRunRecord): number {
-  const rank = (record: ShellRunRecord) => (isActiveShellRunStatus(record.status) ? 1 : 0);
-  return (
-    rank(a) - rank(b) ||
-    b.updatedAt - a.updatedAt ||
-    b.startedAt - a.startedAt ||
-    a.shellRunId.localeCompare(b.shellRunId)
-  );
-}
-
 async function racePromiseWithAbort<T>(
   promise: Promise<T>,
   signal: AbortSignal | undefined,
@@ -2086,13 +2117,16 @@ function normalizeBackgroundTimeoutMs(value: number | undefined): number | undef
   return value;
 }
 
-function splitPtyData(data: string): string[] {
-  const codePoints = Array.from(data);
-  const chunks: string[] = [];
-  for (let offset = 0; offset < codePoints.length; offset += PTY_RAW_INPUT_CHUNK_CODE_POINTS) {
-    chunks.push(codePoints.slice(offset, offset + PTY_RAW_INPUT_CHUNK_CODE_POINTS).join(''));
+function* splitPtyData(data: string): Generator<string> {
+  // Bound each published piece without materializing the entire callback as code points.
+  let offset = 0;
+  while (offset < data.length) {
+    const start = offset;
+    for (let count = 0; count < PTY_RAW_INPUT_CHUNK_CODE_POINTS && offset < data.length; count++) {
+      offset += data.codePointAt(offset)! > 0xffff ? 2 : 1;
+    }
+    yield data.slice(start, offset);
   }
-  return chunks;
 }
 
 function encodedPtyDataBytes(data: string): number {

@@ -1,3 +1,15 @@
+---
+doc_id: astryx-alignment-inventory
+title: "Astryx alignment inventory"
+language: en
+source_language: en
+implementation_status: historical
+document_status: historical
+translation_status: source-only
+last_verified: 2026-09-28
+owners:
+  - maka-backend
+---
 <!--
   Licensed to the Apache Software Foundation (ASF) under one
   or more contributor license agreements.  See the NOTICE file
@@ -17,13 +29,15 @@
   under the License.
 -->
 
-> **Superseded for file-level coverage:** see [astryx-surface-file-inventory.md](./astryx-surface-file-inventory.md) (one row per product surface file). This document remains the family-level wiki map and fix log from the first alignment pass.
+> **Historical family-level fix log.** File-level coverage and current severities are generated in [astryx-surface-file-inventory.md](./astryx-surface-file-inventory.md). This document records the first alignment pass; its status cells and remaining-polish list are not a current backlog. On 2026-09-05, the generated check reported 249 files, 0 blockers, 0 reimplementations, 1 polish item, and 248 aligned files.
 
 # Astryx alignment inventory
 
-Maps [Astryx wiki](https://github.com/facebook/astryx/wiki) conventions onto
-Maka product surfaces. Severity: **blocker** (raw control when an Astryx twin
-exists / broken hierarchy) · **polish** (off-scale px, density).
+This pass mapped [Astryx wiki](https://github.com/facebook/astryx/wiki) conventions onto
+Maka product surfaces. At the time, severity meant **blocker** (raw control when an Astryx twin
+exists / broken hierarchy) · **reimplementation** (a public `@maka/ui` export
+shadows a shipped Astryx component — a review signal, not proof) · **polish**
+(off-scale px, density).
 
 ## Wiki smell checklist (searchable)
 
@@ -34,6 +48,7 @@ exists / broken hierarchy) · **polish** (off-scale px, density).
 | Design · radius | Nested radii not `outer − gap` | Role radii |
 | Design · elevation | Raw `box-shadow` / magic z-index | Elevation tokens |
 | API · Use the System | Raw `<button>` / `<input>` / `<select>` with Astryx twin | `Button`, `TextInput`, `Selector`, `List`/`Item`, `EmptyState`, `Dialog`, `ToggleButton`, `Collapsible`, `SegmentedControl` |
+| API · Use the System | Public `@maka/ui` export whose name shadows a shipped Astryx component (defined locally, not a re-export) | Re-export the Astryx component, or confirm the local one is intentional |
 | Theming | One-off hex for ladder roles | Bridge + product tokens |
 | Container padding | Product padding fighting `--container-padding-*` | Let Card/Section/Layout own inset |
 
@@ -64,7 +79,7 @@ exists / broken hierarchy) · **polish** (off-scale px, density).
 |---------|------|--------|
 | App shell / session list | SideNav | intentional raw siblings where nested button forbidden |
 | Composer | Raw hint/cancel buttons | **fixed → Button** |
-| Workbar tabs | Raw `role=tab` + dnd-kit | intentional (dnd + tablist; close is IconButton) |
+| Workbar tabs | Raw `role=tab` + dnd-kit | **fixed → Astryx `TabList`** (2026-09-05 rebuild; no dnd-kit remains) |
 | Workbar tool picker | Product-authored menu semantics and row chrome | **fixed → List + ListItem** |
 | Inspector failed filter | Raw toggle | **fixed → ToggleButton** |
 | Plan execution panel | Raw expand toggle | **fixed → Collapsible** |
@@ -90,7 +105,8 @@ exists / broken hierarchy) · **polish** (off-scale px, density).
 - Plan execution expand → Astryx `Collapsible`.
 - Workbar tool picker → Astryx `List` + `ListItem`; visible descriptions and native row interaction.
 
-## Remaining polish (non-blocker)
+## Remaining polish recorded by the first pass (historical)
 - Quote chips / prompt-rail ticks stay product-shaped hit targets.
-- Workbar tab strip stays custom for dnd-kit + `role=tab`.
 - Nested button prohibition on SideNavItem endContent (documented intentional).
+
+Run `npm run astryx:surface-inventory` for the current file universe and severity result.

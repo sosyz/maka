@@ -20,9 +20,9 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { expect } from './test-helpers.js';
 import {
   decodeMessageContent,
+  hasMeaningfulMessageContent,
   isCanonicalStorageRef,
   messageContentsEqual,
   normalizeMessageContent,
@@ -38,7 +38,7 @@ import {
   type RuntimeEvent,
   type RuntimeEventActions,
 } from '../runtime-event.js';
-import { decodeCanonicalMessage } from '../session.js';
+import { decodeCanonicalMessage, isRuntimeSystemNoteKind } from '../session.js';
 import { decodeTurnOrigin } from '../turn-origin.js';
 
 /** Minimal valid RuntimeEvent; callers spread overrides on top. */
@@ -56,6 +56,16 @@ function baseEvent(overrides: Partial<RuntimeEvent> = {}): RuntimeEvent {
     ...overrides,
   };
 }
+
+test('interrupted assistant text survives recovery decoding without becoming model context', () => {
+  const event = baseEvent({
+    modelVisibility: 'hidden',
+    content: { kind: 'text', text: 'unfinished answer', interrupted: true },
+  });
+  const decoded = decodeRuntimeEvent(JSON.parse(JSON.stringify(event)));
+  assert.deepEqual(decoded, event);
+  assert.equal(runtimeEventHasModelVisibleContent(decoded), false);
+});
 
 test('Stored assistant reasoning parts survive recovery decoding', () => {
   const parts = [
@@ -116,9 +126,40 @@ test('decodes released Automation origins as read-only legacy provenance', () =>
   });
 });
 
+test('decodes a released provider dropping note that nothing writes any more', () => {
+  const data = { inputTokens: 99_398, priorInputTokens: 134_460 };
+  const event = decodeRuntimeEvent(
+    baseEvent({
+      role: 'system',
+      author: 'system',
+      modelVisibility: 'hidden',
+      content: { kind: 'system_note', note: 'context_provider_dropping', data },
+    }),
+  );
+  assert.equal(
+    event.content?.kind === 'system_note' ? event.content.note : undefined,
+    'context_provider_dropping',
+  );
+
+  const message = decodeCanonicalMessage({
+    type: 'system_note',
+    id: 'note-1',
+    turnId: 'turn-1',
+    ts: 1,
+    kind: 'context_provider_dropping',
+    data,
+  });
+  assert.equal(
+    message.type === 'system_note' ? message.kind : undefined,
+    'context_provider_dropping',
+  );
+  assert.equal(isRuntimeSystemNoteKind('context_provider_dropping'), false);
+});
+
 test('shares one decoder across all TurnOrigin variants', () => {
   const origins = [
     { kind: 'scheduled_task', scheduledTaskId: 'task-1' },
+    { kind: 'cloud_activation', activationId: 'activation-1' },
     { kind: 'goal', goalId: 'goal-1' },
     { kind: 'agent_graph', graphId: 'graph-1', wakeId: 'wake-1', attemptId: 'attempt-1' },
   ] as const;
@@ -131,7 +172,7 @@ test('shares one decoder across all TurnOrigin variants', () => {
 });
 
 describe('continuation-start protocol', () => {
-  test('accepts only the replay projection version defined by v2', () => {
+  test('reads legacy and current replay projections but rejects unknown versions', () => {
     const continuationStart = {
       protocol: 'continuation_start_v2',
       provenance: 'runtime_admission',
@@ -163,12 +204,21 @@ describe('continuation-start protocol', () => {
       ).actions?.continuationStart,
       continuationStart,
     );
+    assert.equal(
+      decodeRuntimeEvent({
+        ...baseEvent({ role: 'system', author: 'system', content: undefined }),
+        actions: {
+          continuationStart: { ...continuationStart, providerProjectionVersion: 2 },
+        },
+      }).actions?.continuationStart?.providerProjectionVersion,
+      2,
+    );
     assert.throws(
       () =>
         decodeRuntimeEvent({
           ...baseEvent({ role: 'system', author: 'system', content: undefined }),
           actions: {
-            continuationStart: { ...continuationStart, providerProjectionVersion: 2 },
+            continuationStart: { ...continuationStart, providerProjectionVersion: 3 },
           },
         }),
       /RuntimeEvent schema/,
@@ -498,6 +548,40 @@ describe('RuntimeEvent content variants', () => {
   });
 });
 
+test('rejects a Tool Result projection that references another Session artifact', () => {
+  assert.throws(
+    () =>
+      decodeRuntimeEvent(
+        baseEvent({
+          role: 'tool',
+          author: 'tool',
+          content: {
+            kind: 'function_response',
+            id: 'call-1',
+            name: 'Read',
+            result: { kind: 'image' },
+            modelProjection: {
+              version: 1,
+              kind: 'content',
+              parts: [
+                {
+                  kind: 'artifact',
+                  mediaType: 'image/png',
+                  ref: {
+                    kind: 'session_context',
+                    sessionId: 'another-session',
+                    refId: 'image-1',
+                  },
+                },
+              ],
+            },
+          },
+        }),
+      ),
+    /Invalid RuntimeEvent schema/,
+  );
+});
+
 describe('RuntimeEvent actions', () => {
   test('binds the managed mutation digest to its canonical execution semantics', () => {
     const canonicalProfile = JSON.stringify({
@@ -581,7 +665,7 @@ describe('RuntimeEvent actions', () => {
     }
   });
 
-  test('permission and user-question interactions are first-class actions', () => {
+  test('permission, question, and form interactions are first-class actions', () => {
     const actions: RuntimeEventActions = {
       permissionRequest: {
         kind: 'tool_permission',
@@ -596,9 +680,17 @@ describe('RuntimeEvent actions', () => {
       permissionDecision: { requestId: 'pr-1', decision: 'deny' },
       permissionAnswerAccepted: { requestId: 'hosted-pr-1' },
       userQuestionAnswerAccepted: { requestId: 'question-1' },
+      formRequest: {
+        requestId: 'form-1',
+        toolUseId: 'tc-1',
+        message: 'Choose settings',
+        requester: { name: 'deploy' },
+        fields: [{ kind: 'boolean', name: 'confirm', label: 'Confirm', required: true }],
+      },
+      formAnswerAccepted: { requestId: 'form-1' },
     };
-    expect(actions.permissionRequest?.category).toBe('shell_unsafe');
-    expect(actions.permissionDecision?.decision).toBe('deny');
+    assert.strictEqual(actions.permissionRequest?.category, 'shell_unsafe');
+    assert.strictEqual(actions.permissionDecision?.decision, 'deny');
     assert.deepEqual(decodeRuntimeEvent(baseEvent({ actions })).actions?.permissionDecision, {
       requestId: 'pr-1',
       decision: 'deny',
@@ -607,6 +699,7 @@ describe('RuntimeEvent actions', () => {
     for (const [accepted, requestId] of [
       [decodedActions?.permissionAnswerAccepted, 'hosted-pr-1'],
       [decodedActions?.userQuestionAnswerAccepted, 'question-1'],
+      [decodedActions?.formAnswerAccepted, 'form-1'],
     ] as const) {
       assert.deepEqual(accepted, { requestId });
       assert.ok(accepted);
@@ -617,8 +710,17 @@ describe('RuntimeEvent actions', () => {
     for (const invalidAcceptedAction of [
       { permissionAnswerAccepted: { requestId: 'pr-1', extra: true } },
       { userQuestionAnswerAccepted: { requestId: 'question-1', extra: true } },
+      { formAnswerAccepted: { requestId: 'form-1', extra: true } },
       { permissionAnswerAccepted: Object.create({ requestId: 'inherited-pr-1' }) },
       { userQuestionAnswerAccepted: { requestId: 'x'.repeat(257) } },
+      {
+        formRequest: {
+          ...actions.formRequest,
+          fields: [
+            { kind: 'boolean', name: 'confirm', label: 'Confirm', required: true, extra: true },
+          ],
+        },
+      },
     ]) {
       assert.throws(() =>
         decodeRuntimeEvent({
@@ -731,10 +833,16 @@ describe('RuntimeEvent actions', () => {
 
 describe('isTerminalRuntimeEvent', () => {
   test('classifies terminal status and explicit invocation completion', () => {
-    expect(isTerminalRuntimeEvent(baseEvent({ status: 'completed' }))).toBe(true);
-    expect(isTerminalRuntimeEvent(baseEvent({ status: 'streaming' }))).toBe(false);
-    expect(isTerminalRuntimeEvent(baseEvent({ actions: { endInvocation: false } }))).toBe(false);
-    expect(isTerminalRuntimeEvent(baseEvent({ actions: { endInvocation: true } }))).toBe(true);
+    assert.strictEqual(isTerminalRuntimeEvent(baseEvent({ status: 'completed' })), true);
+    assert.strictEqual(isTerminalRuntimeEvent(baseEvent({ status: 'streaming' })), false);
+    assert.strictEqual(
+      isTerminalRuntimeEvent(baseEvent({ actions: { endInvocation: false } })),
+      false,
+    );
+    assert.strictEqual(
+      isTerminalRuntimeEvent(baseEvent({ actions: { endInvocation: true } })),
+      true,
+    );
   });
 });
 
@@ -776,7 +884,8 @@ describe('runtimeEventHasModelVisibleContent', () => {
         },
       }),
     ];
-    for (const event of visible) expect(runtimeEventHasModelVisibleContent(event)).toBe(true);
+    for (const event of visible)
+      assert.strictEqual(runtimeEventHasModelVisibleContent(event), true);
 
     const hidden = [
       baseEvent({ content: { kind: 'text', text: '' } }),
@@ -784,15 +893,97 @@ describe('runtimeEventHasModelVisibleContent', () => {
       baseEvent({ actions: { tokenUsage: { input: 1, output: 1 } } }),
       baseEvent({ refs: { toolCallId: 'tc-1' } }),
     ];
-    for (const event of hidden) expect(runtimeEventHasModelVisibleContent(event)).toBe(false);
+    for (const event of hidden)
+      assert.strictEqual(runtimeEventHasModelVisibleContent(event), false);
   });
+
+  test('counts structured user context as model-visible with empty inline text (#4804)', () => {
+    const visible = [
+      baseEvent({
+        role: 'user',
+        content: { kind: 'text', text: '', quotes: [{ text: 'pasted reference-sized excerpt' }] },
+      }),
+      baseEvent({
+        role: 'user',
+        content: {
+          kind: 'text',
+          text: '',
+          attachments: [
+            {
+              kind: 'code',
+              name: 'a.ts',
+              mimeType: 'text/typescript',
+              bytes: 10,
+              ref: { kind: 'workspace_file', relativePath: 'a.ts' },
+            },
+          ],
+        },
+      }),
+    ];
+    for (const event of visible)
+      assert.strictEqual(runtimeEventHasModelVisibleContent(event), true);
+    assert.strictEqual(
+      runtimeEventHasModelVisibleContent(baseEvent({ content: { kind: 'text', text: '' } })),
+      false,
+    );
+  });
+
+  test('keeps whitespace-only persisted text model-visible, without trimming (#4815 review)', () => {
+    // Replay visibility must stay compatible with everything admission has
+    // ever accepted. Trimming here would re-read stored whitespace-only
+    // events as invisible and block replay on them — #4804's own failure.
+    // Surfaces that want the trimmed judgement trim at their own boundary.
+    assert.strictEqual(
+      runtimeEventHasModelVisibleContent(baseEvent({ content: { kind: 'text', text: '   ' } })),
+      true,
+    );
+    assert.strictEqual(hasMeaningfulMessageContent({ text: '   ' }), true);
+    assert.strictEqual(hasMeaningfulMessageContent({ text: '' }), false);
+    assert.strictEqual(hasMeaningfulMessageContent({ text: '', quotes: [{ text: 'q' }] }), true);
+  });
+
+  test('counts directory references as a content carrier (#4815 review)', () => {
+    assert.strictEqual(
+      runtimeEventHasModelVisibleContent(
+        baseEvent({
+          role: 'user',
+          content: {
+            kind: 'text',
+            text: '',
+            directoryReferences: [{ hostId: 'host-a', path: '/workspace/source' }],
+          },
+        }),
+      ),
+      true,
+    );
+    assert.strictEqual(
+      hasMeaningfulMessageContent({
+        text: '',
+        directoryReferences: [{ hostId: 'host-a', path: '/workspace/source' }],
+      }),
+      true,
+    );
+  });
+});
+
+test('runtime errors reject malformed retry decisions at the durable boundary', () => {
+  for (const retry of [
+    { decision: 'exhausted', attempts: 0 },
+    { decision: 'exhausted', attempts: 1.5 },
+    { decision: 'declined', because: 'guess' },
+    { decision: 'declined', because: 'policy', rawError: 'secret' },
+  ]) {
+    assert.throws(() =>
+      decodeRuntimeEvent({ ...baseEvent(), content: { kind: 'error', message: 'failed', retry } }),
+    );
+  }
 });
 
 describe('RuntimeEvent reference validation', () => {
   test('accepts only canonical source message digests', () => {
     const digest = `sha256:${'a'.repeat(64)}` as `sha256:${string}`;
     const event = baseEvent({ refs: { sourceMessageDigest: digest } });
-    expect(decodeRuntimeEvent(event).refs?.sourceMessageDigest).toBe(digest);
+    assert.strictEqual(decodeRuntimeEvent(event).refs?.sourceMessageDigest, digest);
     assert.throws(() =>
       decodeRuntimeEvent({
         ...event,
@@ -803,7 +994,7 @@ describe('RuntimeEvent reference validation', () => {
 
   test('accepts a provider-request trace reference and rejects a non-string reference', () => {
     const event = baseEvent({ refs: { providerRequestTraceId: 'provider-trace-1' } });
-    expect(decodeRuntimeEvent(event).refs?.providerRequestTraceId).toBe('provider-trace-1');
+    assert.strictEqual(decodeRuntimeEvent(event).refs?.providerRequestTraceId, 'provider-trace-1');
     assert.throws(() =>
       decodeRuntimeEvent({
         ...event,
@@ -811,4 +1002,57 @@ describe('RuntimeEvent reference validation', () => {
       }),
     );
   });
+});
+
+test('Coordination Runtime receipts survive decoding and reject unrecognized results', () => {
+  const coordination = {
+    actionId: 'action',
+    userText: 'Which task?',
+    clarification: 'Name a task.',
+    result: { disposition: 'clarify' as const, coordinationTurnId: 'turn-1' },
+  };
+  const event = baseEvent({
+    role: 'system',
+    author: 'host',
+    modelVisibility: 'hidden',
+    actions: { coordination },
+  });
+  assert.deepEqual(decodeRuntimeEvent(event).actions?.coordination, coordination);
+  for (const result of [
+    { disposition: 'clarify', coordinationTurnId: '../invalid' },
+    { disposition: 'stop_work', outcome: 'stop_delivered', targetSessionId: 'target' },
+    {
+      disposition: 'stop_work',
+      outcome: 'cancelled_pending',
+      targetSessionId: 'target',
+      targetTurnId: 'turn',
+    },
+    { disposition: 'resume_work', outcome: 'resume_started', targetSessionId: 'target' },
+    {
+      disposition: 'resume_work',
+      outcome: 'already_running',
+      targetSessionId: 'target',
+      targetTurnId: 'turn',
+    },
+  ]) {
+    assert.throws(() =>
+      decodeRuntimeEvent({
+        ...event,
+        actions: { coordination: { ...coordination, result } },
+      }),
+    );
+  }
+
+  assert.throws(() =>
+    decodeRuntimeEvent({
+      ...event,
+      actions: { coordination: { ...coordination, result: { disposition: 'execute_anything' } } },
+    }),
+  );
+  assert.throws(() =>
+    decodeRuntimeEvent({
+      ...event,
+      actions: { coordination: { ...coordination, executionStatus: 'completed' } },
+    }),
+  );
 });

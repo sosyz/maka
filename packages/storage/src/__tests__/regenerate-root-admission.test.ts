@@ -22,7 +22,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import type { RootExecutionDescriptor } from '@maka/core/agent-run';
+import type { RootExecutionDescriptor } from '@maka/core/runtime-invocation';
 import { createSqliteAgentRunStore, type AdmitRootTurnInput } from '../agent-run-store.js';
 
 test('regenerate admission durably binds the immutable source Turn', async () => {
@@ -36,6 +36,7 @@ test('regenerate admission durably binds the immutable source Turn', async () =>
       kind: 'regenerate',
       sourceTurnId: 'source-turn',
     });
+    assert.deepEqual(admitted.admission.authorization, input.authorization);
     store.close?.();
 
     const reopened = createSqliteAgentRunStore(root);
@@ -84,6 +85,51 @@ test('regenerate admission durably binds the immutable source Turn', async () =>
   }
 });
 
+test('external-message origin survives durable root admission', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'maka-external-origin-admission-'));
+  try {
+    const store = createSqliteAgentRunStore(root);
+    const origin = { kind: 'cloud_activation' as const, activationId: 'activation-1' };
+    const input = admissionInput({
+      sessionId: 'root-session',
+      turnId: 'activation-turn',
+      proposedRunId: 'activation-run',
+      proposedUserMessageId: 'activation-message',
+      execution: { kind: 'external_message', origin },
+      previousRootTurnId: null,
+      normalizedInput: { text: 'Inspect the workspace' },
+      sourceMessages: [],
+    });
+    const admitted = await store.admitRootTurn(input);
+    assert.equal(admitted.kind, 'admitted');
+    store.close?.();
+
+    const reopened = createSqliteAgentRunStore(root);
+    assert.deepEqual(
+      await reopened.readRootTurnAdmission(input.sessionId, input.turnId),
+      admitted.admission,
+    );
+    await assert.rejects(
+      () =>
+        reopened.admitRootTurn(
+          admissionInput({
+            turnId: 'forged-origin-turn',
+            proposedRunId: 'forged-origin-run',
+            proposedUserMessageId: 'forged-origin-message',
+            execution: {
+              kind: 'external_message',
+              origin: { kind: 'goal', goalId: 'goal-1' },
+            } as unknown as RootExecutionDescriptor,
+          }),
+        ),
+      /Invalid root execution descriptor/u,
+    );
+    reopened.close?.();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('new root admissions reject removed Automation authority', async () => {
   const root = await mkdtemp(join(tmpdir(), 'maka-legacy-automation-admission-'));
   try {
@@ -116,6 +162,14 @@ function admissionInput(overrides: Partial<AdmitRootTurnInput> = {}): AdmitRootT
     previousRootTurnId: null,
     normalizedInput: { text: 'Original request' },
     sourceMessages: [],
+    authorization: {
+      kind: 'session_turn_access_request',
+      requestId: 'request-regenerate',
+      principalId: 'session_guest:guest-1',
+      grantId: 'grant-1',
+      approvedAt: 45,
+      approvedBy: 'local_owner',
+    },
     admittedAt: 50,
     ...overrides,
   };

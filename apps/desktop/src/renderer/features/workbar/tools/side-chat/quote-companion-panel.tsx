@@ -17,13 +17,14 @@
  * under the License.
  */
 
-import { useCallback, useEffect, useRef, type ComponentProps } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Banner } from '@astryxdesign/core/Banner';
-import { Spinner } from '@astryxdesign/core/Spinner';
 import {
   ChatView,
   ChatSurfaceLayout,
   Composer,
+  ClientCapabilityPrompt,
+  FormInteractionPrompt,
   SandboxBoundaryPrompt,
   UserQuestionPrompt,
   useToast,
@@ -32,13 +33,20 @@ import {
   type ComposerHandle,
 } from '@maka/ui';
 import type { SessionSummary } from '@maka/core/session';
+import type { QuoteRef } from '@maka/core/events';
+import { generalizedErrorMessageForLocale } from '@maka/core/redaction';
 import { useQuoteCompanion } from './use-quote-companion';
-import { useComposerAttachments } from '../../../../use-composer-attachments';
+import { useComposerAttachments } from '@maka/ui/use-composer-attachments';
+import { localizedShellErrorMessage } from '../../../../locales/shell-copy.js';
 import { useComposerMentionsContext } from '../../../../composer-mentions.js';
-import { preflightAttachmentItems } from '../../../../attachment-preflight';
-import { toComposerIngestItems } from '../../../../composer-attachments';
-import { getDesktopConversationCopy } from '../../../../locales/conversation-copy.js';
-import { deriveTurnFooterActions } from '../../../../turn-footer-actions';
+import { preflightAttachmentItems } from '../../../../application/contracts/attachment-preflight.js';
+import { getDesktopConversationCopy } from '../../../../application/contracts/conversation-copy.js';
+import { useAppShellTurnPresentation } from '../../../../application/contracts/turn-presentation.js';
+import {
+  createQuoteCompanionCompactionPresentation,
+  dispatchQuoteCompanionInput,
+  presentQuoteCompanionCompactionResult,
+} from './quote-companion-context-compaction.js';
 import type {
   CompanionQuoteTarget,
   CompanionQuoteSnapshot,
@@ -67,11 +75,13 @@ export function QuoteCompanionPanel(props: {
   sourceSession: SessionSummary | undefined;
   /** Shared global choice list, only used to render the inherited model's label. */
   modelChoices: readonly ChatModelChoice[];
+  confirmBypass: () => Promise<boolean>;
   onQuotesConsumed: (snapshot: CompanionQuoteSnapshot) => void;
+  /** Re-stages quotes a retracted send carried, so an edit restores them. */
+  onRestoreQuotes?: (panelId: string, quotes: readonly QuoteRef[]) => void;
   onRemoveQuote?: (target: CompanionQuoteTarget) => void;
   onForkVisibilityChange?: (event: CompanionForkVisibilityEvent) => void;
   onContentStateChange?: (panelId: string, hasContent: boolean) => void;
-  onPreparingStateChange?: (panelId: string, preparing: boolean) => void;
   onInitialPromptStarted?: (panelId: string) => void;
   onPromptAccepted?: (panelId: string, prompt: string) => void;
   onActivityStateChange?: (panelId: string, active: boolean) => void;
@@ -83,54 +93,107 @@ export function QuoteCompanionPanel(props: {
   const copy = getDesktopConversationCopy(locale).quoteCompanion;
   const composerRef = useRef<ComposerHandle>(null);
   const initialPromptStartedRef = useRef(false);
+  const contextCompactionPresentationRef = useRef<
+    ReturnType<typeof createQuoteCompanionCompactionPresentation>
+  >(undefined);
+  if (!contextCompactionPresentationRef.current) {
+    contextCompactionPresentationRef.current = createQuoteCompanionCompactionPresentation({
+      toastApi: toast,
+      copyForLocale: (nextLocale) => getDesktopConversationCopy(nextLocale).quoteCompanion,
+      presentTerminal(sessionId, notice) {
+        if (notice.level === 'error') {
+          toast.error(notice.title, notice.description, undefined, { sessionId });
+        } else {
+          toast[notice.level](notice.title, notice.description);
+        }
+      },
+    });
+  }
   const draftKey = `quote-companion:${props.panelId}`;
   const {
     pendingAttachments,
     pickAttachments,
     attachFilePaths,
+    restoreAttachments,
     removeAttachment,
     clearSubmittedAttachments,
   } = useComposerAttachments({
+    copy: getDesktopConversationCopy(locale).actions,
+    formatError: (error, fallback) => localizedShellErrorMessage(error, fallback, locale),
     draftKey,
     toastApi: toast,
     service: attachments,
   });
   const companion = useQuoteCompanion({
     panelId: props.panelId,
+    active: props.active,
     pendingQuotes: props.quotes,
     sourceSession: props.sourceSession,
     modelChoices: props.modelChoices,
     locale,
     onQuotesConsumed: props.onQuotesConsumed,
+    confirmBypass: props.confirmBypass,
     onForkVisibilityChange: props.onForkVisibilityChange,
+    onContextCompactionResult: (sessionId, result) => {
+      presentQuoteCompanionCompactionResult(
+        contextCompactionPresentationRef.current!,
+        sessionId,
+        result,
+        locale,
+      );
+    },
+    onContextCompactionOutcome: (sessionId, turnId, outcome) => {
+      contextCompactionPresentationRef.current!.finished(
+        sessionId,
+        turnId,
+        outcome,
+        locale,
+      );
+    },
+    onContextCompactionError: (sessionId, error) => {
+      if (isWorkspaceUnavailableError(error)) {
+        toast.error(
+          getDesktopConversationCopy(locale).quoteCompanion.workspaceUnavailableTitle,
+          getDesktopConversationCopy(locale).quoteCompanion.workspaceUnavailableDescription,
+          undefined,
+          { sessionId },
+        );
+        return;
+      }
+      const compactCopy = getDesktopConversationCopy(locale).quoteCompanion;
+      toast.error(
+        compactCopy.compactErrorTitle,
+        generalizedErrorMessageForLocale(error, compactCopy.compactErrorFallback, locale),
+        undefined,
+        { sessionId },
+      );
+    },
+    restoreDraft: (_sessionId, draft) => {
+      if (draft.attachments?.length) restoreAttachments(draftKey, draft.attachments);
+      if (draft.quotes?.length) props.onRestoreQuotes?.(props.panelId, draft.quotes);
+      const input = composerRef.current;
+      if (!input || !draft.text.trim()) return;
+      if (input.getText().trim()) input.appendText(draft.text);
+      else input.setText(draft.text);
+      input.focus();
+    },
   });
   useEffect(() => {
     props.onContentStateChange?.(props.panelId, companion.hasContent);
   }, [companion.hasContent, props.onContentStateChange, props.panelId]);
+  const active = Boolean(companion.activeTurn) || companion.processing;
   useEffect(() => {
-    props.onPreparingStateChange?.(props.panelId, companion.preparing);
-  }, [companion.preparing, props.onPreparingStateChange, props.panelId]);
+    props.onActivityStateChange?.(props.panelId, active);
+  }, [active, props.onActivityStateChange, props.panelId]);
   useEffect(() => {
-    props.onActivityStateChange?.(
-      props.panelId,
-      companion.streaming || companion.processing,
-    );
-  }, [
-    companion.processing,
-    companion.streaming,
-    props.onActivityStateChange,
-    props.panelId,
-  ]);
-  useEffect(() => {
-    if (!props.active || companion.preparing) return;
+    if (!props.active) return;
     const frame = window.requestAnimationFrame(() => composerRef.current?.focus());
     return () => window.cancelAnimationFrame(frame);
-  }, [companion.preparing, props.active]);
+  }, [props.active]);
   useEffect(() => {
     const prompt = props.initialPrompt?.trim();
     if (
       !props.active ||
-      companion.preparing ||
       !companion.modelReady ||
       !prompt ||
       initialPromptStartedRef.current
@@ -154,7 +217,6 @@ export function QuoteCompanionPanel(props: {
         composerRef.current?.focus();
       });
   }, [
-    companion.preparing,
     companion.send,
     props.active,
     props.initialPrompt,
@@ -176,46 +238,26 @@ export function QuoteCompanionPanel(props: {
         )?.label
       : undefined) ?? activeModel?.model;
 
-  const activeInteraction = companion.activeSandboxBoundary ?? companion.activeQuestion;
-  const deriveTurnPresentation = useCallback<
-    NonNullable<ComponentProps<typeof ChatView>['deriveTurnPresentation']>
-  >(
-    (turns) => ({
-      footerActionsByTurn: Object.fromEntries(
-        turns.map((turn) => [
-          turn.turnId,
-          deriveTurnFooterActions({
-            status: turn.status,
-            locale,
-            hasContent: Boolean(turn.assistant?.text?.trim()),
-            ...(companion.regeneratePendingTurnId === turn.turnId
-              ? { pendingActions: new Set(['regenerate'] as const) }
-              : {}),
-          }).filter((action) => action.id !== 'branch'),
-        ]),
-      ),
-      failedReasonLabels: {},
-      failedSeverities: {},
-      failedExecutionStateLabels: {},
-      lineageBadgesByTurn: {},
-    }),
-    [companion.regeneratePendingTurnId, locale],
-  );
+  const activeInteraction =
+    companion.activeSandboxBoundary ??
+    companion.activeClientCapability ??
+    companion.activeQuestion ??
+    companion.activeForm;
 
+  const deriveTurnPresentation = useAppShellTurnPresentation({ uiLocale: locale, allowBranch: false });
   return (
-    <div
-      className="maka-quote-companion"
-      data-preparing={companion.preparing || undefined}
-    >
+    <div className="maka-quote-companion">
       <ChatSurfaceLayout
-        scrollOwner="host"
         scrollToBottomLabel={copy.scrollToBottom}
         composer={
           <>
             {companion.error && (
               <Banner status="error" role="alert" title={companion.error} />
             )}
-            {(companion.activeSandboxBoundary || companion.activeQuestion) && (
+            {(companion.activeSandboxBoundary ||
+              companion.activeClientCapability ||
+              companion.activeQuestion ||
+              companion.activeForm) && (
               <div className="maka-composer-interaction-slot">
                 {companion.activeSandboxBoundary && (
                   <SandboxBoundaryPrompt
@@ -223,50 +265,106 @@ export function QuoteCompanionPanel(props: {
                     onRespond={companion.respondToSandboxBoundary}
                   />
                 )}
+                {companion.activeClientCapability && (
+                  <ClientCapabilityPrompt
+                    request={companion.activeClientCapability}
+                    onRespond={companion.respondToClientCapability}
+                  />
+                )}
                 {companion.activeQuestion && (
                   <UserQuestionPrompt
+                    key={companion.activeQuestion.requestId}
                     request={companion.activeQuestion}
                     onRespond={companion.respondToUserQuestion}
                     onStop={() => void companion.stop()}
+                  />
+                )}
+                {companion.activeForm && (
+                  <FormInteractionPrompt
+                    request={companion.activeForm}
+                    modelChoices={props.modelChoices}
+                    onRespond={companion.respondToUserForm}
                   />
                 )}
               </div>
             )}
             <Composer
               ref={composerRef}
-              onSend={async (text) => {
-                // Mid-turn the same submit is steering — the side chat has no
-                // slash commands, so the split is just the turn's state.
-                if (companion.streaming) return companion.steer(text);
-                try {
-                  preflightAttachmentItems(pendingAttachments, locale);
-                } catch (error) {
-                  toast.error(
-                    copy.errors.sendRejected,
-                    error instanceof Error ? error.message : String(error),
-                  );
-                  return false;
-                }
-                const accepted = await companion.send(
+              onSend={(text, metadata) =>
+                dispatchQuoteCompanionInput({
                   text,
-                  pendingAttachments.length > 0
-                    ? toComposerIngestItems(pendingAttachments)
-                    : undefined,
-                );
-                if (accepted) {
-                  props.onPromptAccepted?.(props.panelId, text);
-                }
-                if (accepted) clearSubmittedAttachments(pendingAttachments);
-                return accepted;
-              }}
+                  streaming: companion.streaming,
+                  followUpMode: metadata?.followUpMode,
+                  compact: companion.compact,
+                  queue: companion.queue,
+                  steer: async (text) => {
+                    // Same staged-attachment validation as `send`: an unusable
+                    // attachment rejects here with the localized toast instead
+                    // of dying later on the steer path.
+                    try {
+                      preflightAttachmentItems(pendingAttachments);
+                    } catch (error) {
+                      toast.error(
+                        copy.errors.sendRejected,
+                        localizedShellErrorMessage(error, copy.errors.sendRejected, locale),
+                      );
+                      return false;
+                    }
+                    // Submitted attachments retire on the confirmed-admission
+                    // boundary, not on the hook's optimistic return: an unknown
+                    // outcome keeps them staged for retry (#4804).
+                    const submitted = pendingAttachments;
+                    return companion.steer(
+                      text,
+                      submitted,
+                      submitted.length > 0
+                        ? () => clearSubmittedAttachments(submitted)
+                        : undefined,
+                    );
+                  },
+                  send: async () => {
+                    try {
+                      preflightAttachmentItems(pendingAttachments);
+                    } catch (error) {
+                      toast.error(
+                        copy.errors.sendRejected,
+                        localizedShellErrorMessage(error, copy.errors.sendRejected, locale),
+                      );
+                      return false;
+                    }
+                    // Same admission-boundary retirement as `steer` above.
+                    const submitted = pendingAttachments;
+                    const accepted = await companion.send(
+                      text,
+                      submitted,
+                      submitted.length > 0
+                        ? () => clearSubmittedAttachments(submitted)
+                        : undefined,
+                    );
+                    if (accepted) {
+                      props.onPromptAccepted?.(props.panelId, text);
+                    }
+                    return accepted;
+                  },
+                })
+              }
               onStop={() => void companion.stop()}
               hidden={Boolean(activeInteraction)}
               streaming={companion.streaming}
               processing={companion.processing}
+              queuedMessages={companion.queuedMessages}
+              queuedMessageRevision={companion.queuedMessageRevision}
+              pendingMessages={companion.transientMessages}
+              onPromoteQueuedEntry={companion.promoteQueuedEntry}
+              onEditQueuedEntry={companion.editQueuedEntry}
+              onDeleteQueuedEntry={companion.deleteQueuedEntry}
+              onReorderQueuedEntries={companion.reorderQueuedEntries}
               draftKey={draftKey}
-              disabled={!companion.modelReady || companion.preparing}
+              disabled={!companion.modelReady}
               onPickAttachments={pickAttachments}
               onAttachFilePaths={attachFilePaths}
+              // The side chat submits staged context without a prompt (#4804).
+              allowAttachmentOnlySend
               pendingAttachments={pendingAttachments}
               onRemoveAttachment={removeAttachment}
               mentionSkills={mentions?.mentionSkills}
@@ -289,7 +387,6 @@ export function QuoteCompanionPanel(props: {
               // (the companion has no independent picker; it inherits the source model).
               modelLabel={activeModelLabel}
               permissionMode={companion.permissionMode}
-              permissionModePending={companion.permissionModePending}
               permissionModeDisabledReason={
                 companion.streaming ? copy.permissionStreaming : undefined
               }
@@ -302,29 +399,35 @@ export function QuoteCompanionPanel(props: {
       >
         <ChatView
           messages={companion.messages}
+          transientMessages={companion.transientMessages}
           scrollBehavior={readScrollMotionBehavior()}
-          liveTurn={companion.liveTurn}
-          runningStatus={companion.processing}
+          liveTurns={companion.liveTurns}
+          activeTurn={companion.activeTurn}
           activeSession={companion.companionSession}
-          onReadAttachmentBytes={attachments.readBytes}
+          onReadAttachmentBytes={attachments.readBytes} onResolveImageDelivery={attachments.resolveImageDelivery}
           deriveTurnPresentation={deriveTurnPresentation}
-          onTurnFooterAction={(turnId, actionId) => {
-            if (actionId === 'regenerate') {
-              void companion.regenerate(turnId);
-            }
+          onEditUserMessage={(turnId) => {
+            const message = companion.messages.find(
+              (candidate) => candidate.type === 'user' && candidate.turnId === turnId,
+            );
+            if (message?.type !== 'user') return;
+            composerRef.current?.setText(message.text);
+            composerRef.current?.focus();
           }}
-          emptyOverride={
-            companion.preparing ? (
-              <div className="maka-quote-companion-preparing maka-turn-processing">
-                <Spinner size="sm" shade="subtle" label={copy.preparing} />
-              </div>
-            ) : (
-              <div className="maka-quote-companion-empty" aria-hidden="true" />
-            )
-          }
+          emptyOverride={<div className="maka-quote-companion-empty" aria-hidden="true" />}
           onNew={() => {}}
         />
       </ChatSurfaceLayout>
     </div>
+  );
+}
+
+function isWorkspaceUnavailableError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const value = error as { code?: unknown; message?: unknown };
+  return (
+    value.code === 'SESSION_WORKSPACE_UNAVAILABLE' ||
+    (typeof value.message === 'string' &&
+      value.message.includes('SESSION_WORKSPACE_UNAVAILABLE:'))
   );
 }

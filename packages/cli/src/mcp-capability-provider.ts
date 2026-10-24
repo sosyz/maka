@@ -21,6 +21,7 @@ import { createHash } from 'node:crypto';
 import type { McpBoundTool, McpToolBinding } from '@maka/core/mcp';
 import type { McpClientManager } from '@maka/mcp';
 import type { ClientCapabilityProvider } from '@maka/runtime-host/client';
+import { clientCapabilityEntityId } from '@maka/runtime-host/client-capability-entity-id';
 import {
   CLIENT_CAPABILITY_MAX_TOOLS,
   CLIENT_CAPABILITY_MAX_TOOLS_PER_OFFER,
@@ -34,6 +35,10 @@ const CAPABILITY_VERSION = '0';
 
 export function createMcpCapabilityProvider(
   manager: Pick<McpClientManager, 'toolSnapshot' | 'callTool'>,
+  options: {
+    readonly admission?: 'mcp';
+    readonly onCurrentRegistrationRetired?: () => void | Promise<void>;
+  } = {},
 ): ClientCapabilityProvider | undefined {
   const toolSnapshot = manager.toolSnapshot();
   const tools = [...toolSnapshot.tools].sort(
@@ -57,7 +62,7 @@ export function createMcpCapabilityProvider(
   for (const source of tools) {
     const descriptor = projectMcpTool(
       source.descriptor,
-      capabilityEntityId(source.descriptor.serverId),
+      clientCapabilityEntityId(source.descriptor.serverId),
     );
     const identity = `${descriptor.serverId}\0${descriptor.name}`;
     if (projectedIdentities.has(identity)) {
@@ -78,6 +83,7 @@ export function createMcpCapabilityProvider(
       version: CAPABILITY_VERSION,
       affinity: 'session',
       hostPathAccess: 'none',
+      ...(options.admission ? { admission: options.admission } : {}),
       label:
         servers.size === 1
           ? `MCP: ${chunk[0]?.source.descriptor.serverId ?? 'tools'}`.slice(0, 128)
@@ -94,19 +100,33 @@ export function createMcpCapabilityProvider(
   }
   const canonical = decodeClientCapabilityReplaceInput({
     registrationId: '00000000-0000-4000-8000-000000000000',
+    ...(options.admission ? { sessionId: 'mcp-manifest-validation' } : {}),
     offers,
   });
 
   return {
     offers: () => canonical.offers,
+    ...(options.onCurrentRegistrationRetired
+      ? { currentRegistrationRetired: options.onCurrentRegistrationRetired }
+      : {}),
     call: async (frame, options) => {
       const binding = bindings.get(
         capabilityBindingKey(frame.offerId, frame.serverId, frame.toolName),
       );
       if (!binding) throw new Error('MCP capability is not part of the published snapshot');
-      await options.accept();
+      await options.accept({ kind: 'none' });
       return projectMcpResult(
-        await manager.callTool(binding, frame.arguments, { signal: options.signal }),
+        await manager.callTool(binding, frame.arguments, {
+          signal: options.signal,
+          requestInteraction: options.requestInteraction,
+          ...(options.progress
+            ? {
+                onProgress: (current, total) => {
+                  options.progress?.(current, total);
+                },
+              }
+            : {}),
+        }),
       );
     },
   };
@@ -115,22 +135,16 @@ export function createMcpCapabilityProvider(
 function projectMcpTool(tool: McpToolDescriptor, wireServerId: string) {
   return {
     serverId: wireServerId,
-    name: capabilityEntityId(tool.name),
+    name: clientCapabilityEntityId(tool.name),
     ...(tool.description ? { description: tool.description } : {}),
     inputSchema: structuredClone(tool.inputSchema),
     ...(tool.annotations ? { annotations: { ...tool.annotations } } : {}),
   };
 }
 
-function capabilityEntityId(value: string): string {
-  if (/^[A-Za-z0-9_-]{1,128}$/u.test(value)) return value;
-  const label = value.replace(/[^A-Za-z0-9_-]+/gu, '_').slice(0, 103) || 'mcp';
-  const digest = createHash('sha256').update(value).digest('hex').slice(0, 24);
-  return `${label}_${digest}`;
-}
-
 function projectMcpResult(result: McpCallResult): ClientCapabilityCallResult {
   return {
+    outcome: 'success',
     content: result.content.map((block) => structuredClone(block)),
     ...(result.structuredContent === undefined
       ? {}

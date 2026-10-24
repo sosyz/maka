@@ -1,3 +1,15 @@
+---
+doc_id: architecture.windows-sandbox-rfc-v1
+title: "Windows sandbox RFC v1"
+language: zh-CN
+source_language: en
+implementation_status: current
+document_status: current
+translation_status: synced
+last_verified: 2026-10-10
+owners:
+  - maka-backend
+---
 <!--
   Licensed to the Apache Software Foundation (ASF) under one
   or more contributor license agreements.  See the NOTICE file
@@ -19,8 +31,8 @@
 
 # Windows 沙箱后端 RFC v1
 
-- 状态：实现基线已选定；首个预览切片（[#2961](https://github.com/maka-agent/maka-agent/pull/2961)）已于 2026-08-17 合并；产品接入继续做发布验证（预览范围见 §6.5）
-- 跟踪：[Issue #2142](https://github.com/maka-agent/maka-agent/issues/2142) Windows Phase 4
+- 状态：实现基线已选定；首个预览切片（[#2961](https://github.com/apache/maka/pull/2961)）已于 2026-08-17 合并；产品接入继续做发布验证（预览范围见 §6.5）
+- 跟踪：[Issue #2142](https://github.com/apache/maka/issues/2142) Windows Phase 4
 - 更新日期：2026-08-18
 - Owner：`@maka/runtime` sandbox boundary 与 Runtime Host execution composition
 - 英文版：[windows-sandbox-rfc-v1.md](./windows-sandbox-rfc-v1.md)
@@ -157,14 +169,15 @@ Maka 外已失陷的同用户进程。sandboxed code 从第一条指令开始按
 - readiness probe 的抛弃式 profile 生命周期必须隔离且 fail closed； _(已实现:probe profile 位于专属 `maka.readiness.` 命名空间,与生产 `maka.sandbox.` 命名空间结构性不相交,其保留的 `requestId` 被 launch validation 拒绝,任何生产启动都无法解析到 probe 删除并重建的那个 profile;整个 delete→create→probe→settle→drop 生命周期由一个 DACL 加固的按用户命名互斥量跨进程串行——与 ACL ledger 复用同一原语——使并发 probe 不会互删对方的 active 注册;当 probe 无法证明其 Job 清空时按该周期 fail closed(报告不可用),固定的 readiness identity 并不被持久隔离——清理依赖 kill-on-close Job 的整树终止,且因该 probe 不授任何 filesystem root,一个假设存活的子进程也继承不到任何 ACE 权限;消费侧对负可用性结果只按有界 TTL 缓存,以限制一次瞬时失败毒化 module 缓存的时长:由**下一次 composition 构建**重探,而非运行中的宿主原地恢复——filesystem worker 在 composition 构建时一次性发布,故一个已判负的宿主只在新 composition 或 Runtime Host 重启时恢复,正结果则按进程生命周期缓存。未证清空 identity 的持久隔离,以及运行中宿主的主动 readiness 恢复,均为后续门禁——见 §6.5。)_
 - launcher signature/version/digest 必须与 package metadata 一致； _(后续门禁：每次启动的 request digest 目前已在 broker 内重算并强制；对照打包 metadata 校验 launcher 二进制的 signature 与 version 随 Phase 3 签名一并暂缓 —— 见 §6.5。)_
 - setup 缺失、identity drift、ACL state 损坏、网络策略无效、文件系统不支持、helper 不匹配、probe 失败都返回
-  stable typed unavailable reason； _(后续门禁:readiness probe 目前把每种失败收敛为单一 fail-closed 布尔,统一以
-  `backend_not_available` 呈现;结构化 typed reason 尚未实现,暂缓 —— 见 §6.5。)_
+  stable typed unavailable reason； _(后续门禁:readiness probe 目前把每种 probe 失败收敛为单一 fail-closed 布尔,统一以
+  `backend_not_available` 呈现;更细的 probe 层 typed reason 暂缓 —— transform 层已区分
+  `unsupported_platform`、`backend_not_available`、`invalid_request`。见 §6.5。)_
 - restricted managed profile 在 `auto`/`require` 下绝不 fallback host execution；
 - diagnostics 只暴露 backend、setup version 与 failure stage，不暴露 path、SID、credential、env 或 firewall detail。 _(后续门禁:probe 以 `stdio: 'ignore'` 运行且只保留退出结果,setup version 与 failure stage 尚未传播,与结构化 unavailable reason 一并暂缓 —— 见 §6.5。)_
 
-### 6.5 预览实现状态（2026-08-24）
+### 6.5 预览实现状态（2026-08-25）
 
-首个预览切片 [#2961](https://github.com/maka-agent/maka-agent/pull/2961) 已于 2026-08-17 合并，强制上述保证的一个子集。本节把文档与已交付代码对齐，使 RFC 不 overclaim：§6.3/§6.4 中尚未强制的保证在此显式标为后续门禁。标注 `(#3161)` 的条目落在 readiness-probe 后续 PR，而非已合并的 #2961 切片；其余条目由 #2961 当前强制。
+首个预览切片 [#2961](https://github.com/apache/maka/pull/2961) 已于 2026-08-17 合并，强制上述保证的一个子集。本节把文档与已交付代码对齐，使 RFC 不 overclaim：§6.3/§6.4 中尚未强制的保证在此显式标为后续门禁。标注 `(#3722)` 的条目（Runtime Host 父进程 wait handle、64 次 soak、恶意 child 矩阵）与标注 `(#3174)` 的条目（readiness probe 与 private desktop 放置）落在对应后续 PR，而非已合并的 #2961 切片；其余未标注条目由 #2961 当前强制。
 
 **已强制（未标注者由 #2961 合并强制）：**
 
@@ -175,16 +188,16 @@ Maka 外已失陷的同用户进程。sandboxed code 从第一条指令开始按
 - 创建时原子附加、close 时杀整棵树的 kill-on-close Job（§6.3）；
 - 仅通过 `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` 继承声明的 handle（§6.3）；
 - 封闭、排序后的 allowlist 环境（§6.3）；
-- 打包 one-shot broker 持有由内核进程表确认的 Runtime Host 父进程 wait handle：Host 退出会
+- 打包 one-shot broker 持有由内核进程表确认的 Runtime Host 父进程 wait handle **(#3722)**：Host 退出会
   中断首次启动、终止并 drain AppContainer Job，并释放本次 ledger/ACE；
 - 打包路径执行 64 次、按波次重复的并发 soak，每次使用互不相同的启动 identity，最后断言无进程与
-  ACL-ledger 残留；
+  ACL-ledger 残留 **(#3722)**；
 - 打包恶意 child 矩阵覆盖递归 junction 与多硬链接准入、outside 文件、TCP connection 拒绝、宿主 named
   pipe、ambient 环境、宿主 HKCU、父进程 token、descendant 的 AppContainer/Job 继承，以及 quarantine
-  identity 不复用；
+  identity 不复用 **(#3722)**；
 - 按启动的 private desktop **放置(placement)**（§6.3）**(#3174)**:每次生产启动与 readiness probe 均在当前 window station 上创建 alternate desktop,其 DACL 仅授予发起用户、Local System 与该次启动的 AppContainer SID(且只给该 SID 最小非交互权限;并以前置 deny ACE 从 AppContainer 子进程有效携带的发起用户 SID 上剥离 `DESKTOP_SWITCHDESKTOP`/`DESKTOP_HOOKCONTROL`/journal 录制回放),并以 `STARTUPINFOW.lpDesktop` 指向它启动子进程,建不出或授不了即 fail closed。桌面钉在 Low integrity（`S:(ML;;NW;;;LW)`）使授予权限对 Low-IL 子进程通过 MIC,且 heap 经 `CreateDesktopExW` 按启动限额（512 KiB）使受支持并发不会耗尽系统 desktop heap。由于 `lpDesktop` 只选择*初始*桌面,这把 worker 放置到交互 `Default` 桌面之外并对私有桌面做 DACL 保护;这是 placement 加 DACL 保护、**不是**防逃逸边界——没有结构性机制阻止进程内代码 `OpenDesktopW("Default")` + `SetThreadDesktop` 重新挂回,clipboard 也归 window station、仍为共用(no-Win32k mitigation、独立 window station 与 token 边界见下方暂缓门禁);
-- 生产 identity readiness probe（§6.4）**(#3161)**:`--readiness-probe` 真正建立 AppContainer identity/token、kill-on-close Job 与 private desktop 并在该桌面上启动抛弃式受限子进程（`cmd.exe /d /c exit 0`,以 `/d` 关闭 AutoRun 使宿主 shell 定制不能扭曲结果）,使可用性在宿主无法创建边界时 fail closed,而非仅凭打包二进制存在;成功时输出机器可读 attestation（精确 SID 匹配、特定 Job membership、settlement、private-desktop placement）,发布冒烟逐字段断言,使该 gate 不会静默退化为空洞的 exit-0 检查;
-- 专属且跨进程串行的 readiness profile 生命周期（§6.4）**(#3161)**:probe profile 位于与生产不相交的命名空间,其保留 `requestId` 被 validation 拒绝,一个 DACL 加固的按用户命名互斥量串行其 delete→create→probe→drop 生命周期,未证清空的 probe 按周期 fail closed 而非宣称边界干净(清理依赖 kill-on-close Job 与零权限 identity,而非持久隔离),负可用性按有界 TTL 缓存以限制一次瞬时失败毒化 module 缓存的时长——由下一次 composition 构建重探,而非运行中宿主原地恢复;
+- 生产 identity readiness probe（§6.4）**(#3174)**:`--readiness-probe` 真正建立 AppContainer identity/token、kill-on-close Job 与 private desktop 并在该桌面上启动抛弃式受限子进程（`cmd.exe /d /c exit 0`,以 `/d` 关闭 AutoRun 使宿主 shell 定制不能扭曲结果）,使可用性在宿主无法创建边界时 fail closed,而非仅凭打包二进制存在;成功时输出机器可读 attestation（精确 SID 匹配、特定 Job membership、settlement、private-desktop placement）,发布冒烟逐字段断言,使该 gate 不会静默退化为空洞的 exit-0 检查;
+- 专属且跨进程串行的 readiness profile 生命周期（§6.4）**(#3174)**:probe profile 位于与生产不相交的命名空间,其保留 `requestId` 被 validation 拒绝,一个 DACL 加固的按用户命名互斥量串行其 delete→create→probe→drop 生命周期,未证清空的 probe 按周期 fail closed 而非宣称边界干净(清理依赖 kill-on-close Job 与零权限 identity,而非持久隔离),负可用性按有界 TTL 缓存以限制一次瞬时失败毒化 module 缓存的时长——由下一次 composition 构建重探,而非运行中宿主原地恢复;
 - fail-closed capability check，绝不 unsandboxed fallback（§6.4）。
 
 **已设计但作为后续门禁暂缓（预览切片尚未强制）：**
@@ -194,8 +207,9 @@ Maka 外已失陷的同用户进程。sandboxed code 从第一条指令开始按
 - readiness 阶段的完整策略覆盖（§6.4):readiness probe 已建立生产 AppContainer identity/token、kill-on-close Job 与 private desktop 并在其上启动受限子进程,但尚未在 readiness 阶段编译并演练按 profile 的精确 filesystem 根与 offline network 策略 —— 这些目前按每次启动强制,而非在 readiness 阶段复证;
 - 随 Phase 3 签名一并落地的 launcher signature/version 校验（§6.4）。
 - 结构化 unavailable reason 与 diagnostics（§6.4）:readiness probe 以单一 fail-closed 布尔(呈现为
-  `backend_not_available`)收敛所有失败;stable typed unavailable reason 与 setup-version/failure-stage
-  诊断已设计但尚未实现或传播。
+  `backend_not_available`)收敛所有 probe 失败;更细的 probe 层 typed reason 与 setup-version/failure-stage
+  诊断已设计但尚未实现或传播。（transform 层已区分 `unsupported_platform`、`backend_not_available`、
+  `invalid_request`。）
 - readiness 的跨进程并发真机竞态覆盖（§6.4）:readiness profile 生命周期已由命名互斥量串行,并有针对
   互斥量名、命名空间与 validation 原语的单元测试;在真实 Windows 宿主上 spawn 多个并发 probe 的多进程
   竞态测试暂缓——对一个抛弃式诊断探针不成比例且在 CI 中天然 flaky。被强制的契约是串行化原语本身,而非

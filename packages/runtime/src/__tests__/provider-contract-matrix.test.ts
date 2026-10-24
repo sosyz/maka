@@ -29,10 +29,10 @@ import {
   type ProviderContractGeneratedCell,
   type ProviderContractWire,
 } from './provider-contract-matrix.js';
-import { PROVIDER_DEFAULTS } from '@maka/core/llm-connections';
+import { PROVIDER_REGISTRY } from '@maka/core/llm-connections';
 import { generateText, isStepCount, tool } from 'ai';
 import { z } from 'zod';
-import { fetchProviderModels } from '../model-fetcher.js';
+import { discoverModels } from './model-discovery-fixture.js';
 import { getAIModel } from '../model-factory.js';
 import {
   closeAllJsonServers,
@@ -52,7 +52,7 @@ after(closeAllJsonServers);
 
 test('provider override cells and executable bindings are a bijection', () => {
   const plannedKeys = listProviderContractCells(plan)
-    .flatMap(({ cell }) => (cell.state === 'override' ? [cell.overrideKey] : []))
+    .flatMap((cell) => (cell.state === 'override' ? [cell.overrideKey] : []))
     .sort();
   const bindingKeys = PROVIDER_CONTRACT_OVERRIDE_BINDINGS.flatMap(({ keys }) => keys).sort();
   assert.deepEqual(duplicateValues(plannedKeys), [], 'override cells must be unique');
@@ -180,7 +180,7 @@ async function runGeneratedDiscovery(
         );
       });
       const connection = baseConnection(row, server.url);
-      const models = await fetchProviderModels(connection, credentialCase.apiKey);
+      const models = await discoverModels(connection, credentialCase.apiKey);
       if (handlerErrors.length > 0) throw handlerErrors[0];
       assert.ok(requestCount >= 1, `${where} must request the model list`);
       assert.deepEqual(
@@ -321,7 +321,7 @@ async function assertFallbackDiscoveryMakesNoRequest(row: ProviderContractRow): 
     respondJson(response, 500, { error: 'fallback discovery must not reach the network' });
   });
   const connection = baseConnection(row, server.url);
-  const models = await fetchProviderModels(connection, API_KEY);
+  const models = await discoverModels(connection, API_KEY);
   assert.equal(
     requestCount,
     0,
@@ -371,7 +371,7 @@ interface WireCredentialCase {
 }
 
 function wireCredentialCases(row: ProviderContractRow): WireCredentialCase[] {
-  switch (PROVIDER_DEFAULTS[row.providerType].authKind) {
+  switch (PROVIDER_REGISTRY[row.providerType].authKind) {
     case 'none':
       return [{ label: 'no-auth', apiKey: '', expectCredential: false }];
     case 'optional_api_key':
@@ -622,7 +622,7 @@ async function runAnthropicMessagesWire(
   // The native Anthropic adapter carries the credential as x-api-key by
   // default; providers declaring `auth: 'bearer'` carry an Authorization
   // Bearer token instead (getAIModel passes authToken).
-  const adapter = PROVIDER_DEFAULTS[row.providerType].runtimeAdapter;
+  const adapter = PROVIDER_REGISTRY[row.providerType].runtimeAdapter;
   const carrier =
     adapter.kind === 'anthropic' && adapter.auth === 'bearer'
       ? ('authorization-bearer' as const)

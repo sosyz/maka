@@ -23,20 +23,21 @@ import { createServer } from 'node:http';
 import { createRequire } from 'node:module';
 import {
   closeSync,
+  cpSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
   openSync,
   readFileSync,
+  renameSync,
   rmSync,
   statSync,
   writeFileSync,
   writeSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { validateCliReleaseArtifactMetrics } from './release-cli-artifact-policy.mjs';
 import { findReleaseTarball } from './release-cli-eval-support.mjs';
 import {
   collectRuntimeHostFailureDiagnostic,
@@ -48,6 +49,8 @@ import { npmSpawnOptions } from './npm-spawn.mjs';
 const MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
 const PROCESS_TIMEOUT_MS = 90_000;
 const RUNTIME_HOST_SHUTDOWN_TIMEOUT_MS = 45_000;
+const RELEASE_SMOKE_IDLE_GRACE_MS = 2_000;
+let installedIdleGraceEnvVar;
 const MODEL_ID = 'maka-release-smoke-model';
 const CONNECTION_SLUG = 'maka-release-smoke';
 const API_KEY = 'maka-release-smoke-key';
@@ -139,6 +142,11 @@ async function validateInstalledProduct(root) {
     process.platform === 'win32'
       ? join(prefix, 'node_modules/maka-agent')
       : join(prefix, 'lib/node_modules/maka-agent');
+  const client = await importInstalled(
+    packageRoot,
+    'node_modules/@maka/runtime-host/dist/client/index.js',
+  );
+  installedIdleGraceEnvVar = client.IDLE_GRACE_MS_ENV_VAR;
   const baseEnvironment = isolatedEnvironment(join(root, 'home'));
   const maka = process.platform === 'win32' ? join(prefix, 'maka.cmd') : join(prefix, 'bin/maka');
   const cliEntrypoint = join(packageRoot, 'dist/cli.js');
@@ -172,12 +180,41 @@ async function validateInstalledProduct(root) {
   await smokeNativeFileLock(packageRoot, root);
   await smokeRuntimeHostPeerProtocol({ packageRoot, cliEntrypoint, root });
 
+  // These flows own separate roots and each proves the packaged Host's idle
+  // retirement. Start them before awaiting so the same grace window is
+  // observed once in wall-clock time rather than repeatedly in series.
   logStep('checking the interactive TUI setup path');
-  await smokeInteractiveTui({
+  const interactiveTui = [false, true].map((fullscreen) =>
+    smokeInteractiveTui({
+      packageRoot,
+      cliEntrypoint,
+      ptySpawn,
+      root: join(root, fullscreen ? 'first-run-fullscreen' : 'first-run'),
+      fullscreen,
+    }),
+  );
+
+  logStep('checking a filesystem-backed controlled model turn');
+  const controlledRun = smokeControlledRun({
+    packageRoot,
+    cliEntrypoint,
+    root: join(root, 'controlled-run'),
+  });
+  const smokeResults = await Promise.allSettled([...interactiveTui, controlledRun]);
+  const smokeFailures = smokeResults.flatMap((result) =>
+    result.status === 'rejected' ? [result.reason] : [],
+  );
+  if (smokeFailures.length === 1) throw smokeFailures[0];
+  if (smokeFailures.length > 1) {
+    throw new AggregateError(smokeFailures, 'Installed CLI product flows failed');
+  }
+
+  logStep('checking npx invocation lifetime and durable schedule recovery after cache removal');
+  await smokeNpxScheduleRecovery({
     packageRoot,
     cliEntrypoint,
     ptySpawn,
-    root: join(root, 'first-run'),
+    root: join(root, 'npx-schedule-recovery'),
   });
 
   logStep('checking the managed Runtime Host lifecycle');
@@ -186,13 +223,6 @@ async function validateInstalledProduct(root) {
     cliEntrypoint,
     ptySpawn,
     root: join(root, 'runtime-host-service'),
-  });
-
-  logStep('checking a filesystem-backed controlled model turn');
-  await smokeControlledRun({
-    packageRoot,
-    cliEntrypoint,
-    root: join(root, 'controlled-run'),
   });
 
   console.log(
@@ -214,7 +244,15 @@ async function smokeRuntimeHostPeerProtocol({ packageRoot, cliEntrypoint, root }
     packageRoot,
     'node_modules/@maka/runtime-host/dist/peer-mesh/index.js',
   );
+  const reachability = await importInstalled(
+    packageRoot,
+    'node_modules/@maka/runtime-host/dist/peer-reachability/index.js',
+  );
   const access = await importInstalled(packageRoot, 'dist/runtime-host-access-command.js');
+  const windowsLifecycle = await importInstalled(
+    packageRoot,
+    'dist/runtime-host-windows-service.js',
+  );
   const clientDataRoot = join(root, 'peer-client');
   const hostRoot = join(root, 'peer-host');
   const hostKeyPath = join(root, 'peer-host.key');
@@ -225,8 +263,10 @@ async function smokeRuntimeHostPeerProtocol({ packageRoot, cliEntrypoint, root }
   const previousKeyPath = process.env.MAKA_RUNTIME_HOST_PEER_KEY_PATH;
   let host;
   let connection;
-  let meshAuthorityOwner;
-  let meshMemberOwner;
+  let meshAuthorityEndpoint;
+  let meshAuthorityComponent;
+  let meshMemberEndpoint;
+  let meshMemberComponent;
   try {
     delete process.env.MAKA_RUNTIME_HOST_PEER_NATIVE_PATH;
     delete process.env.MAKA_RUNTIME_HOST_PEER_KEY_PATH;
@@ -239,6 +279,12 @@ async function smokeRuntimeHostPeerProtocol({ packageRoot, cliEntrypoint, root }
     const nativePath = process.env.MAKA_RUNTIME_HOST_PEER_NATIVE_PATH;
     if (!nativePath) throw new Error('Installed CLI did not configure its direct-peer artifact');
     const addon = require(nativePath);
+    await smokeWindowsTaskScheduler(
+      addon,
+      windowsLifecycle.createWindowsRuntimeHostLifecycleProvider,
+      cliEntrypoint,
+      join(root, 'windows task & % 生命周期'),
+    );
     const peerId = await addon.ensurePeerIdentity(hostKeyPath);
     const unrelatedPeerId = await addon.ensurePeerIdentity(join(root, 'unrelated-peer.key'));
     try {
@@ -247,19 +293,22 @@ async function smokeRuntimeHostPeerProtocol({ packageRoot, cliEntrypoint, root }
     } catch (error) {
       if (!String(error).includes('peer_identity_mismatch')) throw error;
     }
-    meshAuthorityOwner = await mesh.openRuntimeHostPeerMeshOwner({
-      nativePath,
-      keyPath: hostKeyPath,
-      expectedPeerId: peerId,
-      dataRoot: join(root, 'mesh-authority'),
-      listenAddresses: ['/ip4/127.0.0.1/udp/0/quic-v1'],
-    });
     host = await server.startExecutionRuntimeHostService({
       rootPath: hostRoot,
-      peer: { client: meshAuthorityOwner.client },
+      peer: {
+        nativePath,
+        keyPath: hostKeyPath,
+        expectedPeerId: peerId,
+        meshDataRoot: join(root, 'peer-host-state'),
+        listenAddresses: ['/ip4/127.0.0.1/udp/0/quic-v1'],
+      },
     });
     const listener = host.peerListeners[0];
-    if (!listener || listener.peerId !== peerId || listener.listenAddresses.length === 0) {
+    if (
+      !listener ||
+      listener.reachability.lease.peerId !== peerId ||
+      listener.reachability.lease.directRoutes.length === 0
+    ) {
       throw new Error('Installed Runtime Host direct-peer listener did not become ready');
     }
     const issued = await access.issueRuntimeHostAccessCredential({
@@ -272,16 +321,33 @@ async function smokeRuntimeHostPeerProtocol({ packageRoot, cliEntrypoint, root }
       canUseHostPaths: false,
       preset: 'terminal-client',
     });
+    const meshAuthorityDataRoot = join(root, 'mesh-authority');
+    meshAuthorityEndpoint = await reachability.openRuntimeHostPeerEndpointOwner({
+      nativePath,
+      keyPath: join(root, 'mesh-authority.key'),
+      dataRoot: meshAuthorityDataRoot,
+      listenAddresses: ['/ip4/127.0.0.1/udp/0/quic-v1'],
+    });
+    meshAuthorityComponent = await mesh.openRuntimeHostPeerMeshComponent({
+      dataRoot: meshAuthorityDataRoot,
+      endpoint: meshAuthorityEndpoint,
+      endpointKind: 'host',
+    });
     const meshMemberKeyPath = join(root, 'mesh-member.key');
     const meshMemberDataRoot = join(root, 'mesh-member');
-    meshMemberOwner = await mesh.openRuntimeHostPeerMeshOwner({
+    meshMemberEndpoint = await reachability.openRuntimeHostPeerEndpointOwner({
       nativePath,
       keyPath: meshMemberKeyPath,
       dataRoot: meshMemberDataRoot,
       listenAddresses: ['/ip4/127.0.0.1/udp/0/quic-v1'],
     });
-    const meshAuthority = meshAuthorityOwner.mesh;
-    let meshMember = meshMemberOwner.mesh;
+    meshMemberComponent = await mesh.openRuntimeHostPeerMeshComponent({
+      dataRoot: meshMemberDataRoot,
+      endpoint: meshMemberEndpoint,
+      endpointKind: 'client',
+    });
+    const meshAuthority = meshAuthorityComponent.mesh;
+    let meshMember = meshMemberComponent.mesh;
     const created = await meshAuthority.create();
     const joined = await meshMember.join(await meshAuthority.invite(created.roster.roster.meshId));
     if (joined.roster.roster.members.length !== 2) {
@@ -295,14 +361,12 @@ async function smokeRuntimeHostPeerProtocol({ packageRoot, cliEntrypoint, root }
         rootId: host.rootId,
         transport: {
           kind: 'libp2p-direct',
-          peerId,
-          routeHints: ['/ip4/127.0.0.1/udp/1/quic-v1'],
-          coordinationRelays: [],
+          reachability: listener.reachability,
         },
       },
       credential: issued.credential,
       clientInstanceId: 'release-smoke-peer-client',
-      peerClient: meshMemberOwner.client,
+      peerClient: meshMemberEndpoint.client,
       connectTimeoutMs: 10_000,
       handshakeTimeoutMs: 10_000,
       readyTimeoutMs: 10_000,
@@ -313,19 +377,27 @@ async function smokeRuntimeHostPeerProtocol({ packageRoot, cliEntrypoint, root }
     }
     const removed = await meshAuthority.remove(
       created.roster.roster.meshId,
-      meshMemberOwner.client.identity().peerId,
+      meshMemberEndpoint.client.identity().peerId,
     );
     if (removed.roster.roster.members.length !== 1) {
       throw new Error('Installed Runtime Host peer Mesh did not remove the invited peer');
     }
-    await meshMemberOwner.close();
-    meshMemberOwner = await mesh.openRuntimeHostPeerMeshOwner({
+    await meshMemberComponent.close();
+    meshMemberComponent = undefined;
+    await meshMemberEndpoint.close();
+    meshMemberEndpoint = undefined;
+    meshMemberEndpoint = await reachability.openRuntimeHostPeerEndpointOwner({
       nativePath,
       keyPath: meshMemberKeyPath,
       dataRoot: meshMemberDataRoot,
       listenAddresses: ['/ip4/127.0.0.1/udp/0/quic-v1'],
     });
-    meshMember = meshMemberOwner.mesh;
+    meshMemberComponent = await mesh.openRuntimeHostPeerMeshComponent({
+      dataRoot: meshMemberDataRoot,
+      endpoint: meshMemberEndpoint,
+      endpointKind: 'client',
+    });
+    meshMember = meshMemberComponent.mesh;
     const stale = meshMember.status()[0];
     if (stale?.roster.roster.revision !== joined.roster.roster.revision) {
       throw new Error('Installed Runtime Host peer Mesh did not recover the last-known roster');
@@ -341,7 +413,7 @@ async function smokeRuntimeHostPeerProtocol({ packageRoot, cliEntrypoint, root }
     }
     await meshAuthority.remove(
       created.roster.roster.meshId,
-      meshMemberOwner.client.identity().peerId,
+      meshMemberEndpoint.client.identity().peerId,
     );
     await meshMember.reconcile();
     if (meshMember.status().length !== 0) {
@@ -350,10 +422,155 @@ async function smokeRuntimeHostPeerProtocol({ packageRoot, cliEntrypoint, root }
   } finally {
     await connection?.close().catch(() => undefined);
     await host?.close().catch(() => undefined);
-    await meshMemberOwner?.close().catch(() => undefined);
-    await meshAuthorityOwner?.close().catch(() => undefined);
+    await meshMemberComponent?.close().catch(() => undefined);
+    await meshMemberEndpoint?.close().catch(() => undefined);
+    await meshAuthorityComponent?.close().catch(() => undefined);
+    await meshAuthorityEndpoint?.close().catch(() => undefined);
     restoreEnvironment('MAKA_RUNTIME_HOST_PEER_NATIVE_PATH', previousNativePath);
     restoreEnvironment('MAKA_RUNTIME_HOST_PEER_KEY_PATH', previousKeyPath);
+  }
+}
+
+async function smokeWindowsTaskScheduler(addon, createProvider, cliEntrypoint, root) {
+  if (process.platform !== 'win32') return;
+  mkdirSync(root, { recursive: true });
+  const rootId = createHash('sha256').update(root).digest('hex');
+  const controllerPackageRoot = dirname(dirname(cliEntrypoint));
+  const managedPackageRoot = join(controllerPackageRoot, '.windows-lifecycle-smoke-package');
+  cpSync(join(controllerPackageRoot, 'dist'), join(managedPackageRoot, 'dist'), {
+    recursive: true,
+  });
+  cpSync(join(controllerPackageRoot, 'native'), join(managedPackageRoot, 'native'), {
+    recursive: true,
+  });
+  const managedCliEntrypoint = join(managedPackageRoot, 'dist', basename(cliEntrypoint));
+  const scriptPath = join(
+    dirname(managedCliEntrypoint),
+    'runtime-host-windows-supervisor-smoke.mjs',
+  );
+  const readyPath = join(root, 'ready.json');
+  const replacementReadyPath = join(root, 'replacement-ready.json');
+  const hostileArgument = '空 格 &|^<>%PATH% " \\';
+  writeFileSync(
+    scriptPath,
+    [
+      "import { spawn } from 'node:child_process';",
+      "import { writeFileSync } from 'node:fs';",
+      "import { fileURLToPath } from 'node:url';",
+      'const [runtimeHost, serve, expected, readyPath] = process.argv.slice(2);',
+      'try {',
+      "  const { ownWindowsRuntimeHostProcessTree } = await import('./runtime-host-windows-service.js');",
+      '  await ownWindowsRuntimeHostProcessTree(fileURLToPath(import.meta.url));',
+      "  if (runtimeHost !== 'runtime-host' || serve !== 'serve') process.exit(90);",
+      `  if (expected !== ${JSON.stringify(hostileArgument)}) process.exit(91);`,
+      "  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore' });",
+      '  child.unref();',
+      '  writeFileSync(readyPath, JSON.stringify({ pid: process.pid, childPid: child.pid }));',
+      '  setInterval(() => {}, 1000);',
+      '} catch (error) {',
+      '  writeFileSync(readyPath, JSON.stringify({ error: error instanceof Error ? (error.stack ?? error.message) : String(error) }));',
+      '  process.exit(92);',
+      '}',
+      '',
+    ].join('\n'),
+    'utf8',
+  );
+  const provider = createProvider(rootId, { cliPath: managedCliEntrypoint });
+  const legacyRunnerPath = join(
+    dirname(managedCliEntrypoint),
+    'runtime-host-windows-task-runner.js',
+  );
+  const hostCommand = [
+    process.execPath,
+    scriptPath,
+    'runtime-host',
+    'serve',
+    hostileArgument,
+    readyPath,
+  ];
+  const replacementHostCommand = [...hostCommand.slice(0, -1), replacementReadyPath];
+  const reconciliationCommand = [process.execPath, '-e', 'process.exit(0)'];
+  try {
+    await provider.supervisor.preflight();
+    addon.windowsTaskConverge(rootId, 'host', legacyRunnerPath, hostCommand);
+    addon.windowsTaskVerify(rootId, 'host', legacyRunnerPath, hostCommand);
+    await provider.supervisor.verify({ command: hostCommand });
+    await provider.reconciliationTrigger.converge({ command: reconciliationCommand });
+    await provider.reconciliationTrigger.verify({ command: reconciliationCommand });
+    const reconciliation = await provider.reconciliationTrigger.status();
+    if (!reconciliation.installed || !reconciliation.active) {
+      throw new Error('Windows reconciliation task is not ready');
+    }
+    await provider.supervisor.activate();
+    await provider.supervisor.activate();
+    let deadline = Date.now() + 15_000;
+    while (!existsSync(readyPath) && Date.now() < deadline) await delay(100);
+    if (!existsSync(readyPath)) {
+      const status = await provider.supervisor.status();
+      throw new Error(`Windows scheduled task did not start: ${JSON.stringify(status)}`);
+    }
+    const first = JSON.parse(readFileSync(readyPath, 'utf8'));
+    if (typeof first.error === 'string') {
+      throw new Error(`Windows scheduled task Host failed to start: ${first.error}`);
+    }
+    const firstStatus = await provider.supervisor.status();
+    if (
+      firstStatus.state !== 'running' ||
+      firstStatus.pid !== first.pid ||
+      !processExists(first.pid) ||
+      !processExists(first.childPid)
+    ) {
+      throw new Error('Windows scheduled task PID does not match its process tree owner');
+    }
+    rmSync(readyPath);
+    process.kill(first.pid, 'SIGKILL');
+    deadline = Date.now() + 90_000;
+    while (!existsSync(readyPath) && Date.now() < deadline) await delay(100);
+    if (!existsSync(readyPath))
+      throw new Error('Windows scheduled task did not restart after crash');
+    const ready = JSON.parse(readFileSync(readyPath, 'utf8'));
+    const status = await provider.supervisor.status();
+    if (
+      ready.pid === first.pid ||
+      status.state !== 'running' ||
+      status.pid !== ready.pid ||
+      !processExists(ready.pid) ||
+      !processExists(ready.childPid) ||
+      processExists(first.childPid)
+    ) {
+      throw new Error('Windows scheduled task did not recover with one fresh process tree');
+    }
+    await provider.supervisor.converge({ command: replacementHostCommand });
+    await provider.supervisor.verify({ command: replacementHostCommand });
+    await provider.supervisor.activate();
+    deadline = Date.now() + 15_000;
+    while (!existsSync(replacementReadyPath) && Date.now() < deadline) await delay(100);
+    if (!existsSync(replacementReadyPath)) {
+      throw new Error('Windows scheduled task did not activate its replacement definition');
+    }
+    const replacement = JSON.parse(readFileSync(replacementReadyPath, 'utf8'));
+    if (
+      processExists(ready.pid) ||
+      processExists(ready.childPid) ||
+      !processExists(replacement.pid) ||
+      !processExists(replacement.childPid)
+    ) {
+      throw new Error('Windows scheduled task replacement retained the previous process tree');
+    }
+    await provider.supervisor.retire();
+    const stopDeadline = Date.now() + 10_000;
+    while (
+      (processExists(replacement.pid) || processExists(replacement.childPid)) &&
+      Date.now() < stopDeadline
+    ) {
+      await delay(100);
+    }
+    if (processExists(replacement.pid) || processExists(replacement.childPid)) {
+      throw new Error('Windows scheduled task retirement left an owned process alive');
+    }
+  } finally {
+    await provider.supervisor.uninstall().catch(() => undefined);
+    await provider.reconciliationTrigger.uninstall().catch(() => undefined);
   }
 }
 
@@ -385,11 +602,9 @@ function validateReleaseArtifact(path) {
     }
     unpackedBytes += file.size;
   }
-  validateCliReleaseArtifactMetrics({
-    compressedBytes: statSync(path).size,
-    unpackedBytes,
-    entryCount: files.length,
-  });
+  console.log(
+    `[cli-smoke] artifact: ${statSync(path).size} compressed bytes, ${unpackedBytes} unpacked bytes, ${files.length} files`,
+  );
 }
 
 function validateInstalledRuntimeFiles(packageRoot) {
@@ -397,11 +612,11 @@ function validateInstalledRuntimeFiles(packageRoot) {
     // Incubator policy: the installed package carries the incubating
     // disclaimer next to LICENSE/NOTICE, like every other Maka release.
     'DISCLAIMER-WIP',
-    'node_modules/@maka/runtime/dist/workers/filesystem-worker.js',
+    'node_modules/@maka/runtime/dist/workers/filesystem-worker.mjs',
     'node_modules/@maka/runtime-host/dist/execution-candidate-main.js',
     'node_modules/@maka/eval/dist/index.js',
-    'packages/eval/harbor/relay_agent.py',
-    'packages/eval/harbor/egress-proxy/network-policy',
+    'node_modules/@maka/eval/harbor/relay_agent.py',
+    'node_modules/@maka/eval/harbor/egress-proxy/network-policy',
   ]) {
     if (!existsSync(join(packageRoot, path))) {
       throw new Error(`Installed runtime file is missing: ${path}`);
@@ -413,7 +628,7 @@ function validateInstalledRuntimeFiles(packageRoot) {
   );
   assertOutput(
     readFileSync(join(packageRoot, 'node_modules/@ai-sdk/provider-utils/dist/index.js'), 'utf8'),
-    'function absentIfBlank',
+    'Ambiguous streamed tool call delta.',
   );
 }
 
@@ -518,12 +733,16 @@ async function smokeNativeFileLock(packageRoot, root) {
   }
 }
 
-async function smokeInteractiveTui({ packageRoot, cliEntrypoint, ptySpawn, root }) {
+async function smokeInteractiveTui({ packageRoot, cliEntrypoint, ptySpawn, root, fullscreen }) {
   mkdirSync(root, { recursive: true });
   const home = join(root, 'home');
   const workspace = join(root, 'workspace');
   mkdirSync(workspace, { recursive: true });
   const environment = isolatedEnvironment(home);
+  environment.MAKA_TUI_FULLSCREEN = fullscreen ? '1' : '0';
+  for (const key of ['DEEPSEEK_API_KEY', 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY']) {
+    delete environment[key];
+  }
   const dataRoots = await resolveInstalledDataRoots(packageRoot, environment, home);
   await withCleanup(
     async () => {
@@ -545,7 +764,9 @@ async function smokeInteractiveTui({ packageRoot, cliEntrypoint, ptySpawn, root 
         },
         timeoutMs: PROCESS_TIMEOUT_MS,
       });
-      if (result.exitCode !== 0) throw new Error(`Interactive TUI exited with ${result.exitCode}`);
+      if (result.exitCode !== 0) {
+        throw new Error(`Interactive TUI exited with ${result.exitCode}: ${result.output}`);
+      }
     },
     (completed) => settleRuntimeHost(packageRoot, dataRoots.workspaceRoot, completed),
   );
@@ -616,6 +837,171 @@ async function smokeRuntimeHostService({ packageRoot, cliEntrypoint, ptySpawn, r
     },
     (completed) => settleRuntimeHost(packageRoot, stateRoot, completed),
   );
+}
+
+async function smokeNpxScheduleRecovery({ packageRoot, cliEntrypoint, ptySpawn, root }) {
+  const home = join(root, 'home');
+  const workspace = join(root, 'workspace');
+  mkdirSync(workspace, { recursive: true });
+  const cache = join(root, 'npm-cache');
+  const cacheSlot = join(cache, '_npx', 'release-smoke');
+  const temporaryPackage = join(cacheSlot, 'node_modules', 'maka-agent');
+  // Use the already verified immutable candidate bytes, not a registry fetch
+  // or a symlink that resolves back to the persistent installation.
+  cpSync(packageRoot, temporaryPackage, { recursive: true, dereference: true });
+  const environment = { ...isolatedEnvironment(home), npm_config_cache: cache };
+  for (const key of ['DEEPSEEK_API_KEY', 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY']) {
+    delete environment[key];
+  }
+  const dataRoots = await resolveInstalledDataRoots(packageRoot, environment, home);
+  const installation = await importInstalled(packageRoot, 'dist/runtime-host-cli-installation.js');
+  if (
+    !(await installation.isTemporaryNpxInstallation(temporaryPackage, {
+      environment,
+      homeDir: home,
+    }))
+  ) {
+    throw new Error('Release smoke cache layout is not recognized as a temporary npx package');
+  }
+  const client = await importInstalled(
+    packageRoot,
+    'node_modules/@maka/runtime-host/dist/client/index.js',
+  );
+  const protocol = await importInstalled(
+    packageRoot,
+    'node_modules/@maka/runtime-host/dist/protocol/index.js',
+  );
+  let observer;
+  let source;
+  let recovered;
+  let task;
+  const connect = async () => {
+    const result = await client.connectExistingRuntimeHost({
+      rootPath: dataRoots.workspaceRoot,
+      compositionId: protocol.INTERACTIVE_RUNTIME_HOST_COMPOSITION_ID,
+      protocol: {
+        min: protocol.RUNTIME_HOST_PROTOCOL_VERSION,
+        max: protocol.RUNTIME_HOST_PROTOCOL_VERSION,
+      },
+      connectTimeoutMs: 10_000,
+      handshakeTimeoutMs: 10_000,
+    });
+    if (result.kind !== 'connected')
+      throw new Error(`Schedule smoke Host unavailable: ${result.kind}`);
+    observer = result.connection;
+    return result;
+  };
+  const assertSchedule = async () => {
+    const result = await observer.request('scheduled-task.query', { kind: 'get', taskId: task.id });
+    if (
+      result.kind !== 'task' ||
+      !result.task ||
+      JSON.stringify(scheduleFacts(result.task)) !== JSON.stringify(scheduleFacts(task))
+    ) {
+      throw new Error('The npx-created durable schedule changed or disappeared after recovery');
+    }
+    const diagnostics = await observer.request('host.diagnostics.query', {});
+    if (
+      !diagnostics.residencies.some((entry) => entry.label === 'scheduled-task' && entry.count > 0)
+    ) {
+      throw new Error('The release smoke schedule does not hold a Host residency');
+    }
+  };
+  const exitSurface = async (entrypoint, prepare) => {
+    const result = await runPtyScenario({
+      ptySpawn,
+      command: process.execPath,
+      args: [entrypoint],
+      cwd: workspace,
+      environment,
+      marker: 'Set Up Provider',
+      onMarker: async (terminal) => {
+        await prepare();
+        await observer.close();
+        observer = undefined;
+        terminal.write('\x03');
+        setTimeout(() => terminal.write('\x04'), 250);
+      },
+      timeoutMs: PROCESS_TIMEOUT_MS,
+    });
+    if (result.exitCode !== 0)
+      throw new Error(`Schedule smoke Surface exited with ${result.exitCode}`);
+  };
+  await withCleanup(
+    async () => {
+      await exitSurface(join(temporaryPackage, 'dist', 'cli.js'), async () => {
+        const connected = await connect();
+        source = {
+          rootId: observer.rootId,
+          hostEpoch: observer.hostEpoch,
+          pid: connected.registration.pid,
+        };
+        const created = await observer.request('scheduled-task.mutate', {
+          kind: 'create',
+          input: {
+            title: 'release-smoke npx durable schedule',
+            intentBody: '',
+            schedule: { kind: 'once', runAt: Date.now() + 24 * 60 * 60 * 1_000 },
+            effect: { kind: 'notify', channel: 'local' },
+          },
+        });
+        if (created.kind !== 'task') throw new Error('Unable to create the release smoke schedule');
+        task = created.task;
+        await assertSchedule();
+      });
+      // This must succeed before any forced cleanup or schedule deletion: the
+      // source still has durable work, but its temporary invocation has ended.
+      await waitForRuntimeHostShutdown(packageRoot, dataRoots.workspaceRoot);
+      const deadline = Date.now() + 5_000;
+      while (processExists(source.pid) && Date.now() < deadline) await delay(50);
+      if (processExists(source.pid))
+        throw new Error('The npx-owned Host outlived its CLI invocation');
+      renameSync(cacheSlot, join(root, 'removed-npx-cache-slot'));
+      if (existsSync(temporaryPackage)) throw new Error('The old npx package path still exists');
+
+      await exitSurface(cliEntrypoint, async () => {
+        const connected = await connect();
+        if (observer.rootId !== source.rootId || observer.hostEpoch === source.hostEpoch) {
+          throw new Error('Persistent CLI did not start a fresh Host for the same State Root');
+        }
+        recovered = { hostEpoch: observer.hostEpoch, pid: connected.registration.pid };
+        await assertSchedule();
+      });
+      // Past the idle grace plus a margin for a loaded runner's process exit, so
+      // a Host that lost its residency cannot still read as alive.
+      await delay(RELEASE_SMOKE_IDLE_GRACE_MS + 3_000);
+      const connected = await connect();
+      if (
+        observer.hostEpoch !== recovered.hostEpoch ||
+        connected.registration.pid !== recovered.pid
+      ) {
+        throw new Error('The persistent Host was replaced after its Surface exited');
+      }
+      await assertSchedule();
+      const deleted = await observer.request('scheduled-task.mutate', {
+        kind: 'delete',
+        taskId: task.id,
+      });
+      if (deleted.kind !== 'deleted')
+        throw new Error('Unable to remove the release smoke schedule');
+    },
+    (completed) =>
+      runCleanupSteps([
+        () => observer?.close(),
+        () => settleRuntimeHost(packageRoot, dataRoots.workspaceRoot, completed),
+      ]),
+  );
+}
+
+function scheduleFacts(task) {
+  return {
+    id: task.id,
+    title: task.title,
+    status: task.status,
+    schedule: task.schedule,
+    effect: task.effect,
+    nextFireAt: task.nextFireAt,
+  };
 }
 
 async function allocateLoopbackPort() {
@@ -1068,6 +1454,7 @@ function runPtyScenario({
   return new Promise((resolvePromise, reject) => {
     let output = '';
     let markerSeen = false;
+    let markerAction = Promise.resolve();
     let outputActionApplied = false;
     let settled = false;
     const terminal = ptySpawn(command, args, {
@@ -1112,7 +1499,13 @@ function runPtyScenario({
       if (!markerSeen && output.includes(marker)) {
         markerSeen = true;
         try {
-          onMarker?.(terminal, output);
+          markerAction = Promise.resolve(onMarker?.(terminal, output)).catch((error) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            terminal.kill();
+            reject(error);
+          });
         } catch (error) {
           settled = true;
           clearTimeout(timer);
@@ -1123,13 +1516,18 @@ function runPtyScenario({
     });
     terminal.onExit(({ exitCode, signal }) => {
       if (settled) return;
-      settled = true;
-      clearTimeout(timer);
       if (!markerSeen) {
+        settled = true;
+        clearTimeout(timer);
         reject(new Error(`PTY command exited before ${JSON.stringify(marker)}: ${output}`));
         return;
       }
-      resolvePromise({ exitCode, signal, output });
+      void markerAction.then(() => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolvePromise({ exitCode, signal, output });
+      });
     });
   });
 }
@@ -1190,6 +1588,8 @@ function runProcess(command, args, { cwd, environment, timeoutMs }) {
 }
 
 function isolatedEnvironment(home) {
+  if (!installedIdleGraceEnvVar)
+    throw new Error('Installed client exports no IDLE_GRACE_MS_ENV_VAR');
   const appData = join(home, 'AppData', 'Roaming');
   const localAppData = join(home, 'AppData', 'Local');
   const temporaryDirectory = join(home, 'tmp');
@@ -1210,6 +1610,7 @@ function isolatedEnvironment(home) {
     TERM: 'xterm-256color',
     NO_PROXY: '127.0.0.1,localhost',
     no_proxy: '127.0.0.1,localhost',
+    [installedIdleGraceEnvVar]: String(RELEASE_SMOKE_IDLE_GRACE_MS),
   };
 }
 

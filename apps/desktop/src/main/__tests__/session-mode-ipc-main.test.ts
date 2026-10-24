@@ -107,6 +107,59 @@ test('the orchestration default writes its own field alone', async () => {
   assert.deepEqual(patches, [{ orchestrationMode: 'swarm' }, { orchestrationMode: 'default' }]);
 });
 
+test('model and thinking are committed through one configuration patch', async () => {
+  const patches: DesktopSessionConfigurationPatch[] = [];
+  const ipc = harness(patches);
+
+  await ipc.invoke('sessions:setModelConfiguration', 'session-1', {
+    llmConnectionId: 'openai-id',
+    llmConnectionSlug: 'openai-main',
+    model: 'gpt-5',
+    thinkingLevel: 'high',
+  });
+
+  assert.deepEqual(patches, [{
+    modelTarget: {
+      kind: 'explicit',
+      connectionId: 'openai-id',
+      connectionSlug: 'openai-main',
+      model: 'gpt-5',
+    },
+    thinkingLevel: 'high',
+  }]);
+});
+
+test('compound model configuration requires an explicit thinking level', async () => {
+  const patches: DesktopSessionConfigurationPatch[] = [];
+  const ipc = harness(patches);
+
+  await assert.rejects(
+    ipc.invoke('sessions:setModelConfiguration', 'session-1', {
+      llmConnectionId: 'openai-id',
+      llmConnectionSlug: 'openai-main',
+      model: 'gpt-5',
+    }) as Promise<unknown>,
+    /Invalid thinking level/,
+  );
+  assert.deepEqual(patches, []);
+});
+
+test('executor model and thinking are committed through one configuration patch', async () => {
+  const patches: DesktopSessionConfigurationPatch[] = [];
+  const ipc = harness(patches);
+
+  await ipc.invoke('sessions:setExecutorConfiguration', 'session-1', {
+    executorId: 'codex.app-server',
+    model: 'gpt-6-astra',
+    thinkingLevel: 'xhigh',
+  });
+
+  assert.deepEqual(patches, [{
+    executorTarget: { executorId: 'codex.app-server', model: 'gpt-6-astra' },
+    thinkingLevel: 'xhigh',
+  }]);
+});
+
 test('a Plan Session keeps the orchestration default it was carrying', async () => {
   const patches: DesktopSessionConfigurationPatch[] = [];
   const ipc = harness(patches);

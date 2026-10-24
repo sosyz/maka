@@ -19,18 +19,16 @@
 
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
-import type { StoredMessage } from '@maka/core/session';
+import { decodeCanonicalMessage, type StoredMessage } from '@maka/core/session';
+import { foldTimeline } from '../timeline-fold.js';
 import {
-  materializeChat,
   materializeTools,
   materializeTurns,
   overlayLiveTurn,
   type TurnTimelineItem,
 } from "../materialize.js";
-import {
-  applyLiveTurnEvent,
-  armLiveTurn,
-} from "../live-turn-projection.js";
+import { applyLiveTurnEvent } from './live-turn-zh.js';
+import { armLiveTurn } from "../live-turn-projection.js";
 
 const originalUser = {
   type: "user" as const,
@@ -39,6 +37,25 @@ const originalUser = {
   ts: 1,
   text: "request",
 };
+
+test('keeps interrupted and replacement responses distinct live and after reload', () => {
+  const failed = { type: 'assistant', id: 'failed', turnId: 't1', ts: 2, text: 'Partial answer', modelId: 'fixture', interrupted: true };
+  const recovered = { ...failed, id: 'recovered', ts: 3, text: 'Recovered answer', interrupted: undefined };
+  const reloaded = JSON.parse(JSON.stringify([originalUser, failed, recovered])).map(decodeCanonicalMessage);
+  let live = armLiveTurn('t1');
+  for (const message of [failed, recovered]) {
+    live = applyLiveTurnEvent(live, {
+      type: 'text_complete', id: message.id, turnId: 't1', messageId: message.id,
+      ts: message.ts, text: message.text, ...(message.interrupted ? { interrupted: true } : {}),
+    })!;
+  }
+  for (const turn of [materializeTurns(reloaded, 'en')[0], overlayLiveTurn(materializeTurns([originalUser], 'en'), live, 'en')[0]]) {
+    const responses = foldTimeline(turn!.timeline).entries.filter((entry) => entry.kind === 'text');
+    assert.deepEqual(responses.map((entry) => [entry.text, entry.interrupted === true]), [
+      ['Partial answer', true], ['Recovered answer', false],
+    ]);
+  }
+});
 const beforeAssistant = {
   type: "assistant" as const,
   id: "before-steer",
@@ -62,6 +79,22 @@ function timelineText(turn: ReturnType<typeof materializeTurns>[number] | undefi
 }
 
 describe("steering timeline", () => {
+  test('ignores old display anchors and keeps Runtime consumption order', () => {
+    const messages = [originalUser, beforeAssistant,
+      { ...steeringUser, steeringEventId: 'accepted' },
+      { ...beforeAssistant, id: 'after', ts: 5, text: 'after' },
+    ];
+    assert.deepEqual(timelineText(materializeTurns(messages, 'en')[0]), [
+      'text:before', 'user:steer', 'text:after',
+    ]);
+    const live = applyLiveTurnEvent(armLiveTurn('t1'), {
+      type: 'text_complete', id: 'answer', messageId: beforeAssistant.id, turnId: 't1', ts: 2, text: 'before',
+    });
+    assert.deepEqual(timelineText(overlayLiveTurn(materializeTurns(messages, 'en'), live, 'en')[0]), [
+      'text:before', 'user:steer', 'text:after',
+    ]);
+  });
+
   test("keeps a steering message at its conversational position", () => {
     const [turn] = materializeTurns([
       originalUser,
@@ -75,7 +108,7 @@ describe("steering timeline", () => {
         text: "after",
         modelId: "fixture",
       },
-    ]);
+    ], "en");
 
     assert.deepEqual(timelineText(turn), [
       "text:before",
@@ -85,7 +118,7 @@ describe("steering timeline", () => {
   });
 
   test("renders one live steering message while its persisted row catches up", () => {
-    const settled = materializeTurns([originalUser]);
+    const settled = materializeTurns([originalUser], "en");
     const before = applyLiveTurnEvent(armLiveTurn("t1"), {
       type: "text_complete",
       id: "event-before",
@@ -103,15 +136,15 @@ describe("steering timeline", () => {
       content: { text: "inserted instruction" },
     });
 
-    const [overlaid] = overlayLiveTurn(settled, live);
+    const [overlaid] = overlayLiveTurn(settled, live, "en");
     assert.deepEqual(timelineText(overlaid), ["text:before", "user:inserted instruction"]);
 
     const persisted = materializeTurns([
       originalUser,
       beforeAssistant,
       { type: "user", id: "steer-1", turnId: "t1", ts: 2, text: "inserted instruction" },
-    ]);
-    const [deduplicated] = overlayLiveTurn(persisted, live);
+    ], "en");
+    const [deduplicated] = overlayLiveTurn(persisted, live, "en");
     assert.deepEqual(timelineText(deduplicated), ["text:before", "user:inserted instruction"]);
   });
 
@@ -126,7 +159,7 @@ describe("steering timeline", () => {
         text: "inserted instruction",
         steeringEventId: "event-steer",
       },
-    ]);
+    ], "en");
     const live = applyLiveTurnEvent(armLiveTurn("t1"), {
       type: "text_delta",
       id: "event-before",
@@ -136,7 +169,7 @@ describe("steering timeline", () => {
       text: "before",
     });
 
-    const [overlaid] = overlayLiveTurn(persisted, live);
+    const [overlaid] = overlayLiveTurn(persisted, live, "en");
 
     assert.deepEqual(timelineText(overlaid), ["text:before", "user:inserted instruction"]);
   });
@@ -154,7 +187,7 @@ describe("steering timeline", () => {
         args: {},
       },
       steeringUser,
-    ]);
+    ], "en");
     const tool = applyLiveTurnEvent(armLiveTurn("t1"), {
       type: "tool_start",
       id: "tool-event",
@@ -182,7 +215,7 @@ describe("steering timeline", () => {
       text: "after",
     });
 
-    const [overlaid] = overlayLiveTurn(persisted, live);
+    const [overlaid] = overlayLiveTurn(persisted, live, "en");
     assert.deepEqual(timelineText(overlaid), ["tools:", "user:steer", "text:after"]);
     assert.deepEqual(
       overlaid?.timeline.flatMap((item) =>
@@ -192,7 +225,63 @@ describe("steering timeline", () => {
   });
 });
 
-describe("materializeChat message metadata", () => {
+describe("materializeTurns message metadata", () => {
+  test("carries a renderer Stop abort source into the turn view model", () => {
+    const [turn] = materializeTurns([
+      userMsg("t-stop", 1, "continue the interrupted work"),
+      {
+        type: "turn_state",
+        id: "stop-state",
+        turnId: "t-stop",
+        ts: 2,
+        status: "aborted",
+        abortSource: "renderer.stop_button",
+      },
+    ], "en");
+
+    assert.equal(turn?.status, "aborted");
+    assert.equal(turn?.abortSource, "renderer.stop_button");
+  });
+
+  test("hides a retired provider dropping note that an old session still carries", () => {
+    const turns = materializeTurns([
+      {
+        type: "system_note",
+        id: "drop",
+        turnId: "t1",
+        ts: 1,
+        kind: "context_provider_dropping",
+        data: { inputTokens: 99_398, priorInputTokens: 134_460 },
+      },
+    ], "en");
+    assert.deepEqual(turns.flatMap((turn) => turn.notes), []);
+  });
+
+  test("hides the apply-time compaction boundary note that exists for usage ordering", () => {
+    // The applied row is the selector's compaction-time anchor; the settlement
+    // context_compacted row stays the one users see.
+    const turns = materializeTurns([
+      {
+        type: "system_note",
+        id: "applied",
+        turnId: "t1",
+        ts: 1,
+        kind: "context_compaction_applied",
+      },
+      {
+        type: "system_note",
+        id: "compacted",
+        turnId: "t1",
+        ts: 2,
+        kind: "context_compacted",
+      },
+    ], "en");
+    assert.deepEqual(
+      turns.flatMap((turn) => turn.notes.map((note) => note.id)),
+      ["compacted"],
+    );
+  });
+
   test("localizes visible system notes", () => {
     const messages: StoredMessage[] = [
       {
@@ -205,16 +294,12 @@ describe("materializeChat message metadata", () => {
     ];
 
     assert.equal(
-      materializeChat(messages, "en")[0]?.text,
-      "Context compacted to keep this session within the model window.",
+      materializeTurns(messages, "en")[0]?.notes[0]?.text,
+      "Earlier context compacted.",
     );
     assert.equal(
-      materializeChat(messages, "zh")[0]?.text,
-      "已压缩较早的对话内容，以适应模型上下文窗口。",
-    );
-    assert.equal(
-      materializeTurns(messages, "zh")[0]?.notes[0]?.text,
-      "已压缩较早的对话内容，以适应模型上下文窗口。",
+      materializeTurns(messages, "zh-CN")[0]?.notes[0]?.text,
+      "已压缩较早的上下文。",
     );
   });
 
@@ -229,8 +314,7 @@ describe("materializeChat message metadata", () => {
         inlineReferences: [],
       },
     ];
-    assert.deepEqual(materializeChat(messages)[0]?.inlineReferences, []);
-    assert.deepEqual(materializeTurns(messages)[0]?.user?.inlineReferences, []);
+    assert.deepEqual(materializeTurns(messages, "en")[0]?.user?.inlineReferences, []);
   });
 
   test("preserves Host provenance on a Goal continuation", () => {
@@ -245,14 +329,122 @@ describe("materializeChat message metadata", () => {
       },
     ];
 
-    assert.deepEqual(materializeChat(messages)[0]?.hostOrigin, {
+    assert.deepEqual(materializeTurns(messages, "en")[0]?.user?.hostOrigin, {
       kind: "goal",
       goalId: "goal-1",
     });
-    assert.deepEqual(materializeTurns(messages)[0]?.user?.hostOrigin, {
-      kind: "goal",
-      goalId: "goal-1",
-    });
+  });
+});
+
+describe('imported Codex context display', () => {
+  function imported(annotations: { text: string; annotation?: string; source?: { messageId: string } }[], body = '') {
+    const prefix = annotations.map(({ text, annotation }) => `“${text}”${annotation ? `\n${annotation}` : ''}`).join('\n\n');
+    return {
+      ...originalUser,
+      text: `\n# Response annotations:
+Each item contains text selected from an earlier Codex response and may include a user comment. Treat items as Annotation 1, Annotation 2, and so on in array order. Use every selection as context and address every comment. For every annotation you address, include its inline directive \`:codex-annotation{index="N"}\`, where N is its one-based array position (for example, \`:codex-annotation{index="1"}\`). Do not use unstructured annotation labels.
+<response-annotations>
+${JSON.stringify(annotations)}
+</response-annotations>
+
+## My request:
+${body}`,
+      displayText: prefix + (body ? `\n\n${body}` : ''),
+    };
+  }
+
+  function questionReply(entries: { question: string; answer: string; questionItemId?: string }[]) {
+    return {
+      ...originalUser,
+      text: `\n<send_user_message_question_reply>\n${JSON.stringify(entries)}\n</send_user_message_question_reply>\n`,
+      displayText: entries.map(({ question, answer }) => `“${question}”${answer ? `\n${answer}` : ''}`).join('\n\n'),
+    };
+  }
+
+  test('projects the excerpt as a native quote and the comment as body text without mutating history', () => {
+    const message = imported([{ text: '补充或纠正任务”框发送的', annotation: '这个', source: { messageId: 'codex-source' } }]);
+    const snapshot = structuredClone(message);
+    for (const source of [message, decodeCanonicalMessage(JSON.parse(JSON.stringify(message)))]) {
+      const user = materializeTurns([source], 'zh-CN')[0]?.user;
+      assert.equal(user?.text, '这个');
+      assert.deepEqual(user?.quotes, [{ text: '补充或纠正任务”框发送的', comment: '这个' }]);
+      assert.equal(user?.id, message.id);
+      assert.equal(user?.ts, message.ts);
+    }
+    assert.deepEqual(message, snapshot);
+    assert.ok(!('quotes' in message), 'display quotes must not be persisted or replayed to the model');
+  });
+
+  test('keeps multiple quote/comment pairs, attachments and request text in order', () => {
+    const tail = '# Files mentioned by the user:\n\n## image.png: /tmp/image.png\nImage attachment: true\n\n    Keep indentation.\n\n## My request:\nliteral heading';
+    const message = imported([
+      { text: 'first\nexcerpt', annotation: 'first comment' },
+      { text: '“second” excerpt', annotation: 'second comment' },
+    ], tail);
+    const user = materializeTurns([message], 'en')[0]?.user;
+    assert.deepEqual(user?.quotes, [
+      { text: 'first\nexcerpt', comment: 'first comment' },
+      { text: '“second” excerpt', comment: 'second comment' },
+    ]);
+    assert.equal(user?.text, `first comment\n\nsecond comment\n\n${tail}`);
+    assert.deepEqual(materializeTurns([message], 'en')[0]?.user, user, 'projection is repeatable');
+  });
+
+  test('keeps an uncommented quote visible without manufacturing body text', () => {
+    const user = materializeTurns([imported([{ text: 'selected text' }])], 'en')[0]?.user;
+    assert.equal(user?.text, '');
+    assert.deepEqual(user?.quotes, [{ text: 'selected text' }]);
+  });
+
+  test('projects a historical question and selected answer without restoring an interactive selector', () => {
+    const question = '图二我理解为：同一个 Session 的完整对话都连续展示，即使夹着别的任务；同一个任务跨多个 Session 时，也在同页展示并加 Session 标识。是这个意思吗？发送目标仍固定为当前任务。';
+    const answer = '是，包含同 Session 的完整对话';
+    const message = questionReply([{ question, answer, questionItemId: 'codex-question' }]);
+    const snapshot = structuredClone(message);
+    for (const source of [message, decodeCanonicalMessage(JSON.parse(JSON.stringify(message)))]) {
+      const user = materializeTurns([source], 'zh-CN')[0]?.user;
+      assert.equal(user?.text, answer);
+      assert.deepEqual(user?.quotes, [{ text: question, comment: answer }]);
+      assert.equal(user?.id, message.id);
+      assert.equal(user?.ts, message.ts);
+    }
+    assert.deepEqual(message, snapshot);
+    assert.ok(!('quotes' in message), 'historical questions must stay display-only');
+  });
+
+  test('preserves question order and empty answers without inventing options or body text', () => {
+    const entries = [{ question: 'First question?', answer: 'First answer' }, { question: 'Second question?', answer: '' }];
+    const user = materializeTurns([questionReply(entries)], 'en')[0]?.user;
+    assert.equal(user?.text, 'First answer');
+    assert.deepEqual(user?.quotes, entries.map(({ question, answer }) => ({ text: question, comment: answer })));
+    assert.equal(materializeTurns([questionReply([entries[1]!])], 'en')[0]?.user?.text, '');
+  });
+
+  test('leaves ordinary text, native references and unrecognized envelopes unchanged', () => {
+    const source = imported([{ text: 'excerpt', annotation: 'comment' }]);
+    const question = questionReply([{ question: 'Question?', answer: 'Answer' }]);
+    const { displayText: _displayText, ...withoutDisplay } = source;
+    const cases = [
+      originalUser,
+      withoutDisplay,
+      { ...source, text: `Example:\n${source.text}` },
+      { ...source, text: source.text.replace('[{"text":"excerpt","annotation":"comment"}]', 'not JSON') },
+      { ...source, text: source.text.replace('"annotation":"comment"', '"annotation":42') },
+      { ...source, text: source.text.replace('[{"text":"excerpt","annotation":"comment"}]', '[]') },
+      { ...source, displayText: `${source.displayText}unrecognized suffix` },
+      { ...source, quotes: [{ text: 'native quote' }] },
+      { ...source, inlineReferences: [] },
+      { ...question, text: question.text.replace('"answer":"Answer"', '"answer":42') },
+      { ...question, text: question.text.replace(',"answer":"Answer"', '') },
+      { ...question, text: `${question.text}not part of the reply` },
+      { ...question, displayText: `${question.displayText}\n\nnot produced by the importer` },
+      { ...originalUser, text: '<send_user_message_question_reply>\n[]\n</send_user_message_question_reply>', displayText: '“Question?”\nAnswer' },
+    ];
+    for (const message of cases) {
+      const user = materializeTurns([message], 'en')[0]?.user;
+      assert.equal(user?.text, 'displayText' in message ? message.displayText : message.text);
+      assert.deepEqual(user?.quotes, 'quotes' in message ? message.quotes : undefined);
+    }
   });
 });
 
@@ -291,6 +483,95 @@ test('retains persisted nested tool activity identity', () => {
     parentToolCallId: 'exec-1',
     parentOperationId: 'exec-operation-1',
   });
+});
+
+test('scopes persisted tool results to their turn when opaque call ids repeat', () => {
+  const turns = materializeTurns([
+    userMsg('turn-1', 1, 'first'),
+    {
+      type: 'tool_call',
+      id: 'call-1',
+      turnId: 'turn-1',
+      ts: 2,
+      toolName: 'Read',
+      args: { path: 'first.txt' },
+    },
+    {
+      type: 'tool_result',
+      id: 'result-1',
+      turnId: 'turn-1',
+      ts: 3,
+      toolUseId: 'call-1',
+      isError: false,
+      outcome: 'success',
+      content: { kind: 'text', text: 'first result' },
+    },
+    userMsg('turn-2', 4, 'second'),
+    {
+      type: 'tool_call',
+      id: 'call-1',
+      turnId: 'turn-2',
+      ts: 5,
+      toolName: 'Read',
+      args: { path: 'second.txt' },
+    },
+    {
+      type: 'tool_result',
+      id: 'result-2',
+      turnId: 'turn-2',
+      ts: 6,
+      toolUseId: 'call-1',
+      isError: true,
+      outcome: 'aborted',
+      content: { kind: 'text', text: 'second result' },
+    },
+  ] satisfies StoredMessage[], 'en');
+
+  assert.deepEqual(
+    turns.map((turn) => ({
+      turnId: turn.turnId,
+      status: turn.tools[0]?.status,
+      result: turn.tools[0]?.result,
+    })),
+    [
+      {
+        turnId: 'turn-1',
+        status: 'completed',
+        result: { kind: 'text', text: 'first result' },
+      },
+      {
+        turnId: 'turn-2',
+        status: 'interrupted',
+        result: { kind: 'text', text: 'second result' },
+      },
+    ],
+  );
+});
+
+test('does not attach a retained old result to a reused call id at a history boundary', () => {
+  const [tool] = materializeTools([
+    {
+      type: 'tool_result',
+      id: 'old-result',
+      turnId: 'turn-old',
+      ts: 1,
+      toolUseId: 'provider-call-1',
+      isError: true,
+      outcome: 'error',
+      content: { kind: 'text', text: 'old failure' },
+    },
+    {
+      type: 'tool_call',
+      id: 'provider-call-1',
+      turnId: 'turn-new',
+      ts: 2,
+      toolName: 'Read',
+      args: { path: 'new.txt' },
+    },
+  ] satisfies StoredMessage[]);
+
+  assert.equal(tool?.result, undefined);
+  assert.notEqual(tool?.status, 'errored');
 });
 
 function shellRunResult(revision: number) {
@@ -345,10 +626,9 @@ describe("flat timeline under tool projection (#1307 P1 regression)", () => {
         content: shellRunResult(1),
       },
       userMsg("t2", 3, "q"),
-    ]);
+    ], "en");
     const turns = overlayLiveTurn(settled, {
       turnId: "t2",
-      phase: "streamed",
       steps: [
         {
           stepId: "a1",
@@ -369,7 +649,7 @@ describe("flat timeline under tool projection (#1307 P1 regression)", () => {
           ],
         },
       ],
-    });
+    }, "en");
     const liveTurn = turns.find((turn) => turn.turnId === "t2");
     assert.deepEqual(
       liveTurn?.timeline.map((item: TurnTimelineItem) => item.kind),
@@ -380,7 +660,7 @@ describe("flat timeline under tool projection (#1307 P1 regression)", () => {
 
 describe("live content over persisted partial rows", () => {
   test("does not create an empty renderer turn for a waiting send", () => {
-    assert.deepEqual(overlayLiveTurn([], armLiveTurn("t1")), []);
+    assert.deepEqual(overlayLiveTurn([], armLiveTurn("t1"), "en"), []);
   });
 
   test("replaces persisted thinking with its live projection instead of rendering it twice", () => {
@@ -392,7 +672,6 @@ describe("live content over persisted partial rows", () => {
         turnId: "t1",
         ts: 2,
         status: "running",
-        partialOutputRetained: false,
       },
       {
         type: "assistant",
@@ -404,10 +683,9 @@ describe("live content over persisted partial rows", () => {
         thinking: { text: "persisted partial" },
         contentOrder: ["thinking"],
       },
-    ]);
+    ], "en");
     const turns = overlayLiveTurn(settled, {
       turnId: "t1",
-      phase: "streamed",
       steps: [
         {
           stepId: "assistant-1",
@@ -420,7 +698,7 @@ describe("live content over persisted partial rows", () => {
           tools: [],
         },
       ],
-    });
+    }, "en");
     const thinking = turns[0]?.timeline.filter(
       (item) => item.kind === "thinking",
     );
@@ -448,7 +726,6 @@ describe("unfinished tools take their status from the turn", () => {
         turnId: "t1",
         ts: 2,
         status: "running",
-        partialOutputRetained: false,
       },
       {
         type: "tool_call",
@@ -458,7 +735,7 @@ describe("unfinished tools take their status from the turn", () => {
         toolName: "Bash",
         args: { command: "sleep 600" },
       },
-    ]);
+    ], "en");
     assert.equal(turn?.status, "running");
     assert.equal(turn?.tools[0]?.status, "running");
   });
@@ -472,7 +749,6 @@ describe("unfinished tools take their status from the turn", () => {
         turnId: "t1",
         ts: 2,
         status: "failed",
-        partialOutputRetained: false,
       },
       {
         type: "tool_call",
@@ -482,7 +758,7 @@ describe("unfinished tools take their status from the turn", () => {
         toolName: "Bash",
         args: { command: "sleep 600" },
       },
-    ]);
+    ], "en");
     assert.equal(turn?.tools[0]?.status, "interrupted");
   });
 });
@@ -499,7 +775,6 @@ describe("live tool status over persisted", () => {
         turnId: "t1",
         ts: 2,
         status: "running",
-        partialOutputRetained: false,
       },
       {
         type: "tool_call",
@@ -509,10 +784,9 @@ describe("live tool status over persisted", () => {
         toolName: "Bash",
         args: { command: "sleep 60" },
       },
-    ]);
+    ], "en");
     const turns = overlayLiveTurn(settled, {
       turnId: "t1",
-      phase: "streamed",
       steps: [
         {
           stepId: "a1",
@@ -527,7 +801,7 @@ describe("live tool status over persisted", () => {
           ],
         },
       ],
-    });
+    }, "en");
     const tools = turns
       .find((turn) => turn.turnId === "t1")
       ?.timeline.find((item: TurnTimelineItem) => item.kind === "tools");
@@ -546,7 +820,6 @@ describe("live tool status over persisted", () => {
         turnId: "t1",
         ts: 2,
         status: "failed",
-        partialOutputRetained: false,
       },
       {
         type: "tool_call",
@@ -556,10 +829,9 @@ describe("live tool status over persisted", () => {
         toolName: "Bash",
         args: { command: "sleep 60" },
       },
-    ]);
+    ], "en");
     const turns = overlayLiveTurn(settled, {
       turnId: "t1",
-      phase: "streamed",
       steps: [
         {
           stepId: "a1",
@@ -583,7 +855,7 @@ describe("live tool status over persisted", () => {
           ],
         },
       ],
-    });
+    }, "en");
     const tools = turns
       .find((turn) => turn.turnId === "t1")
       ?.timeline.find((item: TurnTimelineItem) => item.kind === "tools");
@@ -601,7 +873,6 @@ describe("live tool status over persisted", () => {
         turnId: "t1",
         ts: 2,
         status: "running",
-        partialOutputRetained: false,
       },
       {
         type: "tool_call",
@@ -620,7 +891,7 @@ describe("live tool status over persisted", () => {
         isError: false,
         content: { kind: "text", text: "unsupported_action" },
       },
-    ]);
+    ], "en");
 
     const live = applyLiveTurnEvent(undefined, {
       type: "tool_start",
@@ -631,7 +902,7 @@ describe("live tool status over persisted", () => {
       args: undefined,
       ts: 5,
     });
-    const turns = overlayLiveTurn(settled, live);
+    const turns = overlayLiveTurn(settled, live, "en");
 
     const toolGroup = turns
       .find((turn) => turn.turnId === "t1")
@@ -661,7 +932,6 @@ describe("live tool status over persisted", () => {
         turnId: "t1",
         ts: 2,
         status: "running",
-        partialOutputRetained: false,
       },
       {
         type: "tool_call",
@@ -671,7 +941,7 @@ describe("live tool status over persisted", () => {
         toolName: "Bash",
         args: { command: "sleep 60" },
       },
-    ]);
+    ], "en");
     const started = applyLiveTurnEvent(armLiveTurn("t1"), {
       type: "tool_start",
       id: "event-1",
@@ -704,7 +974,7 @@ describe("live tool status over persisted", () => {
       reason: "user_stop",
       ts: 6,
     });
-    const tools = overlayLiveTurn(settled, aborted!)
+    const tools = overlayLiveTurn(settled, aborted!, "en")
       .find((turn) => turn.turnId === "t1")
       ?.timeline.find((item: TurnTimelineItem) => item.kind === "tools");
     assert.equal(
@@ -712,4 +982,13 @@ describe("live tool status over persisted", () => {
       "interrupted",
     );
   });
+});
+
+test('assistant previews survive materialization without replacing the full text', () => {
+  const message: StoredMessage = { type: 'assistant', id: 'summary', turnId: 'summary-turn', ts: 1,
+    text: 'Full body, not truncated.', summary: 'An independently authored preview.', modelId: 'assistant-bot' };
+  const turn = materializeTurns([message], 'en')[0];
+  const item = turn.timeline.find((row) => row.kind === 'text');
+  assert.equal(item?.kind === 'text' && item.summary, message.summary);
+  assert.equal(item?.kind === 'text' && item.text, message.text);
 });

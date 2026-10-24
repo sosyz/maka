@@ -50,6 +50,7 @@ test('does not render legacy zero cost as a known free Session', () => {
     cacheHitRequests: 0,
     cacheCreateRequests: 0,
     errorRequests: 0,
+    totalDurationMs: 0,
     provenance: {
       coverage: {
         attempts: 0,
@@ -85,6 +86,7 @@ test('reports incomplete provenance as unavailable regardless of recorded reques
     cacheHitRequests: 0,
     cacheCreateRequests: 0,
     errorRequests: 0,
+    totalDurationMs: 0,
     provenance: {
       coverage: {
         attempts: 0,
@@ -121,6 +123,7 @@ test('does not estimate a cache-hit ratio from partial usage', () => {
     cacheHitRequests: 1,
     cacheCreateRequests: 0,
     errorRequests: 0,
+    totalDurationMs: 0,
     provenance: {
       coverage: {
         attempts: 1,
@@ -189,6 +192,27 @@ test('derives per-turn cost only from priced model-call step totals', () => {
     assert.equal(turn?.costUsd, expected, name);
     assert.equal(turn?.durationMs, 9, `${name} duration`);
   }
+});
+
+test('renders an interrupted tool as neutral while preserving the turn abort reason', () => {
+  const trace = traceWithSteps([
+    {
+      kind: 'tool',
+      id: 'tool-1',
+      turnId: 'turn-1',
+      runId: 'run-1',
+      startedAt: 1,
+      endedAt: 2,
+      durationMs: 1,
+      toolName: 'Read',
+      status: 'interrupted',
+    },
+  ]);
+  trace.turns[0]!.failure = { code: 'turn_aborted' };
+
+  const turn = deriveInspectorPanelModel(trace).turns[0];
+  assert.equal(turn?.failureCode, 'turn_aborted');
+  assert.equal(turn?.steps[0]?.failed, false);
 });
 
 test('shows one compact diagnostic line for a failed history-compaction call', () => {

@@ -26,20 +26,27 @@ import type {
   UpdateConnectionInput,
 } from '@maka/core/llm-connections';
 import { buildChatModelChoices } from '@maka/core/chat-model-choice';
+import type { ProjectedLlmConnection } from '@maka/core/llm-connections';
 import {
   connectionEnabledModelIds,
-  defaultEnabledModelIdsWhenOmitted,
-  PROVIDER_DEFAULTS,
+  PROVIDER_REGISTRY,
   providerAuthRequiresSecret,
 } from '@maka/core/llm-connections';
-import { normalizeRelayModelProfiles } from '@maka/core/model-thinking';
+import { normalizeModelOverrides } from '@maka/core/model-thinking';
+import type { CredentialLocator } from '@maka/core/runtime-policy';
 import type {
-  ConnectionCatalogEntry,
-  ConnectionCatalogSnapshot,
-  CredentialLocator,
-} from '@maka/core/runtime-policy';
+  RuntimeHostConnectionCatalogEntry as ConnectionCatalogEntry,
+  RuntimeHostConnectionCatalogSnapshot as ConnectionCatalogSnapshot,
+} from '@maka/runtime-host/client';
 import { normalizeRequestHeaderUpdates } from '@maka/core/runtime-policy';
-import type { ConnectionTestRunResult } from '@maka/runtime-host/protocol';
+import {
+  CONNECTION_EFFECT_OPERATION_SPECS,
+  type ConnectionTestRunResult,
+} from '@maka/runtime-host/protocol';
+import {
+  RuntimeHostOperationError,
+  RuntimeHostRequestInterruptedError,
+} from '@maka/runtime-host/client';
 import type { DesktopRuntimeHostClient } from './runtime-host-client.js';
 import {
   handleReconnectableRead,
@@ -51,7 +58,11 @@ import {
   normalizeConnectionSlugForIpc,
   normalizeCreateConnectionInputForIpc,
 } from './connections-ipc-validation.js';
-import type { DesktopConnectionSnapshot } from '../shared/desktop-connection-snapshot.js';
+import type {
+  DesktopConnectionIdentity,
+  DesktopConnectionSnapshot,
+} from '../shared/desktop-connection-snapshot.js';
+import type { DesktopConnectionOnboardingSaveOutcome } from '../preload/bridge-contract.js';
 
 type HostConnectionsClient = Pick<
   DesktopRuntimeHostClient,
@@ -67,6 +78,8 @@ type HostConnectionsClient = Pick<
   | 'setDefaultConnectionTarget'
   | 'testConnection'
   | 'updateConnection'
+  | 'verifyConnectionOnboarding'
+  | 'saveConnectionOnboarding'
 >;
 
 export interface RuntimeHostConnectionsIpcDeps {
@@ -89,9 +102,9 @@ export function registerRuntimeHostConnectionsIpc(
       chatModelChoices: buildChatModelChoices(connections),
     } satisfies DesktopConnectionSnapshot;
   });
-  handleReconnectableRead(deps.ipcMain, 'connections:hasSecret', async (_event, slug: unknown) => {
+  handleReconnectableRead(deps.ipcMain, 'connections:hasSecret', async (_event, identity: unknown) => {
     const catalog = await snapshot();
-    const connection = requireConnection(catalog, slug);
+    const connection = requireConnectionIdentity(catalog, identity);
     if (!providerAuthRequiresSecret(connection.providerType)) return true;
     return (
       (await deps.client.queryCredential(connectionCredential(connection)))
@@ -101,8 +114,8 @@ export function registerRuntimeHostConnectionsIpc(
   handleReconnectableRead(
     deps.ipcMain,
     'connections:getRequestHeaders',
-    async (_event, slug: unknown) => {
-      const connection = requireConnection(await snapshot(), slug);
+    async (_event, identity: unknown) => {
+      const connection = requireConnectionIdentity(await snapshot(), identity);
       const result = await deps.client.getConnectionRequestHeaders(connection.connectionId);
       if (result.kind !== 'found') throw new Error('Connection no longer exists');
       return { names: result.names } satisfies SavedRequestHeaders;
@@ -110,8 +123,8 @@ export function registerRuntimeHostConnectionsIpc(
   );
   deps.ipcMain.handle(
     'connections:setRequestHeaders',
-    async (_event, slug: unknown, rawUpdates: unknown) => {
-      const connection = requireConnection(await snapshot(), slug);
+    async (_event, identity: unknown, rawUpdates: unknown) => {
+      const connection = requireConnectionIdentity(await snapshot(), identity);
       const result = await deps.client.replaceConnectionRequestHeaders(
         connection.connectionId,
         normalizeRequestHeaderUpdates(rawUpdates),
@@ -121,13 +134,33 @@ export function registerRuntimeHostConnectionsIpc(
       return { names: result.names } satisfies SavedRequestHeaders;
     },
   );
-  deps.ipcMain.handle('connections:setDefault', async (_event, slug: unknown) => {
+  deps.ipcMain.handle('connections:setDefault', async (_event, identity: unknown, modelId?: unknown) => {
     const catalog = await snapshot();
-    const target = slug === null
+    const connection = identity === null ? null : requireConnectionIdentity(catalog, identity);
+    if (modelId !== undefined && (typeof modelId !== 'string' || !modelId.trim() || !connection)) {
+      throw new Error('Invalid default model selection');
+    }
+    const target = identity === null
       ? null
-      : defaultTargetForConnection(requireConnection(catalog, slug));
+      : typeof modelId === 'string'
+        ? { connectionId: connection!.connectionId, modelId }
+        : defaultTargetForConnection(connection!);
+    const enableModel = typeof modelId === 'string' && !connection!.enabledModelIds.includes(modelId);
+    const result = await deps.client.setDefaultConnectionTarget(
+      catalog.revision, target, enableModel ? true : undefined,
+    );
+    if (result.kind === 'revision_conflict') throw new Error('DEFAULT_CONNECTION_CHANGED');
+    if (result.kind === 'invalid_default_target') throw new Error('DEFAULT_MODEL_UNAVAILABLE');
+    requireCommitted(result, 'set default Connection');
+    deps.emitConnectionListChanged();
+  });
+  deps.ipcMain.handle('connections:setDefaultBySlug', async (_event, slug: unknown) => {
+    const catalog = await snapshot();
     requireCommitted(
-      await deps.client.setDefaultConnectionTarget(catalog.revision, target),
+      await deps.client.setDefaultConnectionTarget(
+        catalog.revision,
+        defaultTargetForConnection(requireConnection(catalog, slug)),
+      ),
       'set default Connection',
     );
     deps.emitConnectionListChanged();
@@ -141,23 +174,56 @@ export function registerRuntimeHostConnectionsIpc(
     );
     deps.emitConnectionListChanged();
   });
+  deps.ipcMain.handle('connections:onboardingVerify', async (_event, raw: unknown) => {
+    const input = CONNECTION_EFFECT_OPERATION_SPECS[
+      'connection.onboarding.verify'
+    ].decodeInput(raw);
+    return deps.client.verifyConnectionOnboarding(input);
+  });
+  deps.ipcMain.handle('connections:onboardingSave', async (_event, raw: unknown) => {
+    const input = CONNECTION_EFFECT_OPERATION_SPECS[
+      'connection.onboarding.save'
+    ].decodeInput(raw);
+    try {
+      const result = await deps.client.saveConnectionOnboarding(input);
+      if (result.kind === 'saved') deps.emitConnectionListChanged();
+      return { kind: 'result', result } satisfies DesktopConnectionOnboardingSaveOutcome;
+    } catch (error) {
+      if (error instanceof RuntimeHostOperationError) {
+        return {
+          kind: error.code === 'commit_outcome_unknown' ? 'outcome_unknown' : 'not_saved',
+        } satisfies DesktopConnectionOnboardingSaveOutcome;
+      }
+      if (error instanceof RuntimeHostRequestInterruptedError) {
+        return {
+          kind: error.dispatch === 'not_dispatched' ? 'not_saved' : 'outcome_unknown',
+        } satisfies DesktopConnectionOnboardingSaveOutcome;
+      }
+      // A protocol/decode failure can arrive only after the command response
+      // has started coming back. Without affirmative evidence that the Host
+      // did not commit, allowing another create risks duplicating the account.
+      return { kind: 'outcome_unknown' } satisfies DesktopConnectionOnboardingSaveOutcome;
+    }
+  });
   deps.ipcMain.handle('connections:create', async (_event, raw: unknown) => {
     const input = normalizeCreateInput(raw);
     const catalog = await snapshot();
     // Profiles ride as the typed field end to end — nothing free-form
     // crosses to the host.
-    const relayModelProfiles = input.relayModelProfiles;
+    const modelOverrides = input.modelOverrides;
     const created = await deps.client.createConnection(catalog.revision, {
       slug: input.slug,
       name: input.name,
       providerType: input.providerType,
       ...(input.baseUrl === undefined ? {} : { baseUrl: input.baseUrl }),
+      ...(input.defaultApiProtocol === undefined
+        ? {}
+        : { defaultApiProtocol: input.defaultApiProtocol }),
       enabled: true,
       enabledModelIds: connectionEnabledModelIds({
         defaultModel: input.defaultModel,
-        enabledModelIds: defaultEnabledModelIdsWhenOmitted(input.providerType),
       }),
-      ...(relayModelProfiles === undefined ? {} : { relayModelProfiles }),
+      ...(modelOverrides === undefined ? {} : { modelOverrides }),
       ...(input.requestBodyOverlay === undefined
         ? {}
         : { requestBodyOverlay: input.requestBodyOverlay }),
@@ -193,9 +259,9 @@ export function registerRuntimeHostConnectionsIpc(
     deps.emitConnectionListChanged();
     return requireProjectedConnection(await snapshot(), input.slug);
   });
-  deps.ipcMain.handle('connections:update', async (_event, rawSlug: unknown, rawPatch: unknown) => {
+  deps.ipcMain.handle('connections:update', async (_event, rawIdentity: unknown, rawPatch: unknown) => {
     const catalog = await snapshot();
-    const current = requireConnection(catalog, rawSlug);
+    const current = requireConnectionIdentity(catalog, rawIdentity);
     const patch = normalizeUpdateInput(current, rawPatch);
     const updated = await deps.client.updateConnection(
       { connectionId: current.connectionId, revision: current.revision },
@@ -213,9 +279,9 @@ export function registerRuntimeHostConnectionsIpc(
         // Tri-state: a patch that mentions profiles re-normalizes them (empty
         // normalization = clear); a patch without profiles omits the key
         // entirely, which the store reads as "leave the table alone".
-        ...(patch.relayModelProfiles === undefined
+        ...(patch.modelOverrides === undefined
           ? {}
-          : { relayModelProfiles: normalizeRelayModelProfiles(patch.relayModelProfiles) ?? null }),
+          : { modelOverrides: normalizeModelOverrides(patch.modelOverrides) ?? null }),
         ...(patch.requestBodyOverlay === undefined
           ? {}
           : { requestBodyOverlay: patch.requestBodyOverlay }),
@@ -227,7 +293,7 @@ export function registerRuntimeHostConnectionsIpc(
     if (patch.apiKey !== undefined) await updateCredential(deps.client, current, patch.apiKey);
     if (patch.defaultModel !== undefined) {
       const latest = await snapshot();
-      const entry = requireConnection(latest, current.slug);
+      const entry = requireConnectionIdentity(latest, connectionIdentity(current));
       const target = patch.defaultModel
         ? { connectionId: entry.connectionId, modelId: patch.defaultModel }
         : latest.defaultTarget?.connectionId === entry.connectionId
@@ -239,9 +305,10 @@ export function registerRuntimeHostConnectionsIpc(
       );
     }
     deps.emitConnectionListChanged();
-    return requireProjectedConnection(await snapshot(), current.slug);
+    return requireProjectedConnectionIdentity(await snapshot(), connectionIdentity(current));
   });
-  deps.ipcMain.handle('connections:delete', async (_event, slug: unknown) => {
+  deps.ipcMain.handle('connections:delete', async (_event, rawIdentity: unknown) => {
+    const identity = normalizeConnectionIdentity(rawIdentity);
     // OAuth/model-fetch can bump the connection revision under the UI. Retry
     // on connection_stale with a fresh snapshot so delete does not fail with a
     // opaque "service unavailable" after the user already confirmed.
@@ -250,10 +317,11 @@ export function registerRuntimeHostConnectionsIpc(
       const catalog = await snapshot();
       let current: ReturnType<typeof requireConnection>;
       try {
-        current = requireConnection(catalog, slug);
+        current = requireConnectionIdentity(catalog, identity);
       } catch (error) {
-        // Only treat a missing slug as success. Invalid input must still fail.
-        if (error instanceof Error && error.message.startsWith('No such Connection:')) {
+        // The exact entity is already gone. A new entity may reuse its slug;
+        // deleting that replacement would violate the detail route's binding.
+        if (error instanceof Error && error.message.startsWith('No such Connection identity:')) {
           deps.emitConnectionListChanged();
           return;
         }
@@ -275,22 +343,34 @@ export function registerRuntimeHostConnectionsIpc(
       throw new Error('Unable to delete Connection: connection_stale');
     }
   });
-  deps.ipcMain.handle('connections:fetchModels', async (_event, slug: unknown) => {
-    const current = requireConnection(await snapshot(), slug);
-    const result = await deps.client.fetchConnectionModels(current.connectionId);
+  deps.ipcMain.handle('connections:fetchModels', async (_event, identity: unknown, options?: { preserveSelection?: unknown }) => {
+    const current = requireConnectionIdentity(await snapshot(), identity);
+    if (options?.preserveSelection !== undefined && typeof options.preserveSelection !== 'boolean') {
+      throw new Error('Invalid model discovery selection policy');
+    }
+    const result = await deps.client.fetchConnectionModels(current.connectionId, options?.preserveSelection);
     if (result.kind !== 'committed') {
       throw new Error(`Unable to fetch Connection models: ${result.kind}`);
     }
     deps.emitConnectionListChanged();
-    const latest = requireConnection(await snapshot(), current.slug);
-    return {
-      models: [...latest.models],
-      source: result.source,
-      fetchedAt: result.fetchedAt,
-    };
+    const latest = requireConnectionIdentity(await snapshot(), connectionIdentity(current));
+    return { models: [...latest.models], source: result.source };
   });
   deps.ipcMain.handle(
     'connections:test',
+    async (_event, identity: unknown, options?: { model?: unknown }) => {
+      const current = requireConnectionIdentity(await snapshot(), identity);
+      const model = options?.model;
+      if (model !== undefined && (typeof model !== 'string' || model.length === 0)) {
+        throw new Error('Invalid Connection test model');
+      }
+      const result = await deps.client.testConnection(current.connectionId, model);
+      deps.emitConnectionListChanged();
+      return projectHostConnectionTest(result);
+    },
+  );
+  deps.ipcMain.handle(
+    'connections:testBySlug',
     async (_event, slug: unknown, options?: { model?: unknown }) => {
       const current = requireConnection(await snapshot(), slug);
       const model = options?.model;
@@ -328,7 +408,7 @@ export function projectHostConnectionTest(result: ConnectionTestRunResult): Conn
 
 export function projectHostConnections(
   catalog: ConnectionCatalogSnapshot,
-): IdentifiedLlmConnection[] {
+): ProjectedLlmConnection[] {
   return catalog.connections.map((connection) => {
     const defaultModel =
       catalog.defaultTarget?.connectionId === connection.connectionId
@@ -340,20 +420,21 @@ export function projectHostConnections(
       name: connection.name,
       providerType: connection.providerType,
       ...(connection.baseUrl === undefined ? {} : { baseUrl: connection.baseUrl }),
+      ...(connection.defaultApiProtocol === undefined
+        ? {}
+        : { defaultApiProtocol: connection.defaultApiProtocol }),
       enabled: connection.enabled,
       defaultModel,
       enabledModelIds: [...connection.enabledModelIds],
       models: [...connection.models],
-      ...(connection.relayModelProfiles === undefined
+      catalogEntries: connection.catalogEntries,
+      ...(connection.modelOverrides === undefined
         ? {}
-        : { relayModelProfiles: connection.relayModelProfiles }),
+        : { modelOverrides: connection.modelOverrides }),
       ...(connection.requestBodyOverlay === undefined
         ? {}
         : { requestBodyOverlay: connection.requestBodyOverlay }),
       ...(connection.modelSource === undefined ? {} : { modelSource: connection.modelSource }),
-      ...(connection.modelsFetchedAt === undefined
-        ? {}
-        : { modelsFetchedAt: connection.modelsFetchedAt }),
       ...(connection.lastTest === undefined
         ? {}
         : {
@@ -402,7 +483,7 @@ async function updateCredential(
 }
 
 function connectionCredential(connection: ConnectionCatalogEntry): CredentialLocator {
-  const authKind = PROVIDER_DEFAULTS[connection.providerType].authKind;
+  const authKind = PROVIDER_REGISTRY[connection.providerType].authKind;
   return {
     scope: 'connection',
     connectionId: connection.connectionId,
@@ -426,6 +507,43 @@ function requireConnection(
   return connection;
 }
 
+function normalizeConnectionIdentity(value: unknown): DesktopConnectionIdentity {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new Error('Invalid Connection identity');
+  }
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record).sort();
+  if (keys.length !== 2 || keys[0] !== 'connectionId' || keys[1] !== 'slug') {
+    throw new Error('Invalid Connection identity');
+  }
+  if (typeof record.connectionId !== 'string' || record.connectionId.length === 0) {
+    throw new Error('Connection identity id is required');
+  }
+  return {
+    connectionId: record.connectionId,
+    slug: normalizeConnectionSlugForIpc(record.slug, 'connection identity slug'),
+  };
+}
+
+function requireConnectionIdentity(
+  catalog: ConnectionCatalogSnapshot,
+  value: unknown,
+): ConnectionCatalogEntry {
+  const identity = normalizeConnectionIdentity(value);
+  const connection = catalog.connections.find(
+    (candidate) => candidate.connectionId === identity.connectionId,
+  );
+  if (!connection) throw new Error(`No such Connection identity: ${identity.connectionId}`);
+  if (connection.slug !== identity.slug) {
+    throw new Error('Connection identity no longer matches its slug');
+  }
+  return connection;
+}
+
+function connectionIdentity(connection: ConnectionCatalogEntry): DesktopConnectionIdentity {
+  return { connectionId: connection.connectionId, slug: connection.slug };
+}
+
 function requireProjectedConnection(
   catalog: ConnectionCatalogSnapshot,
   slug: string,
@@ -433,6 +551,18 @@ function requireProjectedConnection(
   const connection = projectHostConnections(catalog).find((candidate) => candidate.slug === slug);
   if (!connection) throw new Error(`No such Connection: ${slug}`);
   return connection;
+}
+
+function requireProjectedConnectionIdentity(
+  catalog: ConnectionCatalogSnapshot,
+  identity: DesktopConnectionIdentity,
+): ProjectedLlmConnection {
+  const connection = requireConnectionIdentity(catalog, identity);
+  const projected = projectHostConnections(catalog).find(
+    (candidate) => candidate.connectionId === connection.connectionId,
+  );
+  if (!projected) throw new Error(`No such Connection identity: ${identity.connectionId}`);
+  return projected;
 }
 
 function defaultTargetForConnection(connection: ConnectionCatalogEntry) {
@@ -469,6 +599,20 @@ function normalizeUpdateInput(
   value: unknown,
 ): UpdateConnectionInput {
   const patch = normalizeConnectionPatchSecretsForIpc(value);
+  if (patch.modelOverride !== undefined) {
+    const { modelId, expected, value: override, enable } = patch.modelOverride;
+    if (typeof modelId !== 'string' || !modelId.trim() || modelId !== modelId.trim() ||
+      typeof override !== 'object' || override === null || Array.isArray(override) ||
+      (enable !== undefined && typeof enable !== 'boolean') || patch.modelOverrides !== undefined) {
+      throw new Error('Invalid model override');
+    }
+    const normalize = (value: unknown) => normalizeModelOverrides({ model: value })?.model ?? null;
+    if (expected === undefined || JSON.stringify(normalize(expected)) !== JSON.stringify(normalize(current.modelOverrides?.[modelId]))) {
+      throw new Error('Model parameters changed. Reopen the editor before saving again.');
+    }
+    patch.modelOverrides = { ...current.modelOverrides, [modelId]: override };
+    if (enable) patch.enabledModelIds = [...new Set([...current.enabledModelIds, modelId])];
+  }
   if (patch.enabledModelIds !== undefined && !patch.enabledModelIds.every((id) => typeof id === 'string')) {
     throw new Error('Invalid enabled model list');
   }

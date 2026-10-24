@@ -20,6 +20,7 @@
 import type {
   ConnectionCatalogMutationResult,
   ConnectionCatalogSnapshot,
+  ConnectionCredentialTarget,
   CreateCatalogConnectionInput,
   CredentialLocator,
   CredentialMutationResult,
@@ -30,7 +31,6 @@ import type {
   RemoveCatalogConnectionInput,
   RuntimePolicySnapshot,
   SetCredentialInput,
-  MigrateSystemSeedInput,
   SetDefaultConnectionTargetInput,
   UpdateCatalogConnectionInput,
 } from '@maka/core/runtime-policy';
@@ -67,7 +67,11 @@ export type {
   ConnectionTestTicket,
   InteractiveOAuthLoginCompletionResult,
   InteractiveOAuthLoginProvider,
+  InteractiveOAuthLoginInput,
+  InteractiveOAuthLoginTarget,
+  InteractiveOAuthConnectionIdentity,
   InteractiveOAuthLoginTicket,
+  QueryInteractiveOAuthLoginResult,
   CredentialStatusQueryResult,
   ModelFetchTicket,
   ProviderAuthKind,
@@ -80,8 +84,7 @@ export type {
   ResolveNetworkProxyExecutionResult,
   ResolveWebSearchExecutionInput,
   ResolveWebSearchExecutionResult,
-  ResolveWebFetchExecutionResult,
-  UnavailableProviderActionAvailability,
+  ResolveHostOutboundExecutionResult,
 } from './runtime-policy/operations.js';
 
 const readerBrand: unique symbol = Symbol('RuntimePolicyStoresReader');
@@ -110,7 +113,6 @@ export interface ConnectionCatalogWriter extends ConnectionCatalogReader {
   setDefaultTarget(
     input: SetDefaultConnectionTargetInput,
   ): Promise<ConnectionCatalogMutationResult>;
-  migrateSystemSeed(input: MigrateSystemSeedInput): Promise<ConnectionCatalogMutationResult>;
 }
 
 export interface CredentialVaultReader {
@@ -224,7 +226,6 @@ function createWriterFacade(coordinator: RuntimePolicyCoordinator): RuntimePolic
       update: (input) => coordinator.updateConnection(input),
       remove: (input) => coordinator.removeConnection(input),
       setDefaultTarget: (input) => coordinator.setDefaultTarget(input),
-      migrateSystemSeed: (input) => coordinator.migrateSystemSeed(input),
     },
     credentialVault: {
       getSnapshot: () => coordinator.getVaultSnapshot(),
@@ -233,23 +234,33 @@ function createWriterFacade(coordinator: RuntimePolicyCoordinator): RuntimePolic
       delete: (input) => coordinator.deleteCredential(input),
     },
     operations: {
-      exportCredentialMaterial: (locator) => coordinator.exportCredentialMaterial(locator),
+      updateNetworkProxy: (input) => coordinator.updateNetworkProxy(input),
+      exportCredentialMaterial: ((
+        locator: CredentialLocator,
+        expectedConnection?: ConnectionCredentialTarget,
+      ) =>
+        expectedConnection
+          ? coordinator.exportCredentialMaterial(locator, expectedConnection)
+          : coordinator.exportCredentialMaterial(
+              locator,
+            )) as OperationCoordinator['exportCredentialMaterial'],
       getConnectionRequestHeaders: (connectionId) =>
         coordinator.getConnectionRequestHeaders(connectionId),
       replaceConnectionRequestHeaders: (connectionId, updates) =>
         coordinator.replaceConnectionRequestHeaders(connectionId, updates),
       resolveExecutionConnection: (ref) => coordinator.resolveExecutionConnection(ref),
       resolveWebSearchExecution: (input) => coordinator.resolveWebSearchExecution(input),
-      resolveWebFetchExecution: () => coordinator.resolveWebFetchExecution(),
+      resolveHostOutboundExecution: () => coordinator.resolveHostOutboundExecution(),
       resolveNetworkProxyExecution: (input) => coordinator.resolveNetworkProxyExecution(input),
       compareAndSetOAuthCredential: (input) => coordinator.compareAndSetOAuthCredential(input),
       importConnectionCredential: (input) => coordinator.importConnectionCredential(input),
-      beginInteractiveOAuthLogin: (connectionId) =>
-        coordinator.beginInteractiveOAuthLogin(connectionId),
+      beginInteractiveOAuthLogin: (input) => coordinator.beginInteractiveOAuthLogin(input),
+      queryInteractiveOAuthLogin: (attemptId) => coordinator.queryInteractiveOAuthLogin(attemptId),
       completeInteractiveOAuthLogin: (ticket, secret) =>
         coordinator.completeInteractiveOAuthLogin(ticket, secret),
       beginModelFetch: (connectionId) => coordinator.beginModelFetch(connectionId),
-      completeModelFetch: (ticket, result) => coordinator.completeModelFetch(ticket, result),
+      completeModelFetch: (ticket, result, preserveSelection) =>
+        coordinator.completeModelFetch(ticket, result, preserveSelection),
       beginConnectionOnboarding: (input) => coordinator.beginConnectionOnboarding(input),
       completeConnectionOnboarding: (ticket, input) =>
         coordinator.completeConnectionOnboarding(ticket, input),

@@ -17,6 +17,8 @@
  * under the License.
  */
 
+import type { UiLocale } from '@maka/core/ui-locale';
+
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { ICON_SIZE, ArrowLeft } from '@maka/ui/icons';
 import {
@@ -53,7 +55,7 @@ import {
   botStatusDetail,
   type BotPendingActionName,
 } from './bot-chat-shared';
-import { getBotSettingsCopy, type BotSettingsCopy } from '../locales/settings-bot-copy';
+import { botStatusReasonMessage, getBotSettingsCopy, type BotSettingsCopy } from '../locales/settings-bot-copy';
 import { SettingsPage, SettingsSection } from './settings-section';
 import { dotForStatus } from '@maka/ui';
 
@@ -193,6 +195,21 @@ export function BotChatChannelDetail(props: {
         icon={<ArrowLeft size={ICON_SIZE.chrome} aria-hidden="true" />}
         label={detailCopy.back}
       />
+      {(
+        <SettingsSection title={getBotSettingsCopy(locale).overview.messageHandlingTitle}>
+          <Selector
+            label={getBotSettingsCopy(locale).overview.messageHandlingLabel}
+            value={channel.messageHandling ?? 'inherit'}
+            options={[
+              { value: 'inherit', label: getBotSettingsCopy(locale).overview.followDefault },
+              { value: 'assistant', label: getBotSettingsCopy(locale).overview.personalAssistant },
+              { value: 'task', label: getBotSettingsCopy(locale).overview.separateTask },
+              { value: 'workhub', label: 'WorkHub' },
+            ]}
+            onChange={(value) => { void props.onUpdateChannel({ messageHandling: value === 'inherit' ? undefined : value as NonNullable<BotChannelSettings['messageHandling']> }); }}
+          />
+        </SettingsSection>
+      )}
       <header className="settingsBotDetailHeader" data-support={support}>
           <BotBrandLogo provider={provider} size="large" />
           <div className="settingsBotDetailHeaderBody">
@@ -282,8 +299,8 @@ export function BotChatChannelDetail(props: {
         <MetadataList columns="multi">
           <MetadataListItem label={detailCopy.identity}>{status?.identity?.username ?? status?.identity?.displayName ?? detailCopy.unknownIdentity}</MetadataListItem>
           <MetadataListItem label={detailCopy.connectionType}>{botConnectionLabel(status?.connection ?? 'none', locale)}</MetadataListItem>
-          <MetadataListItem label={detailCopy.lastEvent}>{status?.lastEventAt ? <RelativeTime ts={status.lastEventAt} /> : detailCopy.noneYet}</MetadataListItem>
-          <MetadataListItem label={detailCopy.lastTest}>{channel.lastTestAt ? <RelativeTime ts={channel.lastTestAt} /> : detailCopy.neverTested}</MetadataListItem>
+          <MetadataListItem label={detailCopy.lastEvent}>{status?.lastEventAt ? <RelativeTime ts={status.lastEventAt} className="settingsInlineTime" /> : detailCopy.noneYet}</MetadataListItem>
+          <MetadataListItem label={detailCopy.lastTest}>{channel.lastTestAt ? <RelativeTime ts={channel.lastTestAt} className="settingsInlineTime" /> : detailCopy.neverTested}</MetadataListItem>
         </MetadataList>
         </div>
       </SettingsSection>
@@ -305,7 +322,7 @@ export function BotChatChannelDetail(props: {
           title={detailCopy.latestFailure}
           description={(
             <span className="settingsBotBannerDescription">
-              {locale === 'zh' ? viewState.currentError : detailCopy.latestFailureDetail}
+              {botStatusReasonMessage(viewState.currentError, locale)}
             </span>
           )} />
       )}
@@ -316,18 +333,21 @@ export function BotChatChannelDetail(props: {
         variant="bare"
         title={quickOnboarding && !qrOnlyOnboarding ? detailCopy.setupMethod : detailCopy.connectionSettings}
         description={quickOnboarding ? detailCopy.localCredentials : detailCopy.autosave}
+        // The setup mode is the section's group-level switch: it sits in the
+        // header's trailing slot at content width, like 导入/导出任务's 来源,
+        // instead of as a row of its own between the heading and the callout.
+        action={quickOnboarding && !qrOnlyOnboarding ? (
+          <SegmentedControl
+            value={setupMode}
+            label={detailCopy.setupAria(providerPresentation.label)}
+            size="sm"
+            onChange={(value) => setSetupMode(value as 'quick' | 'manual')}
+          >
+            <SegmentedControlItem value="quick" label={detailCopy.quickRecommended} />
+            <SegmentedControlItem value="manual" label={detailCopy.manual} />
+          </SegmentedControl>
+        ) : undefined}
       >
-      {quickOnboarding && !qrOnlyOnboarding && (
-        <SegmentedControl
-          className="settingsBotSetupModes"
-          value={setupMode}
-          label={detailCopy.setupAria(providerPresentation.label)}
-          onChange={(value) => setSetupMode(value as 'quick' | 'manual')}
-        >
-          <SegmentedControlItem value="quick" label={detailCopy.quickRecommended} />
-          <SegmentedControlItem value="manual" label={detailCopy.manual} />
-        </SegmentedControl>
-      )}
 
       {quickOnboarding && provider !== 'wechat' && setupMode === 'quick' && (
         /* Astryx convergence: the hand-tinted quick-setup plate is an
@@ -412,10 +432,13 @@ export function BotChatChannelDetail(props: {
             // PR1197 review (P0-3): the bridge may have failed to start even
             // though credentials saved. Reflect that honestly instead of a
             // success toast that overstates the connection.
-            if (snapshot.warning) {
+            if (snapshot.warningCode) {
+              const onboardingCopy = botCopy.onboarding;
               toast.warning(
                 detailCopy.credentialsSaved(providerPresentation.label),
-                locale === 'zh' ? snapshot.warning : detailCopy.savedButNotConnected,
+                snapshot.warningDetail
+                  ? onboardingCopy.savedNotConnectedDetail(botStatusReasonMessage(snapshot.warningDetail, locale))
+                  : onboardingCopy.savedNotConnected,
               );
               return;
             }
@@ -478,6 +501,7 @@ function botCredentialFields(copy: BotSettingsCopy['detail']): Partial<Record<Bo
     { kind: 'notice', text: copy.telegramNotice },
   ],
   feishu: [
+    { kind: 'allowed-user-ids' },
     { kind: 'text', key: 'appId', label: copy.feishuCredentialId, placeholder: 'cli_xxxx' },
     { kind: 'password', key: 'appSecret', label: copy.feishuSecret, placeholder: 'xxxx' },
     {
@@ -570,6 +594,7 @@ function BotCredentialFields(props: {
             return (
               <BotAllowedUserIdsField
                 key="allowed-user-ids"
+                provider={props.provider}
                 value={props.channel.allowedUserIds}
                 onChange={(next) => props.onUpdateChannel({ allowedUserIds: next })}
               />
@@ -594,6 +619,7 @@ function BotCredentialFields(props: {
  * parse function. We only emit the parsed array on commit (onBlur).
  */
 function BotAllowedUserIdsField(props: {
+  provider: BotProvider;
   value: ReadonlyArray<string> | undefined;
   onChange(next: ReadonlyArray<string> | undefined): void;
 }): ReactNode {
@@ -623,8 +649,8 @@ function BotAllowedUserIdsField(props: {
   // non-empty string) — the gate is informational so a power user
   // tracking a non-Telegram platform later is not blocked.
   const invalidEntries = useMemo(
-    () => parsed.filter((id) => !/^[0-9]+$/.test(id)),
-    [parsed],
+    () => props.provider === 'telegram' ? parsed.filter((id) => !/^[0-9]+$/.test(id)) : [],
+    [parsed, props.provider],
   );
 
   const commit = (): void => {
@@ -635,7 +661,7 @@ function BotAllowedUserIdsField(props: {
     if (!same) props.onChange(next);
   };
   const warning = invalidEntries.length > 0
-    ? `${copy.invalidUsers(invalidEntries.slice(0, 3).join(locale === 'zh' ? '、' : ', '))}${invalidEntries.length > 3 ? copy.moreInvalid(invalidEntries.length) : ''}`
+    ? copy.invalidUsers(invalidEntries)
     : undefined;
 
   return (
@@ -645,15 +671,15 @@ function BotAllowedUserIdsField(props: {
       onBlur={commit}
       rows={3}
       hasSpellCheck={false}
-      placeholder={copy.allowedUsersPlaceholder}
+      placeholder={props.provider === 'feishu' ? copy.feishuAllowedUsersPlaceholder : copy.allowedUsersPlaceholder}
       label={copy.allowedUsersLabel(parsed.length, MAX_ALLOWED_USER_IDS)}
-      description={`${copy.allowedUsersHelp}${atCap ? ` ${copy.limitReached}` : ''}`}
+      description={copy.allowedUsersHelp(atCap)}
       status={warning ? { type: 'warning', message: warning } : undefined}
     />
   );
 }
 
-function botConnectionLabel(connection: BotStatus['connection'], locale: 'zh' | 'en'): string {
+function botConnectionLabel(connection: BotStatus['connection'], locale: UiLocale): string {
   const copy = getBotSettingsCopy(locale).status;
   switch (connection) {
     case 'polling': return copy.polling;

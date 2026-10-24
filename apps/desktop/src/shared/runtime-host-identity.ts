@@ -17,6 +17,17 @@
  * under the License.
  */
 
+export interface TerminalCloseChange {
+  readonly sessionId: string;
+  readonly ref: string;
+  readonly status: 'pending' | 'unknown' | 'closed';
+}
+
+export interface TerminalRecovery {
+  readonly resources: import('@maka/core/events').ShellRunUpdate[];
+  readonly closes: TerminalCloseChange[];
+}
+
 export interface DesktopHostRef {
   readonly hostId: string;
 }
@@ -30,6 +41,16 @@ export interface DesktopSessionRef extends DesktopHostRef {
 }
 
 export interface DesktopTargetSessionRef extends DesktopSessionRef, DesktopTargetScope {}
+
+export function sessionCatalogRetiresSession(
+  activeSessionId: string | undefined,
+  refreshedSessions: readonly { readonly id: string }[],
+): activeSessionId is string {
+  return (
+    activeSessionId !== undefined &&
+    !refreshedSessions.some(({ id }) => id === activeSessionId)
+  );
+}
 
 export function desktopSessionKey(ref: DesktopSessionRef): string {
   return JSON.stringify([ref.hostId, ref.sessionId]);

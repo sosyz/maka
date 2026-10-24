@@ -22,17 +22,380 @@ import { describe, test } from 'node:test';
 import { createManagedExecutionBoundary } from '@maka/core/sandbox-boundary';
 import { createWorkspaceWritePermissionProfile } from '@maka/core/permission-profile';
 import { ToolOutcomeUnknownError } from '@maka/core/events';
-import type { McpCallResult } from '@maka/core/mcp';
-import type { ClientCapabilityReplaceInput } from '../protocol/index.js';
+import type { ClientCapabilityCallResult } from '../protocol/index.js';
+import type {
+  ClientCapabilityAdmissionEvidence,
+  ClientCapabilityCallFrame,
+  ClientCapabilityReplaceInput,
+} from '../protocol/index.js';
 import {
   ClientCapabilityInvocationError,
   HostClientCapabilityCoordinator,
+  type HostClientCapabilityCoordinatorOptions,
 } from '../server/client-capability-coordinator.js';
 import type { ClientCapabilityConnection } from '../server/client-capability-service.js';
 import { RuntimePolicyActivationGate } from '../server/runtime-policy-activation-gate.js';
-import { clientCapabilityConnectionIdentity } from './fixtures/client-capability.js';
+import {
+  clientCapabilityConnectionIdentity,
+  clientCapabilityCoordinatorTestAdmission,
+} from './fixtures/client-capability.js';
 
 describe('Host Client Capability coordinator', () => {
+  test('fences complete Session configurations before binding and retains the original on conflict', async () => {
+    const coordinator = createCoordinator();
+    const first = coordinator.attachConnection(clientCapabilityConnectionIdentity('connection-a'), {
+      send: async () => {},
+    });
+    const second = coordinator.attachConnection(
+      clientCapabilityConnectionIdentity('connection-b'),
+      { send: async () => {} },
+    );
+    const alpha = `sha256:${'a'.repeat(64)}`;
+    const beta = `sha256:${'b'.repeat(64)}`;
+    const publish = (
+      connectionId: string,
+      registrationId: string,
+      sessionId: string,
+      sessionConfigurationId?: string,
+    ) =>
+      coordinator.handlers['client.capability.replace'](
+        {
+          ...replacementInput(registrationId, 'inspect'),
+          sessionId,
+          sessionConfigurationId,
+          offers: replacementInput(registrationId, 'inspect').offers.map((offer) => ({
+            ...offer,
+            hostPathAccess: 'none' as const,
+          })),
+        },
+        connectionContext(connectionId),
+      );
+    try {
+      assert.equal((await publish('connection-a', 'first', 'session-a', alpha)).ok, true);
+      // Fence even before the first Turn binds the Session; do not rely on a prior prompt.
+      const conflict = await publish('connection-b', 'conflict', 'session-a', beta);
+      assert.equal(conflict.ok, false);
+      if (!conflict.ok) assert.equal(conflict.error.code, 'session_binding_conflict');
+      assert.equal((await publish('connection-b', 'legacy-conflict', 'session-a')).ok, false);
+      assert.equal((await publish('connection-b', 'other-session', 'session-b', beta)).ok, true);
+      assert.equal((await publish('connection-b', 'equivalent', 'session-a', alpha)).ok, true);
+      assert.deepEqual(await coordinator.bindSession('session-a', 'connection-a'), { ok: true });
+      assert.equal((await publish('connection-a', 'cannot-change', 'session-a', beta)).ok, false);
+      const snapshot = coordinator.snapshotForSession('session-a');
+      assert.deepEqual(snapshot?.registrationIds, ['first']);
+      snapshot?.release();
+      await coordinator.handlers['client.capability.unregister'](
+        { registrationId: 'first' },
+        connectionContext('connection-a'),
+      );
+      assert.equal((await publish('connection-b', 'replacement', 'session-a', beta)).ok, true);
+    } finally {
+      first.close();
+      second.close();
+      await coordinator.close();
+    }
+  });
+
+  test('a frozen scoped provider permits equivalent recovery but fences missing or changed configurations', async () => {
+    const coordinator = createCoordinator();
+    const first = coordinator.attachConnection(clientCapabilityConnectionIdentity('connection-a'), {
+      send: async () => {},
+    });
+    const second = coordinator.attachConnection(
+      clientCapabilityConnectionIdentity('connection-b'),
+      {
+        send: async () => {},
+      },
+    );
+    const foreign = coordinator.attachConnection(
+      clientCapabilityConnectionIdentity('foreign', 'foreign', 'different-principal'),
+      { send: async () => {} },
+    );
+    const input = {
+      ...replacementInput('first', 'inspect'),
+      sessionId: 'session-a',
+      sessionConfigurationId: `sha256:${'a'.repeat(64)}`,
+      offers: replacementInput('first', 'inspect').offers.map((offer) => ({
+        ...offer,
+        hostPathAccess: 'none' as const,
+      })),
+    };
+    try {
+      assert.equal(
+        (
+          await coordinator.handlers['client.capability.replace'](
+            input,
+            connectionContext('connection-a'),
+          )
+        ).ok,
+        true,
+      );
+      assert.deepEqual(await coordinator.bindSession('session-a', 'connection-a'), { ok: true });
+      await first.close();
+      const rejected = await coordinator.handlers['client.capability.replace'](
+        {
+          ...input,
+          registrationId: 'other-config',
+          sessionConfigurationId: `sha256:${'b'.repeat(64)}`,
+        },
+        connectionContext('connection-b'),
+      );
+      assert.equal(rejected.ok, false);
+      if (!rejected.ok) assert.equal(rejected.error.code, 'session_binding_conflict');
+      const missing = await coordinator.handlers['client.capability.replace'](
+        { ...input, registrationId: 'missing-config', sessionConfigurationId: undefined },
+        connectionContext('connection-b'),
+      );
+      assert.equal(missing.ok, false);
+      if (!missing.ok) assert.equal(missing.error.code, 'session_binding_conflict');
+      const foreignAttempt = await coordinator.handlers['client.capability.replace'](
+        { ...input, registrationId: 'foreign' },
+        connectionContext('foreign'),
+      );
+      assert.equal(foreignAttempt.ok, false);
+      if (!foreignAttempt.ok) assert.equal(foreignAttempt.error.code, 'session_binding_conflict');
+      const reconnected = coordinator.attachConnection(
+        clientCapabilityConnectionIdentity('connection-reconnected', 'connection-a'),
+        { send: async () => {} },
+      );
+      try {
+        for (const [registrationId, configId] of [
+          ['same-provider-changed', `sha256:${'b'.repeat(64)}`],
+          ['same-provider-missing', undefined],
+        ] as const) {
+          const rejected = await coordinator.handlers['client.capability.replace'](
+            { ...input, registrationId, sessionConfigurationId: configId },
+            connectionContext('connection-reconnected'),
+          );
+          assert.equal(rejected.ok, false);
+          if (!rejected.ok) assert.equal(rejected.error.code, 'session_binding_conflict');
+        }
+        assert.equal(
+          (
+            await coordinator.handlers['client.capability.replace'](
+              { ...input, registrationId: 'reconnected' },
+              connectionContext('connection-reconnected'),
+            )
+          ).ok,
+          true,
+        );
+        assert.deepEqual(await coordinator.bindSession('session-a', 'connection-reconnected'), {
+          ok: true,
+        });
+      } finally {
+        await reconnected.close();
+      }
+      const equivalent = await coordinator.handlers['client.capability.replace'](
+        { ...input, registrationId: 'equivalent' },
+        connectionContext('connection-b'),
+      );
+      assert.equal(equivalent.ok, true);
+      assert.deepEqual(await coordinator.bindSession('session-a', 'connection-b'), { ok: true });
+      const snapshot = coordinator.snapshotForSession('session-a');
+      assert.deepEqual(snapshot?.registrationIds, ['equivalent']);
+      snapshot?.release();
+    } finally {
+      await first.close();
+      await second.close();
+      await foreign.close();
+      await coordinator.close();
+    }
+  });
+
+  test('a newer connection supersedes scoped publishes from the same provider identity', async () => {
+    const coordinator = createCoordinator();
+    const first = coordinator.attachConnection(
+      clientCapabilityConnectionIdentity('first-connection', 'shared-client'),
+      { send: async () => {} },
+    );
+    const second = coordinator.attachConnection(
+      clientCapabilityConnectionIdentity('second-connection', 'shared-client'),
+      { send: async () => {} },
+    );
+    const publish = (connectionId: string, registrationId: string, sessionId = 'session-a') =>
+      coordinator.handlers['client.capability.replace'](
+        {
+          ...replacementInput(registrationId, 'inspect'),
+          sessionId,
+          sessionConfigurationId: `sha256:${'a'.repeat(64)}`,
+          offers: replacementInput(registrationId, 'inspect').offers.map((offer) => ({
+            ...offer,
+            hostPathAccess: 'none' as const,
+          })),
+        },
+        connectionContext(connectionId),
+      );
+    try {
+      assert.equal((await publish('first-connection', 'first')).ok, true);
+      assert.equal((await publish('second-connection', 'second')).ok, true);
+      const stale = await publish('first-connection', 'stale');
+      assert.equal(stale.ok, false);
+      if (!stale.ok) assert.equal(stale.error.code, 'invalid_request');
+      assert.equal((await publish('first-connection', 'other-session', 'session-b')).ok, true);
+      assert.deepEqual(await coordinator.bindSession('session-b', 'first-connection'), {
+        ok: true,
+      });
+      assert.deepEqual(await coordinator.bindSession('session-a', 'second-connection'), {
+        ok: true,
+      });
+      const snapshot = coordinator.snapshotForSession('session-a');
+      assert.deepEqual(snapshot?.registrationIds, ['second']);
+      snapshot?.release();
+    } finally {
+      await first.close();
+      await second.close();
+      await coordinator.close();
+    }
+  });
+
+  test('a different connection cannot change a shared provider Session configuration', async () => {
+    const coordinator = createCoordinator();
+    const first = coordinator.attachConnection(
+      clientCapabilityConnectionIdentity('first-connection', 'shared-client'),
+      { send: async () => {} },
+    );
+    const second = coordinator.attachConnection(
+      clientCapabilityConnectionIdentity('second-connection', 'shared-client'),
+      { send: async () => {} },
+    );
+    const alpha = `sha256:${'a'.repeat(64)}`;
+    const beta = `sha256:${'b'.repeat(64)}`;
+    const publish = (
+      connectionId: string,
+      registrationId: string,
+      sessionId: string,
+      configId?: string,
+    ) =>
+      coordinator.handlers['client.capability.replace'](
+        {
+          ...replacementInput(registrationId, 'inspect'),
+          sessionId,
+          sessionConfigurationId: configId,
+          offers: replacementInput(registrationId, 'inspect').offers.map((offer) => ({
+            ...offer,
+            hostPathAccess: 'none' as const,
+          })),
+        },
+        connectionContext(connectionId),
+      );
+    try {
+      assert.equal((await publish('first-connection', 'first', 'session-a', alpha)).ok, true);
+      assert.deepEqual(await coordinator.bindSession('session-a', 'first-connection'), {
+        ok: true,
+      });
+      for (const [registrationId, configId] of [
+        ['rejected-changed', beta],
+        ['rejected-missing', undefined],
+      ] as const) {
+        const rejected = await publish('second-connection', registrationId, 'session-a', configId);
+        assert.equal(rejected.ok, false);
+        if (!rejected.ok) assert.equal(rejected.error.code, 'session_binding_conflict');
+        const snapshot = coordinator.snapshotForSession('session-a');
+        assert.deepEqual(snapshot?.registrationIds, ['first']);
+        snapshot?.release();
+      }
+      assert.equal(
+        (await publish('first-connection', 'other-session', 'session-b', beta)).ok,
+        true,
+      );
+      assert.deepEqual(await coordinator.bindSession('session-b', 'first-connection'), {
+        ok: true,
+      });
+      assert.equal((await publish('second-connection', 'equivalent', 'session-a', alpha)).ok, true);
+      assert.deepEqual(await coordinator.bindSession('session-a', 'second-connection'), {
+        ok: true,
+      });
+      const snapshot = coordinator.snapshotForSession('session-a');
+      assert.deepEqual(snapshot?.registrationIds, ['equivalent']);
+      snapshot?.release();
+      assert.equal(
+        (await publish('first-connection', 'another-session', 'session-c', beta)).ok,
+        true,
+      );
+    } finally {
+      await first.close();
+      await second.close();
+      await coordinator.close();
+    }
+  });
+
+  test('guards an opt-in Session replacement at the Host admission cut', async () => {
+    let busy = false;
+    const coordinator = new HostClientCapabilityCoordinator({
+      ...clientCapabilityCoordinatorTestAdmission(),
+      activation: new RuntimePolicyActivationGate(),
+      isSessionRetired: async () => false,
+      isSessionTurnBusy: () => busy,
+      onModelToolsChanged: () => undefined,
+    });
+    const connection = coordinator.attachConnection(
+      clientCapabilityConnectionIdentity('connection-a'),
+      { send: async () => {} },
+    );
+    const context = { connectionId: 'connection-a' } as Parameters<
+      (typeof coordinator.handlers)['client.capability.replace']
+    >[1];
+    try {
+      assert.equal(
+        (
+          await coordinator.handlers['client.capability.replace'](
+            {
+              registrationId: 'registration-a',
+              sessionId: 'session-a',
+              offers: [],
+            },
+            context,
+          )
+        ).ok,
+        true,
+      );
+      busy = true;
+      const blocked = await coordinator.handlers['client.capability.replace'](
+        {
+          registrationId: 'registration-b',
+          sessionId: 'session-a',
+          requireIdleSession: true,
+          offers: [],
+        },
+        context,
+      );
+      assert.equal(blocked.ok, false);
+      if (!blocked.ok) assert.equal(blocked.error.code, 'session_busy');
+      // Ordinary dynamic capability refreshes retain their existing behavior.
+      assert.equal(
+        (
+          await coordinator.handlers['client.capability.replace'](
+            {
+              registrationId: 'registration-c',
+              sessionId: 'session-a',
+              offers: [],
+            },
+            context,
+          )
+        ).ok,
+        true,
+      );
+      busy = false;
+      assert.equal(
+        (
+          await coordinator.handlers['client.capability.replace'](
+            {
+              registrationId: 'registration-d',
+              sessionId: 'session-a',
+              requireIdleSession: true,
+              offers: [],
+            },
+            context,
+          )
+        ).ok,
+        true,
+      );
+    } finally {
+      connection.close();
+      await coordinator.close();
+    }
+  });
+
   test('freezes active snapshots across replacement and releases stale registrations', async () => {
     const sent: unknown[] = [];
     const coordinator = createCoordinator();
@@ -40,18 +403,27 @@ describe('Host Client Capability coordinator', () => {
     connection = coordinator.attachConnection(clientCapabilityConnectionIdentity('connection-a'), {
       send: async (frame) => {
         sent.push(frame);
-        if (frame.kind !== 'client.capability.call') return;
-        queueMicrotask(() => {
+        if (frame.kind === 'client.capability.call') {
           connection.accept({
             kind: 'client.capability.accepted',
             invocationId: frame.invocationId,
+            admissionEvidence: { kind: 'none' },
           });
+          return;
+        }
+        if (frame.kind === 'client.capability.admitted') {
+          const call = sent.find(
+            (candidate) =>
+              isRecord(candidate) &&
+              candidate.kind === 'client.capability.call' &&
+              candidate.invocationId === frame.invocationId,
+          );
           connection.accept({
             kind: 'client.capability.result',
             invocationId: frame.invocationId,
-            result: textResult(`called:${frame.toolName}`),
+            result: textResult(`called:${isRecord(call) ? String(call.toolName) : 'unknown'}`),
           });
-        });
+        }
       },
     });
 
@@ -122,21 +494,32 @@ describe('Host Client Capability coordinator', () => {
     const coordinator = createCoordinator();
     let observedCall: unknown;
     let connection!: ClientCapabilityConnection;
-    connection = coordinator.attachConnection(clientCapabilityConnectionIdentity('connection-a'), {
-      send: async (frame) => {
-        if (frame.kind !== 'client.capability.call') return;
-        observedCall = frame;
-        connection.accept({
-          kind: 'client.capability.accepted',
-          invocationId: frame.invocationId,
-        });
-        connection.accept({
-          kind: 'client.capability.result',
-          invocationId: frame.invocationId,
-          result: textResult('path independent'),
-        });
+    connection = coordinator.attachConnection(
+      clientCapabilityConnectionIdentity(
+        'connection-a',
+        'connection-a',
+        'remote-owner',
+        'remote_owner',
+      ),
+      {
+        send: async (frame) => {
+          if (frame.kind === 'client.capability.call') {
+            observedCall = frame;
+            connection.accept({
+              kind: 'client.capability.accepted',
+              invocationId: frame.invocationId,
+              admissionEvidence: { kind: 'none' },
+            });
+          } else if (frame.kind === 'client.capability.admitted') {
+            connection.accept({
+              kind: 'client.capability.result',
+              invocationId: frame.invocationId,
+              result: textResult('path independent'),
+            });
+          }
+        },
       },
-    });
+    );
     const replaced = await coordinator.handlers['client.capability.replace'](
       {
         registrationId: 'registration-a',
@@ -187,17 +570,20 @@ describe('Host Client Capability coordinator', () => {
       ),
       {
         send: async (frame) => {
-          if (frame.kind !== 'client.capability.call') return;
-          observedCall = frame;
-          connection.accept({
-            kind: 'client.capability.accepted',
-            invocationId: frame.invocationId,
-          });
-          connection.accept({
-            kind: 'client.capability.result',
-            invocationId: frame.invocationId,
-            result: textResult('remote result'),
-          });
+          if (frame.kind === 'client.capability.call') {
+            observedCall = frame;
+            connection.accept({
+              kind: 'client.capability.accepted',
+              invocationId: frame.invocationId,
+              admissionEvidence: { kind: 'none' },
+            });
+          } else if (frame.kind === 'client.capability.admitted') {
+            connection.accept({
+              kind: 'client.capability.result',
+              invocationId: frame.invocationId,
+              result: textResult('remote result'),
+            });
+          }
         },
       },
     );
@@ -265,12 +651,344 @@ describe('Host Client Capability coordinator', () => {
     await coordinator.close();
   });
 
-  test('reports capability_lost before acceptance and outcome_unknown after acceptance', async () => {
-    await assertLossClassification(false, 'capability_lost');
-    await assertLossClassification(true, 'outcome_unknown');
+  test('trusts local-owner Desktop bindings but not a remote owner spoofing their names', async () => {
+    const local = createCoordinator();
+    const localConnection = local.attachConnection(
+      clientCapabilityConnectionIdentity(
+        'local-connection',
+        'desktop-local',
+        'local_os_user',
+        'local_owner',
+      ),
+      { send: async () => undefined },
+    );
+    await registerSessionTools(
+      local,
+      'local-connection',
+      'local-native-registration',
+      'desktop_browser',
+      ['browser_snapshot'],
+      'cwd',
+    );
+    assert.deepEqual(await local.bindSession('local-session', 'local-connection'), {
+      ok: true,
+    });
+    const localSnapshot = local.snapshotForSession('local-session');
+    assert.ok(localSnapshot);
+    assert.equal(localSnapshot.tools[0]?.categoryHint, 'custom_tool');
+    assert.equal(localSnapshot.tools[0]?.hostAdmission, 'client_capability');
+    localSnapshot.release();
+    await localConnection.close();
+    await local.close();
+
+    const remote = createCoordinator();
+    const remoteConnection = attachAutoAdmittingConnection(
+      remote,
+      'remote-connection',
+      () => ({ kind: 'browser_url', url: 'https://example.com/' }),
+      'spoofed',
+      undefined,
+      'remote_owner',
+    );
+    await registerSessionTools(
+      remote,
+      'remote-connection',
+      'spoofed-native-registration',
+      'desktop_browser',
+      ['browser_snapshot'],
+    );
+    assert.deepEqual(await remote.bindSession('remote-session', 'remote-connection'), {
+      ok: true,
+    });
+    const remoteSnapshot = remote.snapshotForSession('remote-session');
+    assert.ok(remoteSnapshot);
+    assert.equal(remoteSnapshot.tools[0]?.categoryHint, 'client_capability');
+    assert.equal(remoteSnapshot.tools[0]?.hostAdmission, 'client_capability');
+    await assert.rejects(
+      () => prepare(remoteSnapshot.tools[0], {}, 'spoofed-browser-call'),
+      /requires a trusted Desktop provider/u,
+    );
+    remoteSnapshot.release();
+    await remoteConnection.close();
+    await remote.close();
   });
 
-  test('prefers the initiating provider and reports otherwise ambiguous selection', async () => {
+  test('approves a trusted Browser origin once and reuses the Session Grant across tools', async () => {
+    let approvedTarget:
+      | Parameters<
+          HostClientCapabilityCoordinatorOptions['interactions']['requestClientCapabilityApproval']
+        >[0]['target']
+      | undefined;
+    let approvalCount = 0;
+    const coordinator = createCoordinator(() => undefined, {
+      interactions: {
+        requestClientCapabilityApproval: async ({ target }) => {
+          approvalCount += 1;
+          approvedTarget = target;
+          return 'allow';
+        },
+      },
+      grants: {
+        readClientCapabilitySessionGrant: async (key) =>
+          approvedTarget &&
+          approvedTarget.providerId === key.providerId &&
+          approvedTarget.contractId === key.contractId &&
+          approvedTarget.capability === key.capability &&
+          approvedTarget.scope.kind === 'browser_origin' &&
+          key.scope.kind === 'browser_origin' &&
+          approvedTarget.scope.origin === key.scope.origin
+            ? { version: 1, ...key, grantedAt: 1 }
+            : undefined,
+      },
+    });
+    const sent: unknown[] = [];
+    const connection = attachAutoAdmittingConnection(
+      coordinator,
+      'connection-a',
+      (frame) => ({
+        kind: 'browser_url',
+        url:
+          frame.toolName === 'browser_navigate' && typeof frame.arguments.url === 'string'
+            ? frame.arguments.url
+            : 'https://example.com/current',
+      }),
+      'done',
+      sent,
+    );
+    await registerSessionTools(
+      coordinator,
+      'connection-a',
+      'registration-browser',
+      'desktop_browser',
+      ['browser_snapshot', 'browser_click', 'browser_navigate'],
+    );
+    assert.deepEqual(await coordinator.bindSession('session-a', 'connection-a'), { ok: true });
+    const snapshot = coordinator.snapshotForSession('session-a');
+    assert.ok(snapshot);
+    const tools = new Map(snapshot.tools.map((tool) => [tool.displayName, tool]));
+
+    const preparedSnapshot = await prepare(tools.get('browser_snapshot'), {}, 'tool-snapshot');
+    assert.equal(approvalCount, 1);
+    assert.equal(
+      sent.some((frame) => isRecord(frame) && frame.kind === 'client.capability.admitted'),
+      false,
+    );
+    assert.deepEqual(
+      await preparedSnapshot.execute(managedContext('tool-snapshot')),
+      textResult('done'),
+    );
+
+    const preparedClick = await prepare(tools.get('browser_click'), {}, 'tool-click');
+    assert.equal(approvalCount, 1);
+    assert.deepEqual(await preparedClick.execute(managedContext('tool-click')), textResult('done'));
+
+    const preparedNavigate = await prepare(
+      tools.get('browser_navigate'),
+      { url: 'https://other.example/path' },
+      'tool-navigate',
+    );
+    assert.equal(approvalCount, 2);
+    assert.deepEqual(
+      await preparedNavigate.execute(managedContext('tool-navigate')),
+      textResult('done'),
+    );
+
+    snapshot.release();
+    await connection.close();
+    await coordinator.close();
+  });
+
+  test('passes trusted Desktop Settings through managed admission without a Session Grant', async () => {
+    const coordinator = createCoordinator();
+    const connection = attachAutoAdmittingConnection(
+      coordinator,
+      'connection-a',
+      () => ({ kind: 'none' }),
+      'settings',
+    );
+    await registerSessionTools(
+      coordinator,
+      'connection-a',
+      'registration-settings',
+      'desktop_settings',
+      ['MakaClientSettingsGet'],
+    );
+    assert.deepEqual(await coordinator.bindSession('session-a', 'connection-a'), { ok: true });
+    const snapshot = coordinator.snapshotForSession('session-a');
+    assert.ok(snapshot);
+    const prepared = await prepare(snapshot.tools[0], {}, 'tool-settings');
+    assert.deepEqual(
+      await prepared.execute(managedContext('tool-settings')),
+      textResult('settings'),
+    );
+    snapshot.release();
+    await connection.close();
+    await coordinator.close();
+  });
+
+  test('approves a trusted Desktop MCP tool once and scopes the Session Grant per tool', async () => {
+    let approvedTarget:
+      | Parameters<
+          HostClientCapabilityCoordinatorOptions['interactions']['requestClientCapabilityApproval']
+        >[0]['target']
+      | undefined;
+    let approvalCount = 0;
+    const coordinator = createCoordinator(() => undefined, {
+      interactions: {
+        requestClientCapabilityApproval: async ({ target }) => {
+          approvalCount += 1;
+          approvedTarget = target;
+          return 'allow';
+        },
+      },
+      grants: {
+        readClientCapabilitySessionGrant: async (key) =>
+          approvedTarget &&
+          approvedTarget.providerId === key.providerId &&
+          approvedTarget.contractId === key.contractId &&
+          approvedTarget.capability === key.capability &&
+          approvedTarget.scope.kind === 'mcp_tool' &&
+          key.scope.kind === 'mcp_tool' &&
+          approvedTarget.scope.serverId === key.scope.serverId &&
+          approvedTarget.scope.toolName === key.scope.toolName
+            ? { version: 1, ...key, grantedAt: 1 }
+            : undefined,
+      },
+    });
+    const sent: unknown[] = [];
+    const connection = attachAutoAdmittingConnection(
+      coordinator,
+      'connection-a',
+      () => ({ kind: 'none' }),
+      'done',
+      sent,
+    );
+    // Production shape: one offer per MCP server, descriptors carrying the
+    // real MCP identity.
+    const registered = await coordinator.handlers['client.capability.replace'](
+      {
+        registrationId: 'registration-mcp',
+        offers: [
+          {
+            offerId: 'desktop_mcp_fixture',
+            version: '1',
+            affinity: 'session',
+            hostPathAccess: 'none',
+            label: 'MCP: fixture',
+            tools: [
+              { serverId: 'fixture', name: 'echo', inputSchema: { type: 'object' } },
+              { serverId: 'fixture', name: 'ping', inputSchema: { type: 'object' } },
+            ],
+          },
+        ],
+      },
+      connectionContext('connection-a'),
+    );
+    assert.equal(registered.ok, true, JSON.stringify(registered));
+    assert.deepEqual(await coordinator.bindSession('session-a', 'connection-a'), { ok: true });
+    const snapshot = coordinator.snapshotForSession('session-a');
+    assert.ok(snapshot);
+    const tools = new Map(snapshot.tools.map((tool) => [tool.displayName, tool]));
+
+    // accept -> approval -> admit -> execute: the provider is never admitted
+    // before the approval resolves.
+    const preparedEcho = await prepare(tools.get('echo'), {}, 'tool-echo');
+    assert.equal(approvalCount, 1);
+    assert.equal(approvedTarget?.capability, 'desktop_mcp');
+    assert.deepEqual(approvedTarget?.scope, {
+      kind: 'mcp_tool',
+      serverId: 'fixture',
+      toolName: 'echo',
+    });
+    assert.equal(
+      sent.some((frame) => isRecord(frame) && frame.kind === 'client.capability.admitted'),
+      false,
+    );
+    assert.deepEqual(await preparedEcho.execute(managedContext('tool-echo')), textResult('done'));
+    const admittedIndex = sent.findIndex(
+      (frame) => isRecord(frame) && frame.kind === 'client.capability.admitted',
+    );
+    const callIndex = sent.findIndex(
+      (frame) => isRecord(frame) && frame.kind === 'client.capability.call',
+    );
+    assert.ok(callIndex >= 0 && admittedIndex > callIndex);
+
+    // The persisted Session Grant covers the approved tool without a new
+    // approval...
+    const preparedEchoAgain = await prepare(tools.get('echo'), {}, 'tool-echo-again');
+    assert.equal(approvalCount, 1);
+    assert.deepEqual(
+      await preparedEchoAgain.execute(managedContext('tool-echo-again')),
+      textResult('done'),
+    );
+
+    // ...while a sibling tool under the same offer needs its own grant.
+    const preparedPing = await prepare(tools.get('ping'), {}, 'tool-ping');
+    assert.equal(approvalCount, 2);
+    assert.deepEqual(approvedTarget?.scope, {
+      kind: 'mcp_tool',
+      serverId: 'fixture',
+      toolName: 'ping',
+    });
+    assert.deepEqual(await preparedPing.execute(managedContext('tool-ping')), textResult('done'));
+
+    snapshot.release();
+    await connection.close();
+    await coordinator.close();
+  });
+
+  test('cancels a denied Desktop MCP call before admission', async () => {
+    const coordinator = createCoordinator(() => undefined, {
+      interactions: {
+        requestClientCapabilityApproval: async () => 'deny',
+      },
+      grants: {
+        readClientCapabilitySessionGrant: async () => undefined,
+      },
+    });
+    const sent: unknown[] = [];
+    const connection = attachAutoAdmittingConnection(
+      coordinator,
+      'connection-a',
+      () => ({ kind: 'none' }),
+      'done',
+      sent,
+    );
+    await registerSessionTools(
+      coordinator,
+      'connection-a',
+      'registration-mcp',
+      'desktop_mcp_fixture',
+      ['echo'],
+    );
+    assert.deepEqual(await coordinator.bindSession('session-a', 'connection-a'), { ok: true });
+    const snapshot = coordinator.snapshotForSession('session-a');
+    assert.ok(snapshot);
+
+    await assert.rejects(
+      () => prepare(snapshot.tools[0], {}, 'tool-mcp-denied'),
+      /Client Capability request was denied/u,
+    );
+    assert.equal(
+      sent.some((frame) => isRecord(frame) && frame.kind === 'client.capability.admitted'),
+      false,
+    );
+    assert.equal(
+      sent.some((frame) => isRecord(frame) && frame.kind === 'client.capability.cancel'),
+      true,
+    );
+
+    snapshot.release();
+    await connection.close();
+    await coordinator.close();
+  });
+
+  test('reports capability_lost before admission and outcome_unknown after admission', async () => {
+    await assertLossClassification('before_acceptance', 'capability_lost');
+    await assertLossClassification('after_admission', 'outcome_unknown');
+  });
+
+  test('keeps explicit clients isolated and reports Host-originated ambiguity', async () => {
     const coordinator = createCoordinator();
     const first = coordinator.attachConnection(clientCapabilityConnectionIdentity('connection-a'), {
       send: async () => {},
@@ -279,14 +997,19 @@ describe('Host Client Capability coordinator', () => {
       clientCapabilityConnectionIdentity('connection-b'),
       { send: async () => {} },
     );
+    const observer = coordinator.attachConnection(clientCapabilityConnectionIdentity('observer'), {
+      send: async () => {},
+    });
     await replace(coordinator, 'connection-a', 'registration-a', 'first');
     assert.deepEqual(await coordinator.bindSession('sole-session', 'observer'), { ok: true });
     const sole = coordinator.snapshotForSession('sole-session');
-    assert.deepEqual(sole?.registrationIds, ['registration-a']);
-    sole?.release();
+    assert.equal(sole, undefined);
     await replace(coordinator, 'connection-b', 'registration-b', 'first');
 
-    const ambiguous = await coordinator.bindSession('ambiguous-session', 'observer');
+    assert.deepEqual(await coordinator.bindSession('unrelated-session', 'observer'), { ok: true });
+    assert.equal(coordinator.snapshotForSession('unrelated-session'), undefined);
+
+    const ambiguous = await coordinator.bindSession('ambiguous-session', '');
     assert.equal(ambiguous.ok, false);
     if (!ambiguous.ok) assert.match(ambiguous.message, /Multiple Client Capability providers/);
 
@@ -296,8 +1019,161 @@ describe('Host Client Capability coordinator', () => {
     const snapshot = coordinator.snapshotForSession('selected-session');
     assert.deepEqual(snapshot?.registrationIds, ['registration-b']);
     snapshot?.release();
+    observer.close();
     first.close();
     second.close();
+    await coordinator.close();
+  });
+
+  test('selects only the provider bound to the exact initiating Client identity', async () => {
+    const coordinator = createCoordinator();
+    const owner = coordinator.attachConnection(
+      clientCapabilityConnectionIdentity(
+        'owner-connection',
+        'owner-client',
+        'owner-principal',
+        'remote_owner',
+      ),
+      { send: async () => {} },
+    );
+    const unrelated = coordinator.attachConnection(
+      clientCapabilityConnectionIdentity(
+        'unrelated-provider',
+        'unrelated-provider-client',
+        'unrelated-provider-principal',
+        'capability_provider',
+        { principalId: 'other-principal', clientInstanceId: 'other-client' },
+      ),
+      { send: async () => {} },
+    );
+    await replaceTrustedProvider(
+      coordinator,
+      'unrelated-provider',
+      'unrelated-registration',
+      'inspect',
+    );
+
+    assert.deepEqual(await coordinator.bindSession('unrelated-only', 'owner-connection'), {
+      ok: true,
+    });
+    assert.equal(coordinator.snapshotForSession('unrelated-only'), undefined);
+
+    const associated = coordinator.attachConnection(
+      clientCapabilityConnectionIdentity(
+        'associated-provider',
+        'associated-provider-client',
+        'associated-provider-principal',
+        'capability_provider',
+        { principalId: 'owner-principal', clientInstanceId: 'owner-client' },
+      ),
+      { send: async () => {} },
+    );
+    await replaceTrustedProvider(
+      coordinator,
+      'associated-provider',
+      'associated-registration',
+      'inspect',
+    );
+    assert.throws(
+      () =>
+        coordinator.attachConnection(
+          clientCapabilityConnectionIdentity(
+            'changed-owner-provider',
+            'associated-provider-client',
+            'associated-provider-principal',
+            'capability_provider',
+            { principalId: 'other-principal', clientInstanceId: 'other-client' },
+          ),
+          { send: async () => {} },
+        ),
+      /provider owner changed/u,
+    );
+
+    assert.deepEqual(await coordinator.bindSession('associated', 'owner-connection'), { ok: true });
+    const snapshot = coordinator.snapshotForSession('associated');
+    assert.deepEqual(snapshot?.registrationIds, ['associated-registration']);
+    snapshot?.release();
+
+    const otherClient = coordinator.attachConnection(
+      clientCapabilityConnectionIdentity(
+        'other-client-connection',
+        'different-client',
+        'owner-principal',
+        'remote_owner',
+      ),
+      { send: async () => {} },
+    );
+    assert.deepEqual(await coordinator.bindSession('different-client', 'other-client-connection'), {
+      ok: true,
+    });
+    assert.equal(coordinator.snapshotForSession('different-client'), undefined);
+
+    const duplicate = coordinator.attachConnection(
+      clientCapabilityConnectionIdentity(
+        'duplicate-provider',
+        'duplicate-provider-client',
+        'duplicate-provider-principal',
+        'capability_provider',
+        { principalId: 'owner-principal', clientInstanceId: 'owner-client' },
+      ),
+      { send: async () => {} },
+    );
+    await replaceTrustedProvider(
+      coordinator,
+      'duplicate-provider',
+      'duplicate-registration',
+      'inspect',
+    );
+    const ambiguous = await coordinator.bindSession('duplicate-owner', 'owner-connection');
+    assert.equal(ambiguous.ok, false);
+    if (!ambiguous.ok) assert.match(ambiguous.message, /bound to the initiating Client/u);
+
+    await Promise.all([
+      owner.close(),
+      unrelated.close(),
+      associated.close(),
+      otherClient.close(),
+      duplicate.close(),
+    ]);
+    await coordinator.close();
+  });
+
+  test('does not match a companion from a hello-only Client identity', async () => {
+    const coordinator = createCoordinator();
+    const provider = coordinator.attachConnection(
+      clientCapabilityConnectionIdentity(
+        'associated-provider',
+        'provider-client',
+        'provider-principal',
+        'capability_provider',
+        { principalId: 'owner-principal', clientInstanceId: 'owner-client' },
+      ),
+      { send: async () => {} },
+    );
+    await replaceTrustedProvider(
+      coordinator,
+      'associated-provider',
+      'associated-registration',
+      'inspect',
+    );
+    const unboundOwner = coordinator.attachConnection(
+      clientCapabilityConnectionIdentity(
+        'unbound-owner',
+        'owner-client',
+        'owner-principal',
+        'remote_owner',
+        undefined,
+        false,
+      ),
+      { send: async () => {} },
+    );
+
+    assert.deepEqual(await coordinator.bindSession('unbound-owner', 'unbound-owner'), {
+      ok: true,
+    });
+    assert.equal(coordinator.snapshotForSession('unbound-owner'), undefined);
+
+    await Promise.all([provider.close(), unboundOwner.close()]);
     await coordinator.close();
   });
 
@@ -459,7 +1335,7 @@ describe('Host Client Capability coordinator', () => {
       'second_offer',
     );
 
-    assert.deepEqual(await coordinator.bindSession('session-a', 'observer'), { ok: true });
+    assert.deepEqual(await coordinator.bindSession('session-a', ''), { ok: true });
     const snapshot = coordinator.snapshotForSession('session-a');
     assert.ok(snapshot);
     assert.deepEqual([...snapshot.registrationIds].sort(), ['registration-a', 'registration-b']);
@@ -561,17 +1437,35 @@ describe('Host Client Capability coordinator', () => {
     await coordinator.close();
   });
 
-  test('forgets initiating Clients when replacement or unregister removes all call-affine offers', async () => {
+  test('retains the initiating Client across temporary loss of call-affine offers', async () => {
     for (const mutation of ['replace', 'unregister'] as const) {
       const coordinator = createCoordinator();
-      const first = coordinator.attachConnection(
-        clientCapabilityConnectionIdentity('connection-a'),
-        { send: async () => {} },
-      );
-      const second = coordinator.attachConnection(
-        clientCapabilityConnectionIdentity('connection-b'),
-        { send: async () => {} },
-      );
+      const attach = (connectionId: string) => {
+        let connection!: ClientCapabilityConnection;
+        connection = coordinator.attachConnection(
+          clientCapabilityConnectionIdentity(connectionId),
+          {
+            send: async (frame) => {
+              if (frame.kind === 'client.capability.call') {
+                connection.accept({
+                  kind: 'client.capability.accepted',
+                  invocationId: frame.invocationId,
+                  admissionEvidence: { kind: 'none' },
+                });
+              } else if (frame.kind === 'client.capability.admitted') {
+                connection.accept({
+                  kind: 'client.capability.result',
+                  invocationId: frame.invocationId,
+                  result: textResult(connectionId),
+                });
+              }
+            },
+          },
+        );
+        return connection;
+      };
+      const first = attach('connection-a');
+      const second = attach('connection-b');
       await replace(
         coordinator,
         'connection-a',
@@ -621,11 +1515,7 @@ describe('Host Client Capability coordinator', () => {
       );
       const snapshot = coordinator.snapshotForSession('session-a');
       assert.ok(snapshot);
-      await assert.rejects(
-        () => invoke(snapshot.tools[0]),
-        (error: unknown) =>
-          error instanceof ClientCapabilityInvocationError && error.code === 'capability_ambiguous',
-      );
+      assert.deepEqual(await invoke(snapshot.tools[0]), textResult('connection-a'));
       snapshot.release();
       first.close();
       second.close();
@@ -633,9 +1523,12 @@ describe('Host Client Capability coordinator', () => {
     }
   });
 
-  test('does not retain an initiating Client for a Session with no capability state', async () => {
+  test('keeps Host-originated call offers independent and unattached Clients isolated', async () => {
     const coordinator = createCoordinator();
-    assert.deepEqual(await coordinator.bindSession('session-a', 'connection-a'), { ok: true });
+    assert.deepEqual(await coordinator.bindSession('session-a', ''), { ok: true });
+    assert.deepEqual(await coordinator.bindSession('unattached', 'missing-connection'), {
+      ok: true,
+    });
 
     const first = coordinator.attachConnection(clientCapabilityConnectionIdentity('connection-a'), {
       send: async () => {},
@@ -665,6 +1558,7 @@ describe('Host Client Capability coordinator', () => {
 
     const snapshot = coordinator.snapshotForSession('session-a');
     assert.ok(snapshot);
+    assert.equal(coordinator.snapshotForSession('unattached'), undefined);
     await assert.rejects(
       () => invoke(snapshot.tools[0]),
       (error: unknown) =>
@@ -696,6 +1590,99 @@ describe('Host Client Capability coordinator', () => {
     await coordinator.close();
   });
 
+  test('required tools must have one available provider before a Session binding commits', async () => {
+    const coordinator = createCoordinator();
+    const names = ['mcp__desktop_workhub__control', 'mcp__desktop_workhub__tasks'];
+    try {
+      coordinator.attachConnection(clientCapabilityConnectionIdentity('desktop'), {
+        send: async () => {},
+      });
+      coordinator.attachConnection(clientCapabilityConnectionIdentity('other'), {
+        send: async () => {},
+      });
+      await registerSessionTools(coordinator, 'desktop', 'control-only', 'desktop_workhub', [
+        'control',
+      ]);
+      assert.equal((await coordinator.bindSession('session-a', 'desktop', names)).ok, false);
+      assert.equal(coordinator.snapshotForSession('session-a'), undefined);
+      await registerSessionTools(coordinator, 'other', 'tasks-only', 'desktop_workhub', ['tasks']);
+      assert.equal((await coordinator.bindSession('session-a', 'desktop', names)).ok, false);
+      assert.equal(coordinator.snapshotForSession('session-a'), undefined);
+      await registerSessionTools(coordinator, 'desktop', 'complete', 'desktop_workhub', [
+        'control',
+        'tasks',
+      ]);
+      const bound = await coordinator.bindSession('session-a', 'desktop', names);
+      assert.ok(bound.ok);
+      assert.match(bound.capabilityBinding!, /^sha256:[a-f0-9]{64}$/);
+      const snapshot = coordinator.snapshotForSession('session-a');
+      assert.deepEqual(snapshot?.registrationIds, ['complete']);
+      snapshot?.release();
+    } finally {
+      await coordinator.close();
+    }
+  });
+
+  test('cold binding authenticates provider principal, Client and credential owner independently of registration identity', async () => {
+    const names = ['mcp__desktop_workhub__control', 'mcp__desktop_workhub__tasks'];
+    const identity = clientCapabilityConnectionIdentity(
+      'original',
+      'desktop-client',
+      'provider-principal',
+      'capability_provider',
+      { principalId: 'desktop-owner', clientInstanceId: 'owner-client' },
+    );
+    const original = createCoordinator();
+    original.attachConnection(identity, { send: async () => {} });
+    await registerSessionTools(original, 'original', 'original-reg', 'desktop_workhub', [
+      'control',
+      'tasks',
+    ]);
+    const result = await original.bindSession('session-a', 'original', names);
+    assert.ok(result.ok);
+    const binding = result.capabilityBinding;
+    assert.ok(binding);
+    await original.close();
+    for (const changed of [
+      { principalId: 'other-provider' },
+      { clientInstanceId: 'other-client' },
+      { capabilityOwner: { principalId: 'other-owner', clientInstanceId: 'owner-client' } },
+      { capabilityOwner: { principalId: 'desktop-owner', clientInstanceId: 'other-owner-client' } },
+    ]) {
+      const recovered = createCoordinator();
+      try {
+        const unrelated = recovered.attachConnection(
+          { ...identity, ...changed, connectionId: 'unrelated' },
+          { send: async () => {} },
+        );
+        await registerSessionTools(recovered, 'unrelated', 'hostile-reg', 'desktop_workhub', [
+          'control',
+          'tasks',
+        ]);
+        assert.equal(await recovered.bindRecoveredSession('session-a', binding, names), false);
+        assert.equal(recovered.snapshotForSession('session-a'), undefined);
+        await unrelated.close();
+        recovered.attachConnection(
+          { ...identity, connectionId: 'reconnected' },
+          { send: async () => {} },
+        );
+        await registerSessionTools(
+          recovered,
+          'reconnected',
+          'new-registration',
+          'desktop_workhub',
+          ['control', 'tasks'],
+        );
+        assert.equal(await recovered.bindRecoveredSession('session-a', binding, names), true);
+        const snapshot = recovered.snapshotForSession('session-a');
+        assert.deepEqual(snapshot?.registrationIds, ['new-registration']);
+        snapshot?.release();
+      } finally {
+        await recovered.close();
+      }
+    }
+  });
+
   test('retires Session bindings after explicit replacement and unregister', async () => {
     const coordinator = createCoordinator();
     const connection = coordinator.attachConnection(
@@ -706,7 +1693,7 @@ describe('Host Client Capability coordinator', () => {
     assert.deepEqual(await coordinator.bindSession('session-a', 'connection-a'), { ok: true });
 
     await replace(coordinator, 'connection-a', 'registration-b', 'inspect', '1');
-    assert.deepEqual(await coordinator.bindSession('session-a', 'observer'), { ok: true });
+    assert.deepEqual(await coordinator.bindSession('session-a', ''), { ok: true });
     const replacement = coordinator.snapshotForSession('session-a');
     assert.deepEqual(replacement?.registrationIds, ['registration-b']);
     replacement?.release();
@@ -716,7 +1703,7 @@ describe('Host Client Capability coordinator', () => {
       connectionContext('connection-a'),
     );
     assert.equal(unregistered.ok, true);
-    assert.deepEqual(await coordinator.bindSession('session-a', 'observer'), { ok: true });
+    assert.deepEqual(await coordinator.bindSession('session-a', ''), { ok: true });
     assert.equal(coordinator.snapshotForSession('session-a'), undefined);
     connection.close();
     await coordinator.close();
@@ -727,31 +1714,37 @@ describe('Host Client Capability coordinator', () => {
     let first!: ClientCapabilityConnection;
     first = coordinator.attachConnection(clientCapabilityConnectionIdentity('connection-a'), {
       send: async (frame) => {
-        if (frame.kind !== 'client.capability.call') return;
-        first.accept({
-          kind: 'client.capability.accepted',
-          invocationId: frame.invocationId,
-        });
-        first.accept({
-          kind: 'client.capability.result',
-          invocationId: frame.invocationId,
-          result: textResult('first'),
-        });
+        if (frame.kind === 'client.capability.call') {
+          first.accept({
+            kind: 'client.capability.accepted',
+            invocationId: frame.invocationId,
+            admissionEvidence: { kind: 'none' },
+          });
+        } else if (frame.kind === 'client.capability.admitted') {
+          first.accept({
+            kind: 'client.capability.result',
+            invocationId: frame.invocationId,
+            result: textResult('first'),
+          });
+        }
       },
     });
     let second!: ClientCapabilityConnection;
     second = coordinator.attachConnection(clientCapabilityConnectionIdentity('connection-b'), {
       send: async (frame) => {
-        if (frame.kind !== 'client.capability.call') return;
-        second.accept({
-          kind: 'client.capability.accepted',
-          invocationId: frame.invocationId,
-        });
-        second.accept({
-          kind: 'client.capability.result',
-          invocationId: frame.invocationId,
-          result: textResult('second'),
-        });
+        if (frame.kind === 'client.capability.call') {
+          second.accept({
+            kind: 'client.capability.accepted',
+            invocationId: frame.invocationId,
+            admissionEvidence: { kind: 'none' },
+          });
+        } else if (frame.kind === 'client.capability.admitted') {
+          second.accept({
+            kind: 'client.capability.result',
+            invocationId: frame.invocationId,
+            result: textResult('second'),
+          });
+        }
       },
     });
     await replace(
@@ -773,7 +1766,7 @@ describe('Host Client Capability coordinator', () => {
       'call',
     );
 
-    assert.deepEqual(await coordinator.bindSession('session-a', 'observer'), { ok: true });
+    assert.deepEqual(await coordinator.bindSession('session-a', ''), { ok: true });
     const ambiguous = coordinator.snapshotForSession('session-a');
     assert.ok(ambiguous);
     await assert.rejects(
@@ -792,7 +1785,7 @@ describe('Host Client Capability coordinator', () => {
     frozen.release();
 
     first.close();
-    assert.deepEqual(await coordinator.bindSession('session-a', 'observer'), { ok: true });
+    assert.deepEqual(await coordinator.bindSession('session-a', ''), { ok: true });
     const sole = coordinator.snapshotForSession('session-a');
     assert.ok(sole);
     assert.deepEqual(await invoke(sole.tools[0]), textResult('second'));
@@ -829,7 +1822,7 @@ describe('Host Client Capability coordinator', () => {
       'turn',
     );
 
-    assert.deepEqual(await coordinator.bindSession('session-a', 'observer'), { ok: true });
+    assert.deepEqual(await coordinator.bindSession('session-a', ''), { ok: true });
     assert.equal(coordinator.snapshotForSession('session-a'), undefined);
     assert.deepEqual(await coordinator.bindSession('session-a', 'connection-b'), { ok: true });
     const selected = coordinator.snapshotForSession('session-a');
@@ -837,7 +1830,7 @@ describe('Host Client Capability coordinator', () => {
     selected?.release();
 
     second.close();
-    assert.deepEqual(await coordinator.bindSession('session-a', 'observer'), { ok: true });
+    assert.deepEqual(await coordinator.bindSession('session-a', ''), { ok: true });
     const rebound = coordinator.snapshotForSession('session-a');
     assert.deepEqual(rebound?.registrationIds, ['registration-a']);
     rebound?.release();
@@ -938,23 +1931,26 @@ describe('Host Client Capability coordinator', () => {
     await coordinator.close();
   });
 
-  test('cancels accepted work as outcome_unknown and ignores a late provider outcome', async () => {
+  test('cancels admitted work as outcome_unknown and ignores a late provider outcome', async () => {
     const coordinator = createCoordinator();
     const sent: Array<{ kind: string; invocationId?: string }> = [];
     let connection!: ClientCapabilityConnection;
-    let callArrived!: () => void;
-    const receivedCall = new Promise<void>((resolve) => {
-      callArrived = resolve;
+    let admittedArrived!: () => void;
+    const receivedAdmission = new Promise<void>((resolve) => {
+      admittedArrived = resolve;
     });
     connection = coordinator.attachConnection(clientCapabilityConnectionIdentity('connection-a'), {
       send: async (frame) => {
         sent.push(frame);
-        if (frame.kind !== 'client.capability.call') return;
-        connection.accept({
-          kind: 'client.capability.accepted',
-          invocationId: frame.invocationId,
-        });
-        callArrived();
+        if (frame.kind === 'client.capability.call') {
+          connection.accept({
+            kind: 'client.capability.accepted',
+            invocationId: frame.invocationId,
+            admissionEvidence: { kind: 'none' },
+          });
+        } else if (frame.kind === 'client.capability.admitted') {
+          admittedArrived();
+        }
       },
     });
     await replace(coordinator, 'connection-a', 'registration-a', 'opaque');
@@ -974,7 +1970,7 @@ describe('Host Client Capability coordinator', () => {
       },
     );
     assert.ok(pending);
-    await receivedCall;
+    await receivedAdmission;
     abort.abort(new DOMException('Cancelled by test', 'AbortError'));
     await assert.rejects(
       Promise.resolve(pending),
@@ -1009,6 +2005,7 @@ describe('Host Client Capability coordinator', () => {
     const cases = [
       {
         name: 'start before acceptance',
+        afterAdmission: false,
         transition: (connection: ClientCapabilityConnection, invocationId: string) => {
           connection.accept({
             kind: 'client.capability.result_start',
@@ -1017,12 +2014,12 @@ describe('Host Client Capability coordinator', () => {
             chunkCount: 1,
           });
         },
-        message: /chunks started outside the accepted phase/,
+        message: /chunks started outside the admitted phase/,
       },
       {
         name: 'chunk before start',
+        afterAdmission: true,
         transition: (connection: ClientCapabilityConnection, invocationId: string) => {
-          connection.accept({ kind: 'client.capability.accepted', invocationId });
           connection.accept({
             kind: 'client.capability.result_chunk',
             invocationId,
@@ -1034,8 +2031,8 @@ describe('Host Client Capability coordinator', () => {
       },
       {
         name: 'duplicate start',
+        afterAdmission: true,
         transition: (connection: ClientCapabilityConnection, invocationId: string) => {
-          connection.accept({ kind: 'client.capability.accepted', invocationId });
           connection.accept({
             kind: 'client.capability.result_start',
             invocationId,
@@ -1049,12 +2046,12 @@ describe('Host Client Capability coordinator', () => {
             chunkCount: 1,
           });
         },
-        message: /chunks started outside the accepted phase/,
+        message: /chunks started outside the admitted phase/,
       },
       {
         name: 'unchunked result after start',
+        afterAdmission: true,
         transition: (connection: ClientCapabilityConnection, invocationId: string) => {
-          connection.accept({ kind: 'client.capability.accepted', invocationId });
           connection.accept({
             kind: 'client.capability.result_start',
             invocationId,
@@ -1067,12 +2064,12 @@ describe('Host Client Capability coordinator', () => {
             result: textResult('invalid terminal form'),
           });
         },
-        message: /result arrived outside the accepted phase/,
+        message: /result arrived outside the admitted phase/,
       },
       {
         name: 'out-of-order chunk',
+        afterAdmission: true,
         transition: (connection: ClientCapabilityConnection, invocationId: string) => {
-          connection.accept({ kind: 'client.capability.accepted', invocationId });
           connection.accept({
             kind: 'client.capability.result_start',
             invocationId,
@@ -1096,12 +2093,25 @@ describe('Host Client Capability coordinator', () => {
       const invocationArrived = new Promise<string>((resolve) => {
         resolveInvocation = resolve;
       });
+      let resolveAdmission!: () => void;
+      const admissionArrived = new Promise<void>((resolve) => {
+        resolveAdmission = resolve;
+      });
       const connection = coordinator.attachConnection(
         clientCapabilityConnectionIdentity('connection-a'),
         {
           send: async (frame) => {
             if (frame.kind === 'client.capability.call') {
               resolveInvocation(frame.invocationId);
+              if (malformed.afterAdmission) {
+                connection.accept({
+                  kind: 'client.capability.accepted',
+                  invocationId: frame.invocationId,
+                  admissionEvidence: { kind: 'none' },
+                });
+              }
+            } else if (frame.kind === 'client.capability.admitted') {
+              resolveAdmission();
             }
           },
         },
@@ -1112,6 +2122,7 @@ describe('Host Client Capability coordinator', () => {
       assert.ok(snapshot);
       const pending = invoke(snapshot.tools[0]);
       const invocationId = await invocationArrived;
+      if (malformed.afterAdmission) await admissionArrived;
 
       try {
         assert.throws(
@@ -1131,21 +2142,26 @@ describe('Host Client Capability coordinator', () => {
 });
 
 async function assertLossClassification(
-  accept: boolean,
+  phase: 'before_acceptance' | 'after_admission',
   expected: ClientCapabilityInvocationError['code'] | 'outcome_unknown',
 ): Promise<void> {
   const coordinator = createCoordinator();
   let connection!: ClientCapabilityConnection;
   connection = coordinator.attachConnection(clientCapabilityConnectionIdentity('connection-a'), {
     send: async (frame) => {
-      if (frame.kind !== 'client.capability.call') return;
-      if (accept) {
+      if (frame.kind === 'client.capability.call') {
+        if (phase === 'before_acceptance') {
+          connection.close();
+          return;
+        }
         connection.accept({
           kind: 'client.capability.accepted',
           invocationId: frame.invocationId,
+          admissionEvidence: { kind: 'none' },
         });
+      } else if (frame.kind === 'client.capability.admitted') {
+        connection.close();
       }
-      connection.close();
     },
   });
   await replace(coordinator, 'connection-a', 'registration-a', 'opaque');
@@ -1165,11 +2181,112 @@ async function assertLossClassification(
 
 function createCoordinator(
   onModelToolsChanged: () => void = () => undefined,
+  admission: Pick<
+    HostClientCapabilityCoordinatorOptions,
+    'interactions' | 'grants'
+  > = clientCapabilityCoordinatorTestAdmission(),
 ): HostClientCapabilityCoordinator {
   return new HostClientCapabilityCoordinator({
+    ...admission,
+    isSessionRetired: async () => false,
     activation: new RuntimePolicyActivationGate(),
     onModelToolsChanged,
   });
+}
+
+async function prepare(
+  tool: ReturnType<typeof toolAt>,
+  args: Record<string, unknown>,
+  toolCallId: string,
+) {
+  assert.ok(tool?.prepareExecution);
+  return tool.prepareExecution(args, {
+    ...managedContext(toolCallId),
+    permissionMode: 'ask',
+  });
+}
+
+function managedContext(toolCallId: string) {
+  return {
+    sessionId: 'session-a',
+    runId: 'run-a',
+    turnId: 'turn-a',
+    cwd: '/tmp',
+    toolCallId,
+    permissionMode: 'ask' as const,
+    executionBoundary: createManagedExecutionBoundary(createWorkspaceWritePermissionProfile(), 0),
+    abortSignal: new AbortController().signal,
+    emitOutput: () => undefined,
+  };
+}
+
+function attachAutoAdmittingConnection(
+  coordinator: HostClientCapabilityCoordinator,
+  connectionId: string,
+  admissionEvidence: (frame: ClientCapabilityCallFrame) => ClientCapabilityAdmissionEvidence,
+  resultText: string,
+  sent?: unknown[],
+  principalKind: Parameters<typeof clientCapabilityConnectionIdentity>[3] = 'capability_provider',
+): ClientCapabilityConnection {
+  let connection!: ClientCapabilityConnection;
+  connection = coordinator.attachConnection(
+    clientCapabilityConnectionIdentity(
+      connectionId,
+      `${connectionId}-client`,
+      `${connectionId}-principal`,
+      principalKind,
+    ),
+    {
+      send: async (frame) => {
+        sent?.push(frame);
+        if (frame.kind === 'client.capability.call') {
+          connection.accept({
+            kind: 'client.capability.accepted',
+            invocationId: frame.invocationId,
+            admissionEvidence: admissionEvidence(frame),
+          });
+        } else if (frame.kind === 'client.capability.admitted') {
+          connection.accept({
+            kind: 'client.capability.result',
+            invocationId: frame.invocationId,
+            result: textResult(resultText),
+          });
+        }
+      },
+    },
+  );
+  return connection;
+}
+
+async function registerSessionTools(
+  coordinator: HostClientCapabilityCoordinator,
+  connectionId: string,
+  registrationId: string,
+  serverId: string,
+  toolNames: readonly string[],
+  hostPathAccess: ClientCapabilityReplaceInput['offers'][number]['hostPathAccess'] = 'none',
+): Promise<void> {
+  const result = await coordinator.handlers['client.capability.replace'](
+    {
+      registrationId,
+      offers: [
+        {
+          offerId: serverId,
+          version: '1',
+          affinity: 'session',
+          hostPathAccess,
+          label: serverId,
+          tools: toolNames.map((name) => ({
+            serverId,
+            name,
+            inputSchema: { type: 'object' },
+          })),
+        },
+      ],
+    },
+    connectionContext(connectionId),
+  );
+  assert.equal(result.ok, true, JSON.stringify(result));
 }
 
 async function replace(
@@ -1186,6 +2303,23 @@ async function replace(
     {
       ...connectionContext(connectionId),
     },
+  );
+  assert.equal(outcome.ok, true);
+}
+
+async function replaceTrustedProvider(
+  coordinator: HostClientCapabilityCoordinator,
+  connectionId: string,
+  registrationId: string,
+  toolName: string,
+): Promise<void> {
+  const input = replacementInput(registrationId, toolName);
+  const outcome = await coordinator.handlers['client.capability.replace'](
+    {
+      ...input,
+      offers: input.offers.map((offer) => ({ ...offer, hostPathAccess: 'none' as const })),
+    },
+    connectionContext(connectionId),
   );
   assert.equal(outcome.ok, true);
 }
@@ -1241,6 +2375,7 @@ test('Host services stay bound to the explicitly initiating Client connection', 
           connection.accept({
             kind: 'client.capability.accepted',
             invocationId: frame.invocationId,
+            admissionEvidence: { kind: 'none' },
           });
           return;
         }
@@ -1248,7 +2383,11 @@ test('Host services stay bound to the explicitly initiating Client connection', 
           connection.accept({
             kind: 'client.capability.result',
             invocationId: frame.invocationId,
-            result: { content: [], structuredContent: { kind: 'presented' } },
+            result: {
+              outcome: 'success',
+              content: [],
+              structuredContent: { kind: 'presented' },
+            },
           });
         }
       },
@@ -1322,7 +2461,7 @@ test('Host services never fail over to a different Session owner', async () => {
   assert.equal(
     (
       await coordinator.handlers['client.capability.replace'](
-        { registrationId: 'owner-without-service', offers: [], services: [] },
+        replacementInput('owner-without-service', 'placeholder'),
         connectionContext('connection-a'),
       )
     ).ok,
@@ -1395,6 +2534,88 @@ test('service-only registration lifecycle does not invalidate model backends', a
   assert.equal(modelToolChanges, 2);
 });
 
+test('close waits for nested Client Capability interaction cleanup', async () => {
+  const coordinator = createCoordinator();
+  let connection!: ClientCapabilityConnection;
+  let interactionStarted!: () => void;
+  const started = new Promise<void>((resolve) => {
+    interactionStarted = resolve;
+  });
+  let finishCleanup!: () => void;
+  const cleanup = new Promise<void>((resolve) => {
+    finishCleanup = resolve;
+  });
+  connection = coordinator.attachConnection(clientCapabilityConnectionIdentity('connection-a'), {
+    send: async (frame) => {
+      if (frame.kind === 'client.capability.call') {
+        connection.accept({
+          kind: 'client.capability.accepted',
+          invocationId: frame.invocationId,
+          admissionEvidence: { kind: 'none' },
+        });
+      } else if (frame.kind === 'client.capability.admitted') {
+        connection.accept({
+          kind: 'client.capability.interaction_request',
+          invocationId: frame.invocationId,
+          interactionId: 'interaction-a',
+          request: {
+            message: 'Choose a target',
+            requester: { name: 'deploy' },
+            fields: [
+              { kind: 'string', name: 'target', label: 'Target', required: true, maxLength: 256 },
+            ],
+          },
+        });
+      }
+    },
+  });
+  await replace(coordinator, 'connection-a', 'registration-a', 'deploy');
+  assert.deepEqual(await coordinator.bindSession('session-a', 'connection-a'), { ok: true });
+  const snapshot = coordinator.snapshotForSession('session-a');
+  assert.ok(snapshot);
+  const call = Promise.resolve(
+    snapshot.tools[0]!.impl(
+      {},
+      {
+        sessionId: 'session-a',
+        turnId: 'turn-a',
+        cwd: '/tmp',
+        toolCallId: 'tool-call-a',
+        abortSignal: new AbortController().signal,
+        emitOutput: () => undefined,
+        requestUserForm: async (_form, options) => {
+          interactionStarted();
+          const signal = options?.cancellationSignal;
+          assert.ok(signal);
+          if (!signal.aborted) {
+            await new Promise<void>((resolve) =>
+              signal.addEventListener('abort', () => resolve(), { once: true }),
+            );
+          }
+          await cleanup;
+          throw signal.reason;
+        },
+      },
+    ),
+  );
+  void call.catch(() => undefined);
+  await started;
+  snapshot.release();
+
+  const connectionClosing = connection.close();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  let closed = false;
+  const closing = coordinator.close().then(() => {
+    closed = true;
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(closed, false);
+  finishCleanup();
+  await Promise.all([connectionClosing, closing]);
+  await assert.rejects(call, ToolOutcomeUnknownError);
+});
+
 async function invoke(tool: NonNullable<ReturnType<typeof toolAt>>): Promise<unknown> {
   return tool.impl(
     {},
@@ -1416,8 +2637,8 @@ function toolAt(
   return snapshot?.tools[index];
 }
 
-function textResult(text: string): McpCallResult {
-  return { content: [{ type: 'text', text }] };
+function textResult(text: string): ClientCapabilityCallResult {
+  return { outcome: 'success', content: [{ type: 'text', text }] };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

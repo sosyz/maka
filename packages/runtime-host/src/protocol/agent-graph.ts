@@ -22,6 +22,7 @@ import {
   requireEncodedByteLimit,
   requireEntityId,
   requireExactRecord,
+  requireOpaqueIdentity,
   requireShapedRecord,
   requireUtf8String,
 } from './codec.js';
@@ -54,6 +55,7 @@ export const AGENT_GRAPH_MAX_INSPECTION_RECORDS = 32;
 export const AGENT_GRAPH_EPOCH_PAGE_SIZE = 32;
 
 const AGENT_GRAPH_INSTRUCTION_PREVIEW_MAX_BYTES = 2 * 1024;
+const AGENT_GRAPH_OUTPUT_PREVIEW_MAX_BYTES = 2 * 1024;
 const AGENT_GRAPH_REASON_MAX_BYTES = 12 * 1024;
 const AGENT_GRAPH_RECONCILIATION_FAILURE_REASON_MAX_BYTES = 4 * 1024;
 
@@ -112,6 +114,7 @@ export type AgentGraphRecordFacet =
   | 'permission_request'
   | 'permission_decision'
   | 'user_question_request'
+  | 'form_request'
   | 'transfer'
   | 'usage'
   | 'completed'
@@ -121,7 +124,10 @@ export type AgentGraphRecordFacet =
   | 'runtime_fact';
 
 export type AgentGraphSupervisorSignal =
-  | { readonly kind: 'attention'; readonly reason: 'permission_request' | 'user_question_request' }
+  | {
+      readonly kind: 'attention';
+      readonly reason: 'permission_request' | 'user_question_request' | 'form_request';
+    }
   | {
       readonly kind: 'terminal';
       readonly status: 'completed' | 'failed' | 'aborted' | 'cancelled';
@@ -173,6 +179,21 @@ export interface AgentGraphClientOperator {
     readonly terminalRecordId?: string;
     readonly run: AgentGraphClientRunRef;
   };
+  readonly output?: AgentGraphClientOperatorOutput;
+}
+
+export interface AgentGraphClientOperatorOutput {
+  readonly activationId: string;
+  readonly preview: string;
+  readonly previewTruncated: boolean;
+  readonly phase: 'streaming' | 'completed';
+  readonly previewUpdatedAt: number;
+  readonly sourceEventId: string;
+  readonly messageId?: string;
+  readonly sampleStartedAt: number;
+  readonly outputTokens?: number;
+  readonly sampleDurationMs?: number;
+  readonly tokensPerSecond?: number;
 }
 
 export interface AgentGraphClientEdge {
@@ -755,7 +776,7 @@ function decodeOperator(value: unknown): AgentGraphClientOperator {
       'readiness',
       'omitted',
     ],
-    ['currentActivation'],
+    ['currentActivation', 'output'],
   );
   return {
     operatorId: requireOpaqueIdentity(record.operatorId, 'operatorId'),
@@ -789,6 +810,57 @@ function decodeOperator(value: unknown): AgentGraphClientOperator {
     ...(record.currentActivation === undefined
       ? {}
       : { currentActivation: decodeCurrentActivation(record.currentActivation) }),
+    ...(record.output === undefined ? {} : { output: decodeOperatorOutput(record.output) }),
+  };
+}
+
+function decodeOperatorOutput(value: unknown): AgentGraphClientOperatorOutput {
+  const record = requireShapedRecord(
+    value,
+    'agent graph operator output',
+    [
+      'activationId',
+      'preview',
+      'previewTruncated',
+      'phase',
+      'previewUpdatedAt',
+      'sourceEventId',
+      'sampleStartedAt',
+    ],
+    ['messageId', 'outputTokens', 'sampleDurationMs', 'tokensPerSecond'],
+  );
+  if (record.phase !== 'streaming' && record.phase !== 'completed') {
+    throw invalidProtocolFrame('Invalid agent graph operator output phase');
+  }
+  return {
+    activationId: requireOpaqueIdentity(record.activationId, 'activationId'),
+    preview: requireUtf8String(
+      record.preview,
+      'operator output preview',
+      AGENT_GRAPH_OUTPUT_PREVIEW_MAX_BYTES,
+    ),
+    previewTruncated: requireBoolean(record.previewTruncated, 'previewTruncated'),
+    phase: record.phase,
+    previewUpdatedAt: requireCount(record.previewUpdatedAt, 'previewUpdatedAt'),
+    sourceEventId: requireOpaqueIdentity(record.sourceEventId, 'sourceEventId'),
+    ...(record.messageId === undefined
+      ? {}
+      : { messageId: requireOpaqueIdentity(record.messageId, 'messageId') }),
+    sampleStartedAt: requireCount(record.sampleStartedAt, 'sampleStartedAt'),
+    ...(record.outputTokens === undefined
+      ? {}
+      : { outputTokens: requireCount(record.outputTokens, 'outputTokens') }),
+    ...(record.sampleDurationMs === undefined
+      ? {}
+      : { sampleDurationMs: requireCount(record.sampleDurationMs, 'sampleDurationMs') }),
+    ...(record.tokensPerSecond === undefined
+      ? {}
+      : {
+          tokensPerSecond: requireNonNegativeFiniteNumber(
+            record.tokensPerSecond,
+            'tokensPerSecond',
+          ),
+        }),
   };
 }
 
@@ -1194,7 +1266,11 @@ function decodeSignal(value: unknown): AgentGraphSupervisorSignal {
   const record = requireShapedRecord(value, 'agent graph signal', ['kind'], ['reason', 'status']);
   if (record.kind === 'attention') {
     requireExactRecord(record, 'agent graph attention signal', ['kind', 'reason']);
-    if (record.reason !== 'permission_request' && record.reason !== 'user_question_request') {
+    if (
+      record.reason !== 'permission_request' &&
+      record.reason !== 'user_question_request' &&
+      record.reason !== 'form_request'
+    ) {
       throw invalidProtocolFrame('Invalid agent graph attention reason');
     }
     return { kind: record.kind, reason: record.reason };
@@ -1340,14 +1416,8 @@ function requireBoolean(value: unknown, label: string): boolean {
   return value;
 }
 
-function requireOpaqueIdentity(value: unknown, label: string): string {
-  if (
-    typeof value !== 'string' ||
-    value.length === 0 ||
-    value.length > 256 ||
-    value.trim() !== value ||
-    /[\u0000-\u001f\u007f]/.test(value)
-  ) {
+function requireNonNegativeFiniteNumber(value: unknown, label: string): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
     throw invalidProtocolFrame(`Invalid ${label}`);
   }
   return value;
@@ -1429,6 +1499,7 @@ function requireFacet(value: unknown): AgentGraphRecordFacet {
     value === 'permission_request' ||
     value === 'permission_decision' ||
     value === 'user_question_request' ||
+    value === 'form_request' ||
     value === 'transfer' ||
     value === 'usage' ||
     value === 'completed' ||

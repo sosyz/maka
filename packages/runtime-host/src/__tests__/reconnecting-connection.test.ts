@@ -17,9 +17,11 @@
  * under the License.
  */
 
+import { deferred } from '@maka/core/test-only/async-primitives';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  createRuntimeHostReconnectLifecycle,
   createRuntimeHostReconnectingConnection,
   remoteRuntimeHostUnavailableError,
   RuntimeHostOperationError,
@@ -35,12 +37,14 @@ import {
   INTERACTIVE_RUNTIME_HOST_COMPOSITION_ID,
   RUNTIME_HOST_COMPATIBILITY_EPOCH,
   RUNTIME_HOST_PROTOCOL_VERSION,
+  type ArtifactChangedFrame,
   type HostIncompatible,
   type HostStatusResult,
   type OperationInput,
   type OperationKey,
   type OperationOutput,
 } from '../protocol/index.js';
+import { waitFor } from '@maka/core/test-only/async-primitives';
 
 test('a reconnecting Client retries an interrupted query on the replacement connection', async () => {
   const first = connectionHarness('first', (operation) => {
@@ -123,6 +127,68 @@ test('a reconnecting Client reports the connection generation used by direct ope
   replacement.disconnect();
   await yieldToEventLoop();
   assert.equal(availability.length, 3);
+  await connection.close();
+});
+
+test('a reconnecting Client forwards Artifact invalidations only from its current connection', async () => {
+  const first = connectionHarness('first', () => undefined);
+  const replacement = connectionHarness('replacement', () => undefined);
+  const connection = await createRuntimeHostReconnectingConnection({
+    initialConnection: first.connection,
+    connect: async () => replacement.connection,
+  });
+  const changes: ArtifactChangedFrame[] = [];
+  const unsubscribe = connection.subscribeArtifactChanges((frame) => changes.push(frame));
+
+  first.emitArtifactChange({
+    kind: 'artifact.changed',
+    reason: 'deleted',
+    sessionId: 'session-1',
+    artifactId: 'artifact-1',
+  });
+  assert.deepEqual(changes, [
+    {
+      kind: 'artifact.changed',
+      reason: 'deleted',
+      sessionId: 'session-1',
+      artifactId: 'artifact-1',
+    },
+  ]);
+
+  first.disconnect();
+  await waitForCondition(() => replacement.artifactSubscribers === 1);
+  first.emitArtifactChange({
+    kind: 'artifact.changed',
+    reason: 'session_purged',
+    sessionId: 'stale-session',
+  });
+  replacement.emitArtifactChange({
+    kind: 'artifact.changed',
+    reason: 'session_purged',
+    sessionId: 'session-2',
+  });
+  assert.deepEqual(changes, [
+    {
+      kind: 'artifact.changed',
+      reason: 'deleted',
+      sessionId: 'session-1',
+      artifactId: 'artifact-1',
+    },
+    {
+      kind: 'artifact.changed',
+      reason: 'session_purged',
+      sessionId: 'session-2',
+    },
+  ]);
+
+  unsubscribe();
+  replacement.emitArtifactChange({
+    kind: 'artifact.changed',
+    reason: 'deleted',
+    sessionId: 'session-2',
+    artifactId: 'artifact-2',
+  });
+  assert.equal(changes.length, 2);
   await connection.close();
 });
 
@@ -262,6 +328,47 @@ test('a Session observation reopens safely after its first connection starts dra
   await connection.close();
 });
 
+test('an initial Session observation stays pinned to the concrete connection it started on', async () => {
+  const first = connectionHarness(
+    'first',
+    () => undefined,
+    async () => {
+      first.disconnect();
+      throw new RuntimeHostOperationError(
+        'subscription.open',
+        'host_draining',
+        'Runtime Host is draining',
+      );
+    },
+  );
+  const replacement = connectionHarness(
+    'replacement',
+    () => undefined,
+    async () => ({ subscriptionId: 'replacement-subscription' }),
+  );
+  const reconnected = deferred();
+  const connection = await createRuntimeHostReconnectingConnection({
+    initialConnection: first.connection,
+    connect: async () => {
+      reconnected.resolve();
+      return replacement.connection;
+    },
+  });
+
+  await assert.rejects(
+    connection.openSessionSubscriptionOnce({
+      sessionId: 'session-1',
+      transcript: { kind: 'none' },
+    }),
+    (error: unknown) =>
+      error instanceof RuntimeHostOperationError && error.code === 'host_draining',
+  );
+  await reconnected.promise;
+  assert.equal(first.openedSubscriptions, 1);
+  assert.equal(replacement.openedSubscriptions, 0);
+  await connection.close();
+});
+
 test('a reconnecting Client rejects a different Host composition permanently', async () => {
   const first = connectionHarness('first', () => undefined);
   const replacement = connectionHarness('replacement', () => undefined, undefined, {
@@ -385,6 +492,189 @@ test('reconnect lifecycle close waits for a resource returned after cancellation
   assert.equal(closeSettled, true);
 });
 
+for (const closeDuringConnect of [false, true]) {
+  test(`reconnect lifecycle close waits for its initial connection and late resource cleanup (${closeDuringConnect ? 'reentrant' : 'caller'} close)`, {
+    timeout: 5_000,
+  }, async () => {
+    const acquired = deferredValue<RuntimeHostConnection>();
+    const closeEntered = deferred();
+    const releaseClose = deferred();
+    const late = connectionHarness('late-initial', () => undefined);
+    const lifecycle = createRuntimeHostReconnectLifecycle({
+      connect: async () => {
+        if (closeDuringConnect) void lifecycle.close();
+        return acquired.promise;
+      },
+    });
+    const starting = lifecycle.start();
+    let closeSettled = false;
+    let closedSettled = false;
+    const closing = lifecycle.close().then(() => {
+      closeSettled = true;
+    });
+    void lifecycle.closed.then(() => {
+      closedSettled = true;
+    });
+    const resource = {
+      ...late.connection,
+      close: async () => {
+        closeEntered.resolve();
+        await releaseClose.promise;
+        await late.connection.close();
+      },
+    };
+    try {
+      acquired.resolve(resource);
+      await closeEntered.promise;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(closeSettled, false);
+      assert.equal(closedSettled, false);
+      assert.equal(lifecycle.current, undefined);
+      releaseClose.resolve();
+      await Promise.all([starting, closing, lifecycle.closed, late.connection.closed]);
+      assert.equal(closeSettled, true);
+      assert.equal(closedSettled, true);
+    } finally {
+      acquired.resolve(resource);
+      releaseClose.resolve();
+      await Promise.allSettled([starting, closing]);
+      await late.connection.close();
+    }
+  });
+}
+
+test('reconnect lifecycle close waits for initial abort cleanup without reporting a fatal failure', {
+  timeout: 5_000,
+}, async () => {
+  const cleanupEntered = deferred();
+  const releaseCleanup = deferred();
+  const fatalErrors: Error[] = [];
+  let cleaned = false;
+  let reentrantCloseSettled = false;
+  const lifecycle = createRuntimeHostReconnectLifecycle({
+    connect: async (signal): Promise<RuntimeHostConnection> => {
+      await new Promise<void>((resolve) =>
+        signal.addEventListener(
+          'abort',
+          () => {
+            void lifecycle.close().then(() => {
+              reentrantCloseSettled = true;
+            });
+            resolve();
+          },
+          { once: true },
+        ),
+      );
+      cleanupEntered.resolve();
+      await releaseCleanup.promise;
+      cleaned = true;
+      throw signal.reason;
+    },
+    onFatalError: (error) => fatalErrors.push(error),
+  });
+  const starting = lifecycle.start().catch((error: unknown) => error);
+  let closedSettled = false;
+  let closeSettled = false;
+  void lifecycle.closed.then(() => {
+    closedSettled = true;
+  });
+  const closing = lifecycle.close().then(() => {
+    closeSettled = true;
+  });
+  try {
+    await cleanupEntered.promise;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(closeSettled, false);
+    assert.equal(closedSettled, false);
+    assert.equal(reentrantCloseSettled, false);
+    assert.equal(cleaned, false);
+    releaseCleanup.resolve();
+    await Promise.all([starting, closing, lifecycle.closed]);
+    assert.equal(cleaned, true);
+    assert.equal(closeSettled, true);
+    assert.equal(closedSettled, true);
+    assert.equal(reentrantCloseSettled, true);
+    assert.deepEqual(fatalErrors, []);
+  } finally {
+    releaseCleanup.resolve();
+    await Promise.allSettled([starting, closing]);
+  }
+});
+
+test('reconnect lifecycle closes an unstarted initial resource and cannot start after close', {
+  timeout: 5_000,
+}, async () => {
+  const initial = connectionHarness('unstarted', () => undefined);
+  let connectCalls = 0;
+  const lifecycle = createRuntimeHostReconnectLifecycle({
+    initial: initial.connection,
+    connect: async () => {
+      connectCalls += 1;
+      return initial.connection;
+    },
+  });
+  let resourceClosed = false;
+  void initial.connection.closed.then(() => {
+    resourceClosed = true;
+  });
+  try {
+    await lifecycle.close();
+    await lifecycle.closed;
+    assert.equal(resourceClosed, true);
+    await assert.rejects(lifecycle.start(), /lifecycle is closed/u);
+    assert.equal(connectCalls, 0);
+    assert.equal(lifecycle.current, undefined);
+  } finally {
+    await initial.connection.close();
+  }
+});
+
+test('reconnect lifecycle repeated start acquires only one initial resource', {
+  timeout: 5_000,
+}, async () => {
+  const resource = connectionHarness('initial', () => undefined);
+  const acquired = deferredValue<RuntimeHostConnection>();
+  let connectCalls = 0;
+  const lifecycle = createRuntimeHostReconnectLifecycle({
+    connect: async () => {
+      connectCalls += 1;
+      return acquired.promise;
+    },
+  });
+  const first = lifecycle.start();
+  const second = lifecycle.start();
+  try {
+    acquired.resolve(resource.connection);
+    await Promise.all([first, second]);
+    assert.equal(connectCalls, 1);
+    assert.equal(lifecycle.current, resource.connection);
+  } finally {
+    acquired.resolve(resource.connection);
+    await Promise.allSettled([first, second]);
+    await lifecycle.close();
+  }
+});
+
+test('reconnect lifecycle initial permanent failure rejects waiters and completes close', {
+  timeout: 5_000,
+}, async () => {
+  const failure = new RuntimeHostPermanentReconnectError('initial admission rejected');
+  const fatalErrors: Error[] = [];
+  const lifecycle = createRuntimeHostReconnectLifecycle<RuntimeHostConnection>({
+    connect: async () => {
+      throw failure;
+    },
+    onFatalError: (error) => {
+      fatalErrors.push(error);
+    },
+  });
+  const waiting = assert.rejects(lifecycle.waitForCurrent(), (error) => error === failure);
+  await assert.rejects(lifecycle.start(), (error) => error === failure);
+  await Promise.all([waiting, lifecycle.closed, lifecycle.close()]);
+  assert.deepEqual(fatalErrors, [failure]);
+  assert.equal(lifecycle.current, undefined);
+});
+
 test('reconnect lifecycle quiescence suppresses replacement until it is resumed', async () => {
   const first = connectionHarness('first', () => undefined);
   const replacement = connectionHarness('replacement', () => undefined);
@@ -469,6 +759,215 @@ test('reconnect lifecycle suspension admits recovery while no connection exists'
   assert.equal(await lifecycle.waitForCurrent(), replacement.connection);
   assert.equal(connectCalls, 2);
   await lifecycle.close();
+});
+
+test('new reachability evidence wakes an existing reconnect loop without starting another lifecycle', async () => {
+  const first = connectionHarness('first', () => undefined);
+  const replacement = connectionHarness('replacement', () => undefined);
+  const waitingForBackoff = deferred();
+  let connectCalls = 0;
+  const lifecycle = await startRuntimeHostReconnectLifecycle({
+    initial: first.connection,
+    connect: async () => {
+      connectCalls += 1;
+      if (connectCalls === 1) throw new Error('route is not reachable yet');
+      return replacement.connection;
+    },
+    backoff: {
+      minMs: 30_000,
+      maxMs: 30_000,
+      wait: (_delayMs, signal) =>
+        new Promise<void>((_resolve, reject) => {
+          waitingForBackoff.resolve();
+          const onAbort = () => reject(signal.reason);
+          signal.addEventListener('abort', onAbort, { once: true });
+          if (signal.aborted) onAbort();
+        }),
+    },
+  });
+
+  first.disconnect();
+  await waitingForBackoff.promise;
+  assert.equal(connectCalls, 1);
+
+  lifecycle.wake();
+  assert.equal(await lifecycle.waitForCurrent(), replacement.connection);
+  assert.equal(connectCalls, 2);
+  await lifecycle.close();
+});
+
+test('an initial transient failure keeps a wakeable reconnect lifecycle', async () => {
+  const replacement = connectionHarness('replacement', () => undefined);
+  const waitingForBackoff = deferred();
+  const failures: Error[] = [];
+  let connectCalls = 0;
+  const lifecycle = await startRuntimeHostReconnectLifecycle({
+    retryInitialFailure: true,
+    connect: async () => {
+      connectCalls += 1;
+      if (connectCalls <= 2) throw new Error('the peer is not reachable yet');
+      return replacement.connection;
+    },
+    onReconnectError: (error) => failures.push(error),
+    backoff: {
+      minMs: 30_000,
+      maxMs: 30_000,
+      wait: (_delayMs, signal) =>
+        new Promise<void>((_resolve, reject) => {
+          waitingForBackoff.resolve();
+          const onAbort = () => reject(signal.reason);
+          signal.addEventListener('abort', onAbort, { once: true });
+          if (signal.aborted) onAbort();
+        }),
+    },
+  });
+  try {
+    assert.equal(lifecycle.current, undefined);
+    assert.equal(connectCalls, 2);
+    assert.match(failures[0]?.message ?? '', /not reachable yet/u);
+    await waitingForBackoff.promise;
+
+    lifecycle.wake();
+    assert.equal(await lifecycle.waitForCurrent(), replacement.connection);
+    assert.equal(connectCalls, 3);
+  } finally {
+    await lifecycle.close();
+  }
+});
+
+test('initial retry policy reports a rejected admission without retrying', async () => {
+  const capacity = new Error('capacity exceeded');
+  let attempts = 0;
+  await assert.rejects(
+    startRuntimeHostReconnectLifecycle({
+      retryInitialFailure: (error) => error !== capacity,
+      connect: async (): Promise<RuntimeHostConnection> => {
+        attempts += 1;
+        throw capacity;
+      },
+    }),
+    (error: unknown) => error === capacity,
+  );
+  assert.equal(attempts, 1);
+});
+
+test('initial retry policy also stops a later initial admission attempt', async () => {
+  const capacity = new Error('capacity exceeded');
+  let attempts = 0;
+  const lifecycle = await startRuntimeHostReconnectLifecycle({
+    retryInitialFailure: (error) => error !== capacity,
+    connect: async (): Promise<RuntimeHostConnection> => {
+      attempts += 1;
+      if (attempts === 1) throw new Error('route unavailable');
+      throw capacity;
+    },
+    backoff: { minMs: 0, maxMs: 0 },
+  });
+  try {
+    await assert.rejects(lifecycle.waitForCurrent(), (error: unknown) => error === capacity);
+    assert.equal(attempts, 2);
+  } finally {
+    await lifecycle.close();
+  }
+});
+
+test('initial retry policy does not reject recovery of an established connection', async () => {
+  const first = connectionHarness('first', () => undefined);
+  const replacement = connectionHarness('replacement', () => undefined);
+  let attempts = 0;
+  let policyCalls = 0;
+  const lifecycle = await startRuntimeHostReconnectLifecycle({
+    retryInitialFailure: () => {
+      policyCalls += 1;
+      return false;
+    },
+    connect: async () => {
+      attempts += 1;
+      if (attempts === 1) return first.connection;
+      if (attempts === 2) throw new Error('capacity exceeded');
+      return replacement.connection;
+    },
+    backoff: { minMs: 0, maxMs: 0 },
+  });
+  try {
+    first.disconnect();
+    assert.equal(await lifecycle.waitForCurrent(first.connection), replacement.connection);
+    assert.equal(attempts, 3);
+    assert.equal(policyCalls, 0);
+  } finally {
+    await lifecycle.close();
+  }
+});
+
+test('initial retry mode does not outlive caller cancellation', async () => {
+  const controller = new AbortController();
+  const connecting = deferred();
+  const cancelled = new Error('initial connection cancelled');
+  let connectCalls = 0;
+  const starting = startRuntimeHostReconnectLifecycle({
+    retryInitialFailure: true,
+    initialSignal: controller.signal,
+    connect: async (signal): Promise<RuntimeHostConnection> => {
+      connectCalls += 1;
+      connecting.resolve();
+      return new Promise<never>((_resolve, reject) => {
+        const onAbort = () => reject(signal.reason);
+        signal.addEventListener('abort', onAbort, { once: true });
+        if (signal.aborted) onAbort();
+      });
+    },
+    backoff: { minMs: 0, maxMs: 0 },
+  });
+
+  await connecting.promise;
+  controller.abort(cancelled);
+  await assert.rejects(starting, (error: unknown) => error === cancelled);
+  await yieldToEventLoop();
+  assert.equal(connectCalls, 1);
+});
+
+test('reachability discovered during a failed attempt skips the next reconnect delay', async () => {
+  const first = connectionHarness('first', () => undefined);
+  const replacement = connectionHarness('replacement', () => undefined);
+  const attemptStarted = deferredValue<void>();
+  const failAttempt = deferredValue<void>();
+  let connectCalls = 0;
+  let delayCalls = 0;
+  const lifecycle = await startRuntimeHostReconnectLifecycle({
+    initial: first.connection,
+    connect: async () => {
+      connectCalls += 1;
+      if (connectCalls === 1) {
+        attemptStarted.resolve(undefined);
+        await failAttempt.promise;
+        throw new Error('the first route stopped working');
+      }
+      return replacement.connection;
+    },
+    backoff: {
+      minMs: 30_000,
+      maxMs: 30_000,
+      wait: (_delayMs, signal) =>
+        new Promise<void>((_resolve, reject) => {
+          delayCalls += 1;
+          const onAbort = () => reject(signal.reason);
+          signal.addEventListener('abort', onAbort, { once: true });
+          if (signal.aborted) onAbort();
+        }),
+    },
+  });
+  try {
+    first.disconnect();
+    await attemptStarted.promise;
+    lifecycle.wake();
+    failAttempt.resolve(undefined);
+
+    await waitForCondition(() => connectCalls === 2);
+    assert.equal(await lifecycle.waitForCurrent(), replacement.connection);
+    assert.equal(delayCalls, 0);
+  } finally {
+    await lifecycle.close();
+  }
 });
 
 test('reconnect delay escalates past maxMs while the Host never stabilizes', async () => {
@@ -598,12 +1097,7 @@ test('an omitted unstableMaxMs stays compatible with a large maxMs', async () =>
 });
 
 function waitForCondition(condition: () => boolean): Promise<void> {
-  return (async () => {
-    for (let i = 0; i < 1_000 && !condition(); i += 1) {
-      await new Promise<void>((resolve) => setImmediate(resolve));
-    }
-    assert.ok(condition());
-  })();
+  return waitFor(condition, { attempts: 1_000 });
 }
 
 function yieldToEventLoop(): Promise<void> {
@@ -627,6 +1121,7 @@ function connectionHarness(
     resolveClosed = resolve;
   });
   const operations: DirectRequestOperationKey[] = [];
+  const artifactListeners = new Set<(frame: ArtifactChangedFrame) => void>();
   let openedSubscriptions = 0;
   const connection = {
     rootId: 'root-id',
@@ -646,6 +1141,11 @@ function connectionHarness(
       return openSubscription();
     },
     subscribeConfigurationChanges: () => () => {},
+    subscribeArtifactChanges: (listener: (frame: ArtifactChangedFrame) => void) => {
+      artifactListeners.add(listener);
+      return () => artifactListeners.delete(listener);
+    },
+    subscribeConnectionCatalogChanges: () => () => {},
     subscribeProjectCatalogChanges: () => () => {},
     subscribeSessionCatalogChanges: () => () => {},
     subscribeScheduledTaskChanges: () => () => {},
@@ -655,6 +1155,12 @@ function connectionHarness(
     connection,
     operations,
     disconnect: resolveClosed,
+    emitArtifactChange: (frame: ArtifactChangedFrame) => {
+      for (const listener of artifactListeners) listener(frame);
+    },
+    get artifactSubscribers() {
+      return artifactListeners.size;
+    },
     get openedSubscriptions() {
       return openedSubscriptions;
     },
@@ -686,15 +1192,6 @@ function interrupted(
 ): RuntimeHostRequestInterruptedError {
   return new RuntimeHostRequestInterruptedError(operation, mode, dispatch, 'connection_lost');
 }
-
-function deferred() {
-  let resolve!: () => void;
-  const promise = new Promise<void>((settle) => {
-    resolve = settle;
-  });
-  return { promise, resolve };
-}
-
 function deferredValue<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((settle) => {

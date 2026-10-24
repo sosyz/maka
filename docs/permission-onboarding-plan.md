@@ -1,3 +1,15 @@
+---
+doc_id: permission-onboarding-plan
+title: "Drag-to-grant permission onboarding (macOS)"
+language: en
+source_language: en
+implementation_status: current
+document_status: current
+translation_status: source-only
+last_verified: 2026-09-04
+owners:
+  - maka-backend
+---
 <!--
   Licensed to the Apache Software Foundation (ASF) under one
   or more contributor license agreements.  See the NOTICE file
@@ -23,6 +35,8 @@ Status: **Stage 1 built** (`apps/desktop/src/main/permission-overlay/`,
 `apps/desktop/src/overlay/permission-overlay.*`). Stage 2 is still a proposal.
 Written 2026-07-27 for maka.
 
+Tracking: [macOS permission onboarding Stage 2 #4328](https://github.com/apache/maka/issues/4328)
+
 ## The problem
 
 macOS gates Accessibility and Screen Recording behind TCC, and the stock
@@ -33,7 +47,7 @@ Six steps, and the file picker is where most people give up.
 
 maka today does the honest-but-minimal thing: `permissions-actions.ts`
 deep-links into the right pane and stops there
-(`apps/desktop/src/main/permissions-actions.ts:52`). Everything after the
+(`apps/desktop/src/main/permissions-actions.ts:61-90`). Everything after the
 deep link is on the user.
 
 Apple's design intent is that the user *explicitly* adds the app — that

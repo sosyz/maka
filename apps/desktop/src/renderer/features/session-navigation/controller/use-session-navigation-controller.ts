@@ -21,62 +21,34 @@ import { useCallback, useLayoutEffect, useMemo, useRef } from 'react';
 import type { ProjectRecord } from '@maka/core/project';
 import type { SessionSummary } from '@maka/core/session';
 import { runtimeHostProfileUsesHostWorkspace } from '@maka/runtime-host/profile-kind';
-import { useUiLocale, type SessionHistoryGroup } from '@maka/ui';
-import { useExternalStoreSelector } from '../../../use-external-store-selector.js';
+import {
+  deriveTitlebarProjectName,
+  useUiLocale,
+  type SessionHistoryGroup,
+} from '@maka/ui';
+import { runtimeHostProjectKey } from '../../../application/contracts/runtime-host-project-key.js';
+import { useExternalStoreSelector } from '../../../application/contracts/session-catalog/use-external-store-selector.js';
 import { deriveSessionNavigationGroups } from '../model/session-navigation-groups.js';
-import { deriveWorktreeSessionIds } from '../model/session-project-grouping.js';
+import {
+  deriveSessionLocation,
+  deriveWorktreeSessionIds,
+} from '../model/session-project-grouping.js';
 import type { SessionRailProjection } from '../model/session-rail.js';
 import {
   selectRailLayout,
   sessionRailLayoutStore,
   type SessionRailLayoutState,
 } from '../model/session-rail-layout-store.js';
-import type { SessionNavigationSession } from '../ports.js';
+import type {
+  SessionNavigationPorts,
+  SessionNavigationProjectScope,
+  SessionNavigationSession,
+} from '../ports.js';
 import { useSessionNavigationServices } from '../services-context.js';
 import {
   createSessionNavigationRowActions,
   type SessionNavigationRowActions,
 } from './session-row-actions.js';
-
-export type SessionNavigationToastApi = {
-  success(title: string, description?: string): void;
-  error(
-    title: string,
-    description?: string,
-    diagnosticDetails?: string,
-    diagnosticTarget?: { sessionId: string },
-  ): void;
-  confirm(options: {
-    title: string;
-    description: string;
-    confirmLabel: string;
-    cancelLabel: string;
-    destructive?: boolean;
-  }): Promise<boolean>;
-};
-
-type RefBox<T> = { current: T };
-
-/**
- * What the rail asks of the rest of the shell, named one by one.
- *
- * Switching a session also clears the active messages and leaves the Work Hub.
- * Those are commands the shell issues, and they stay commands: the rail calls
- * them, it does not subscribe to them. Nothing here has to be identity-stable —
- * the controller reads them through a ref published on commit — so the shell
- * may build this object inline, and no ordinary `function` declaration upstream
- * can quietly put the rail back on every AppShell render (#4109).
- */
-export interface SessionNavigationPorts {
-  activeIdRef: RefBox<string | undefined>;
-  sessionsRef: RefBox<ReadonlyArray<SessionSummary>>;
-  pendingSessionRowActionsRef: RefBox<Set<string>>;
-  activateSession(sessionId: string | undefined): void;
-  clearActiveMessages(): void;
-  clearSessionRendererState(sessionId: string): void;
-  refreshSessions(): Promise<ReadonlyArray<SessionSummary>>;
-  toastApi: SessionNavigationToastApi;
-}
 
 export interface UseSessionNavigationControllerInput {
   /**
@@ -85,13 +57,15 @@ export interface UseSessionNavigationControllerInput {
    * derivations of one reading.
    */
   rail: SessionRailProjection<SessionNavigationSession>;
-  projects: readonly ProjectRecord[];
+  projectScopes: readonly SessionNavigationProjectScope[];
   ports: SessionNavigationPorts;
 }
 
 export interface SessionNavigationSelectors {
   groups: SessionHistoryGroup[];
   worktreeSessionIds: ReadonlySet<string>;
+  sessionProjectName(session: SessionSummary): string | undefined;
+  sessionLocation(session: SessionSummary): string | undefined;
   sessionMeta(session: SessionSummary): string | undefined;
 }
 
@@ -130,6 +104,7 @@ export function useSessionNavigationController(
   // be upstream of the rail, where a single ordinary `function` declaration
   // anywhere in the chain silently undoes the whole thing (#4109).
   const portsRef = useRef(ports);
+  const pendingSessionRowActionsRef = useRef(new Set<string>());
   useLayoutEffect(() => {
     portsRef.current = ports;
   });
@@ -138,15 +113,14 @@ export function useSessionNavigationController(
     () =>
       createSessionNavigationRowActions({
         uiLocale: locale,
-        activeIdRef: portsRef.current.activeIdRef,
-        clearActiveMessages: () => portsRef.current.clearActiveMessages(),
+        acquireAutomaticQueryBlock: (sessionIds) =>
+          portsRef.current.acquireAutomaticQueryBlock(sessionIds),
         clearSessionRendererState: (sessionId) =>
           portsRef.current.clearSessionRendererState(sessionId),
-        pendingSessionRowActionsRef: portsRef.current.pendingSessionRowActionsRef,
+        pendingSessionRowActionsRef,
         refreshSessions: () => portsRef.current.refreshSessions(),
         service,
         sessionsRef: portsRef.current.sessionsRef,
-        setActiveId: (sessionId) => portsRef.current.activateSession(sessionId),
         toastApi: {
           success: (title, description) => portsRef.current.toastApi.success(title, description),
           error: (title, description, details, target) =>
@@ -158,8 +132,9 @@ export function useSessionNavigationController(
   );
 
   const groups = useMemo(
-    () => deriveSessionNavigationGroups(rail.sessions, input.projects, locale),
-    [locale, input.projects, rail.sessions],
+    () =>
+      deriveSessionNavigationGroups(rail.sessions, input.projectScopes, locale),
+    [locale, input.projectScopes, rail.sessions],
   );
   const worktreeSessionIds = useMemo(
     () =>
@@ -167,13 +142,54 @@ export function useSessionNavigationController(
         rail.sessions.filter(
           (session) => !runtimeHostProfileUsesHostWorkspace(session.profileKind),
         ),
-        input.projects,
+        input.projectScopes
+          .filter((scope) => scope.profileKind === 'local')
+          .map((scope) => scope.project),
       ),
-    [input.projects, rail.sessions],
+    [input.projectScopes, rail.sessions],
   );
   const sessionById = useMemo(
     () => new Map(rail.sessions.map((session) => [session.id, session])),
     [rail.sessions],
+  );
+  const projectByIdentity = useMemo(() => {
+    const projects = new Map<string, ProjectRecord>();
+    for (const scope of input.projectScopes) {
+      projects.set(runtimeHostProjectKey(scope.hostId, scope.project.id), scope.project);
+      for (const alias of scope.project.aliases ?? []) {
+        projects.set(runtimeHostProjectKey(scope.hostId, alias), scope.project);
+      }
+    }
+    return projects;
+  }, [input.projectScopes]);
+  const sessionProjectName = useCallback(
+    (session: SessionSummary): string | undefined => {
+      const projected = sessionById.get(session.id);
+      return deriveTitlebarProjectName({
+        projectName: projected?.projectId
+          ? projectByIdentity.get(
+              runtimeHostProjectKey(projected.runtimeHostId, projected.projectId),
+            )?.name
+          : undefined,
+        projectPath: session.cwd,
+      });
+    },
+    [projectByIdentity, sessionById],
+  );
+  const sessionLocation = useCallback(
+    (session: SessionSummary): string | undefined => {
+      const projected = sessionById.get(session.id);
+      if (!projected || runtimeHostProfileUsesHostWorkspace(projected.profileKind)) {
+        return undefined;
+      }
+      const project = projected.projectId
+        ? projectByIdentity.get(
+            runtimeHostProjectKey(projected.runtimeHostId, projected.projectId),
+          )
+        : undefined;
+      return deriveSessionLocation(projected, project);
+    },
+    [projectByIdentity, sessionById],
   );
   const sessionMeta = useCallback(
     (session: SessionSummary): string | undefined => {
@@ -186,12 +202,9 @@ export function useSessionNavigationController(
   );
 
   const selectors = useMemo<SessionNavigationSelectors>(
-    () => ({ groups, worktreeSessionIds, sessionMeta }),
-    [groups, sessionMeta, worktreeSessionIds],
+    () => ({ groups, worktreeSessionIds, sessionProjectName, sessionLocation, sessionMeta }),
+    [groups, sessionLocation, sessionMeta, sessionProjectName, worktreeSessionIds],
   );
 
-  return useMemo(
-    () => ({ layout, selectors, commands }),
-    [commands, layout, selectors],
-  );
+  return useMemo(() => ({ layout, selectors, commands }), [commands, layout, selectors]);
 }

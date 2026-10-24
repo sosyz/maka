@@ -22,7 +22,7 @@ import test from 'node:test';
 import { parseHTML } from 'linkedom';
 import { renderToStaticMarkup } from 'react-dom/server';
 import type { ProjectRecord } from '@maka/core/project';
-import type { SessionSummary } from '@maka/core/session';
+import type { SessionCatalogSummary, SessionSummary } from '@maka/core/session';
 import { LocaleProvider } from '../locale-context.js';
 import {
   SessionHistoryList,
@@ -66,9 +66,7 @@ const session: SessionSummary = {
 const rowActions: SessionRowActions = {
   onToggleFlag: () => undefined,
   onArchive: () => undefined,
-  onUnarchive: () => undefined,
   onRename: () => undefined,
-  onDelete: () => undefined,
 };
 
 const project: ProjectRecord = {
@@ -85,6 +83,17 @@ const projectActions: ProjectRowActions = {
   onArchive: () => undefined,
   onRestore: () => undefined,
 };
+
+/** The list's top-level `SideNavSection`s, in document order, by their title. */
+function readSections(document: Document): Array<{ title: string; element: Element }> {
+  return [...document.querySelectorAll('.maka-session-list > [role="group"]')].map((element) => {
+    const labelId = element.getAttribute('aria-labelledby');
+    return {
+      title: (labelId ? document.getElementById(labelId)?.textContent : undefined) ?? '',
+      element,
+    };
+  });
+}
 
 function assertNoNestedButtons(markup: string): void {
   // Structural check. A real regression here moves the action menu inside the
@@ -105,6 +114,32 @@ function assertNoNestedButtons(markup: string): void {
   for (const [, slash] of markup.matchAll(/<(\/?)button\b/g)) {
     depth += slash === '/' ? -1 : 1;
     assert.ok(depth <= 1, 'markup must not open a <button> inside another');
+  }
+}
+
+function assertDescriptionReferencesResolve(markup: string): void {
+  const { document } = parseHTML(markup);
+  for (const element of document.querySelectorAll<HTMLElement>(
+    'button.astryx-side-nav-item[aria-describedby]',
+  )) {
+    const describedBy = element.getAttribute('aria-describedby');
+    assert.ok(describedBy);
+    for (const id of describedBy.split(/\s+/)) {
+      const description = document.getElementById(id);
+      assert.ok(
+        description,
+        `aria-describedby token ${JSON.stringify(id)} must resolve while the card is closed`,
+      );
+      assert.equal(
+        description.textContent,
+        '',
+        'the stable description must not duplicate session or project content into DOM text queries',
+      );
+      assert.ok(
+        description.getAttribute('aria-label'),
+        'the stable description keeps its accessible text through aria-label',
+      );
+    }
   }
 }
 
@@ -145,6 +180,166 @@ test('renders a scan-friendly compact timestamp in the session rail', () => {
   }
 });
 
+for (const lastMessageAt of [undefined, Date.UTC(2026, 6, 24)]) {
+  test(`shows a new branch's activity time without newer messages (${lastMessageAt})`, () => {
+    const now = Date.UTC(2026, 7, 24, 12);
+    const originalDateNow = Date.now;
+    Date.now = () => now;
+    try {
+      const branch: SessionCatalogSummary = {
+        ...session,
+        id: 'branch',
+        parentSessionId: session.id,
+        branchOfTurnId: 'turn-1',
+        activityAt: now,
+        lastMessageAt,
+      };
+      const { document } = parseHTML(renderToStaticMarkup(
+        <LocaleProvider locale="en">
+          <Rail sessions={[branch]} />
+        </LocaleProvider>,
+      ));
+
+      assert.equal(document.querySelector('.maka-session-row-time-label')?.textContent, 'just now');
+    } finally {
+      Date.now = originalDateNow;
+    }
+  });
+}
+
+test('sorts a newly created branch ahead of older conversations by catalog activity', () => {
+  const now = Date.UTC(2026, 7, 24, 12);
+  const source: SessionCatalogSummary = {
+    ...session,
+    activityAt: now - 60_000,
+    lastMessageAt: now - 60_000,
+  };
+  const branch: SessionCatalogSummary = {
+    ...session,
+    id: 'branch',
+    parentSessionId: source.id,
+    branchOfTurnId: 'turn-1',
+    activityAt: now,
+  };
+  const { document } = parseHTML(renderToStaticMarkup(
+    <LocaleProvider locale="en">
+      <Rail sessions={[source, branch]} />
+    </LocaleProvider>,
+  ));
+
+  assert.deepEqual(
+    [...document.querySelectorAll('.maka-session-row')].map((row) =>
+      row.getAttribute('data-session-id'),
+    ),
+    [branch.id, source.id],
+  );
+});
+
+test('identifies an external executor in the session rail', () => {
+  const markup = renderToStaticMarkup(
+    <LocaleProvider locale="en">
+      <Rail
+        sessions={[{ ...session, executorId: 'antigravity' }]}
+        onSelectSession={() => undefined}
+      />
+    </LocaleProvider>,
+  );
+  const { document } = parseHTML(markup);
+
+  assert.equal(
+    document.querySelector('.maka-session-row-executor-badge')?.textContent,
+    'antigravity',
+  );
+  const describedBy = document
+    .querySelector('.maka-session-row .astryx-side-nav-item')
+    ?.getAttribute('aria-describedby');
+  assert.ok(describedBy);
+  assert.match(
+    document.getElementById(describedBy)?.getAttribute('aria-label') ?? '',
+    /antigravity/,
+  );
+});
+
+test('wires the session navigation control to its hover card description', () => {
+  const markup = renderToStaticMarkup(
+    <LocaleProvider locale="en">
+      <Rail
+        sessions={[session]}
+        onSelectSession={() => undefined}
+      />
+    </LocaleProvider>,
+  );
+  const { document } = parseHTML(markup);
+  const navigation = document.querySelector<HTMLButtonElement>(
+    '.maka-session-row .astryx-side-nav-item',
+  );
+
+  assert.ok(navigation);
+  assert.ok(navigation.getAttribute('aria-describedby'));
+  assertDescriptionReferencesResolve(markup);
+});
+
+test('a responding row spins where an unread row shows a dot', () => {
+  const unread = { ...session, id: 'session-unread', hasUnread: true };
+  const responding = { ...session, hasUnread: true };
+  const markup = renderToStaticMarkup(
+    <LocaleProvider locale="en">
+      <Rail
+        sessions={[responding, unread]}
+        streamingSessionIds={new Set([responding.id])}
+        onSelectSession={() => undefined}
+        rowActions={rowActions}
+      />
+    </LocaleProvider>,
+  );
+  const { document } = parseHTML(markup);
+  const signal = (id: string) =>
+    document.querySelector(`[data-session-id="${id}"] .maka-session-row-signal`)!;
+
+  assert.ok(signal(responding.id).querySelector('.astryx-spinner[aria-hidden="true"]'));
+  assert.equal(signal(responding.id).querySelector('.astryx-status-dot'), null);
+  assert.ok(signal(unread.id).querySelector('.astryx-status-dot'));
+  assert.equal(signal(unread.id).querySelector('.astryx-spinner'), null);
+});
+
+test('a row shows its state in place of the timestamp and still names it when covered', () => {
+  const now = Date.UTC(2026, 7, 24, 12, 0, 0);
+  const waiting = {
+    ...session,
+    status: 'waiting_for_user' as const,
+    lastMessageAt: now - 46 * 60_000,
+  };
+  const idle = { ...session, id: 'session-idle', lastMessageAt: now - 46 * 60_000 };
+  const originalDateNow = Date.now;
+  Date.now = () => now;
+  try {
+    const markup = renderToStaticMarkup(
+      <LocaleProvider locale="en">
+        <Rail
+          sessions={[waiting, idle]}
+          onSelectSession={() => undefined}
+          rowActions={rowActions}
+        />
+      </LocaleProvider>,
+    );
+    const { document } = parseHTML(markup);
+    const row = (id: string) => document.querySelector(`[data-session-id="${id}"]`)!;
+    const slot = (id: string) => row(id).querySelector('.maka-session-row-signal')!;
+
+    assert.ok(slot(waiting.id).querySelector('.astryx-status-dot'));
+    assert.equal(slot(waiting.id).querySelector('.maka-session-row-time-label'), null);
+    assert.equal(slot(idle.id).querySelector('.astryx-status-dot'), null);
+    assert.equal(slot(idle.id).querySelector('.maka-session-row-time-label')?.textContent, '46min');
+    assert.match(
+      row(waiting.id).querySelector('.astryx-side-nav-item .maka-visually-hidden')?.textContent ??
+        '',
+      /Waiting for you/,
+    );
+  } finally {
+    Date.now = originalDateNow;
+  }
+});
+
 test('renders Runtime Host live runs without requiring renderer-local streaming', () => {
   const hostRunning = { ...session, runningTurnIds: ['turn-live'] };
   const markup = renderToStaticMarkup(
@@ -157,7 +352,7 @@ test('renders Runtime Host live runs without requiring renderer-local streaming'
     </LocaleProvider>,
   );
 
-  assert.match(markup, /aria-label="Responding"/);
+  assert.match(markup, /maka-visually-hidden">Responding</);
 });
 
 for (const [status, attentionLabel] of [
@@ -177,7 +372,7 @@ for (const [status, attentionLabel] of [
       </LocaleProvider>,
     );
 
-    assert.doesNotMatch(markup, /aria-label="Responding"/);
+    assert.doesNotMatch(markup, /maka-visually-hidden">Responding</);
     assert.match(markup, new RegExp(`aria-label="${attentionLabel}"`));
   });
 }
@@ -204,9 +399,9 @@ test('keeps known-empty idle unless renderer-local streaming is newer', () => {
     </LocaleProvider>,
   );
 
-  assert.doesNotMatch(idleMarkup, /aria-label="Responding"/);
-  assert.doesNotMatch(idleMarkup, /aria-label="Running"/);
-  assert.match(locallyStreamingMarkup, /aria-label="Responding"/);
+  assert.doesNotMatch(idleMarkup, /maka-visually-hidden">Responding</);
+  assert.doesNotMatch(idleMarkup, /maka-visually-hidden">Running</);
+  assert.match(locallyStreamingMarkup, /maka-visually-hidden">Responding</);
 });
 
 test('renders collapsible project navigation and row actions as sibling controls', () => {
@@ -227,9 +422,11 @@ test('renders collapsible project navigation and row actions as sibling controls
   const action = document.querySelector<HTMLButtonElement>(
     'button[aria-label="Maka project actions"]',
   );
+  const newTask = projectRow?.querySelector<HTMLButtonElement>('button[aria-label="Maka New task"]');
 
   assert.ok(projectRow);
   assert.ok(action);
+  assert.ok(newTask);
   const navigation = projectRow.querySelector<HTMLButtonElement>(
     ':scope > div > button[aria-controls]',
   );
@@ -244,7 +441,10 @@ test('renders collapsible project navigation and row actions as sibling controls
   assert.ok(controlledGroup);
   assert.equal(navigation.contains(metadata), true);
   assert.equal(navigation.contains(action), false);
-  assert.equal(metadata.textContent, '1');
+  assert.equal(navigation.contains(newTask), false);
+  assert.equal(action.closest('.maka-project-row-actions'), newTask.closest('.maka-project-row-actions'));
+  assert.equal(metadata.textContent, '');
+  assert.equal(navigation.textContent, 'Maka', 'project navigation omits the task-count badge');
   assert.equal(controlledGroup.getAttribute('aria-hidden'), 'false');
   const projectButtons = [...projectRow.querySelectorAll('button')];
   assert.equal(
@@ -253,5 +453,280 @@ test('renders collapsible project navigation and row actions as sibling controls
     'project navigation precedes its auxiliary action',
   );
   assert.equal(projectButtons.indexOf(action), 1, 'project action precedes nested tasks');
+  assert.equal(projectButtons.indexOf(newTask), 2, 'new task follows the menu and precedes nested tasks');
+  assert.ok(navigation.getAttribute('aria-describedby'));
+  assertDescriptionReferencesResolve(markup);
   assertNoNestedButtons(markup);
+});
+
+for (const scenario of [
+  { name: 'empty', project, sessions: [], hasNewTask: true },
+  { name: 'unavailable', project: { ...project, available: false }, sessions: [session], hasNewTask: false },
+  { name: 'archived', project: { ...project, archivedAt: 1 }, sessions: [session], hasNewTask: false },
+  { name: 'ungrouped', project: undefined, sessions: [session], hasNewTask: false },
+]) {
+  test(`an ${scenario.name} project group offers the correct new-task shortcut`, () => {
+    const markup = renderToStaticMarkup(
+      <LocaleProvider locale="en">
+        <Rail
+          sessions={scenario.sessions}
+          groups={[{ id: 'group', label: 'Maka', project: scenario.project, sessions: scenario.sessions }]}
+          groupVariant="project"
+          projectActions={projectActions}
+        />
+      </LocaleProvider>,
+    );
+    const { document } = parseHTML(markup);
+    const projectRow = document.querySelector('[data-project-id="group"]');
+    assert.ok(projectRow);
+    assert.equal(projectRow.querySelector('button[aria-label="Maka New task"]') !== null, scenario.hasNewTask);
+    assert.equal(
+      projectRow.querySelector('button[aria-label="Maka project actions"]') !== null,
+      scenario.project !== undefined,
+    );
+    assertNoNestedButtons(markup);
+  });
+}
+
+test('renders pinned tasks once above project groups', () => {
+  const pinnedSession: SessionSummary = {
+    ...session,
+    id: 'session-pinned',
+    name: 'Pinned task',
+    isFlagged: true,
+  };
+  const projectSession: SessionSummary = {
+    ...session,
+    id: 'session-project',
+    name: 'Project task',
+  };
+  const markup = renderToStaticMarkup(
+    <LocaleProvider locale="en">
+      <Rail
+        sessions={[pinnedSession, projectSession]}
+        groups={[
+          {
+            id: project.id,
+            label: project.name,
+            project,
+            sessions: [pinnedSession, projectSession],
+          },
+        ]}
+        groupVariant="project"
+      />
+    </LocaleProvider>,
+  );
+
+  const { document } = parseHTML(markup);
+  const sections = readSections(document);
+  assert.deepEqual(
+    sections.map((section) => section.title),
+    ['Pinned', 'Projects'],
+    'pinned tasks and project rows are sibling sections, not a section beside bare items',
+  );
+  const [pinned, projects] = sections;
+  assert.ok(pinned && projects);
+  assert.equal(markup.match(/Pinned task/g)?.length, 1);
+  assert.match(pinned.element.textContent, /Pinned task/);
+  assert.doesNotMatch(projects.element.textContent, /Pinned task/);
+  const projectRow = projects.element.querySelector('.maka-project-row');
+  assert.ok(projectRow, 'project rows are items inside the Projects section');
+  assert.match(projectRow.textContent, /Project task/);
+});
+
+test('keeps archived-project pins visible once in both grouping modes', () => {
+  const archivedProject: ProjectRecord = {
+    ...project,
+    id: 'project-archived',
+    name: 'Archived project',
+    archivedAt: Date.UTC(2026, 8, 16),
+  };
+  const activePin: SessionSummary = {
+    ...session,
+    id: 'active-pin',
+    projectId: project.id,
+    isFlagged: true,
+    lastMessageAt: Date.UTC(2026, 8, 14),
+  };
+  const archivedProjectPin: SessionSummary = {
+    ...session,
+    id: 'archived-project-pin',
+    projectId: archivedProject.id,
+    isFlagged: true,
+    lastMessageAt: Date.UTC(2026, 8, 15),
+  };
+  const archivedProjectTask: SessionSummary = {
+    ...session,
+    id: 'archived-project-task',
+    projectId: archivedProject.id,
+  };
+  const sessions = [activePin, archivedProjectPin, archivedProjectTask];
+  const groups = [
+    { id: project.id, label: project.name, project, sessions: [activePin] },
+    {
+      id: archivedProject.id,
+      label: archivedProject.name,
+      project: archivedProject,
+      sessions: [archivedProjectPin, archivedProjectTask],
+    },
+  ];
+
+  for (const mode of ['conversation', 'project'] as const) {
+    const { document } = parseHTML(renderToStaticMarkup(
+      <LocaleProvider locale="en">
+        <Rail
+          sessions={sessions}
+          groups={mode === 'project' ? groups : undefined}
+          groupVariant={mode}
+        />
+      </LocaleProvider>,
+    ));
+    const pinned = readSections(document).find((section) => section.title === 'Pinned');
+    assert.ok(pinned, `${mode} must keep a top-level Pinned section`);
+    assert.deepEqual(
+      [...pinned.element.querySelectorAll('.maka-session-row')].map((row) =>
+        row.getAttribute('data-session-id'),
+      ),
+      [archivedProjectPin.id, activePin.id],
+      `${mode} must show all pins in the same recency order`,
+    );
+    for (const pin of [activePin, archivedProjectPin]) {
+      const rows = document.querySelectorAll(`[data-session-id="${pin.id}"]`);
+      assert.equal(rows.length, 1, `${pin.id} must appear exactly once in ${mode}`);
+      assert.equal(rows[0]!.closest('[aria-hidden="true"], [inert]'), null);
+    }
+    if (mode === 'project') {
+      const task = document.querySelector(`[data-session-id="${archivedProjectTask.id}"]`);
+      assert.ok(task);
+      assert.ok(task.closest('[aria-hidden="true"]'), 'unpinned tasks stay folded away');
+      assert.ok(task.closest('[inert]'), 'folded unpinned tasks are not interactive');
+      assert.equal(
+        task.closest('.maka-project-row')?.querySelectorAll('.maka-session-row').length,
+        1,
+        'expanding the archived project must not repeat its pinned task',
+      );
+    }
+  }
+});
+
+for (const state of ['active', 'archived'] as const) {
+  test(`an ${state} project whose only task is pinned describes itself as empty`, () => {
+    const pinnedProject: ProjectRecord = {
+      ...project,
+      archivedAt: state === 'archived' ? Date.UTC(2026, 8, 16) : undefined,
+    };
+    const pinnedSession: SessionSummary = {
+      ...session,
+      id: 'session-pinned',
+      name: 'Pinned task',
+      projectId: pinnedProject.id,
+      isFlagged: true,
+    };
+    const markup = renderToStaticMarkup(
+      <LocaleProvider locale="en">
+        <Rail
+          sessions={[pinnedSession]}
+          groups={[{
+            id: pinnedProject.id,
+            label: pinnedProject.name,
+            project: pinnedProject,
+            sessions: [pinnedSession],
+          }]}
+          groupVariant="project"
+          projectActions={projectActions}
+        />
+      </LocaleProvider>,
+    );
+
+    const { document } = parseHTML(markup);
+    const projectRow = document.querySelector('.maka-project-row');
+    assert.ok(projectRow);
+    const navigation = projectRow.querySelector<HTMLButtonElement>(':scope > div > button');
+    assert.ok(navigation);
+    assert.equal(navigation.getAttribute('aria-controls'), null, 'no disclosure without a subtree');
+    const describedBy = navigation.getAttribute('aria-describedby');
+    assert.ok(describedBy);
+    const description = document.getElementById(describedBy);
+    assert.ok(description);
+    assert.match(
+      description.getAttribute('aria-label') ?? '',
+      /\b0 tasks\b/,
+      'the hover description counts what the row actually shows',
+    );
+    const action = document.querySelector('button[aria-label="Maka project actions"]');
+    assert.ok(action);
+  });
+}
+
+test('keeps project running totals aligned with renderer-local task streaming', () => {
+  const locallyStreaming = {
+    ...session,
+    status: 'active' as const,
+    runningTurnIds: [] as string[],
+  };
+  const markup = renderToStaticMarkup(
+    <LocaleProvider locale="en">
+      <Rail
+        sessions={[locallyStreaming]}
+        groups={[
+          {
+            id: project.id,
+            label: project.name,
+            project,
+            sessions: [locallyStreaming],
+          },
+        ]}
+        groupVariant="project"
+        streamingSessionIds={new Set([locallyStreaming.id])}
+      />
+    </LocaleProvider>,
+  );
+  const { document } = parseHTML(markup);
+  const projectNavigation = document.querySelector<HTMLButtonElement>(
+    '.maka-project-row > div > .astryx-side-nav-item',
+  );
+  const descriptionId = projectNavigation?.getAttribute('aria-describedby');
+  const description = descriptionId ? document.getElementById(descriptionId) : null;
+
+  assert.match(markup, /maka-visually-hidden">Responding</);
+  assert.ok(description);
+  assert.match(description.getAttribute('aria-label') ?? '', /1 running/);
+});
+
+test('names the session location in the hover description only when one is provided', () => {
+  const describe = (markup: string): string => {
+    const { document } = parseHTML(markup);
+    const navigation = document.querySelector<HTMLButtonElement>(
+      '.maka-session-row .astryx-side-nav-item',
+    );
+    const describedBy = navigation?.getAttribute('aria-describedby');
+    return (describedBy ? document.getElementById(describedBy) : null)?.getAttribute(
+      'aria-label',
+    ) ?? '';
+  };
+  const located = renderToStaticMarkup(
+    <LocaleProvider locale="en">
+      <Rail
+        sessions={[session]}
+        sessionLocation={() => '/workspace/maka-agent/.worktree/sidebar'}
+        onSelectSession={() => undefined}
+      />
+    </LocaleProvider>,
+  );
+  const plain = renderToStaticMarkup(
+    <LocaleProvider locale="en">
+      <Rail sessions={[session]} onSelectSession={() => undefined} />
+    </LocaleProvider>,
+  );
+
+  assert.match(
+    describe(located),
+    /\/workspace\/maka-agent\/\.worktree\/sidebar/,
+    'a multi-location project names the session location',
+  );
+  assert.doesNotMatch(
+    describe(plain),
+    /maka-agent\/\.worktree\/sidebar/,
+    'a single-location project stays quiet about its location',
+  );
 });

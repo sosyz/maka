@@ -19,6 +19,8 @@
 
 import type {
   AppSettings,
+  RuntimeHostAppSettings,
+  RuntimeHostSettingsUpdateGuard,
   SettingsTestResult,
   UpdateAppSettingsInput,
   UpdateAppSettingsResult,
@@ -28,7 +30,7 @@ import type {
   CredentialStatus,
   RuntimePolicy,
 } from "@maka/core/runtime-policy";
-import { SENSITIVE_PLACEHOLDER } from "@maka/core/settings/network-settings";
+import { isSensitivePlaceholder, SENSITIVE_PLACEHOLDER } from "@maka/core/settings/network-settings";
 import type {
   TestProxyInput,
   TestProxySettings,
@@ -56,9 +58,12 @@ type RuntimeHostSettingsClient = Pick<
   | "queryRuntimePolicy"
   | "setCredential"
   | "testNetworkProxy"
+  | "updateNetworkProxy"
   | "updateRuntimePolicy"
+  | "updateRuntimePolicyIf"
 >;
 
+const JEV_CREDENTIAL: CredentialLocator = { scope: 'jev', kind: 'api_key' };
 const PROXY_CREDENTIAL: CredentialLocator = {
   scope: "network_proxy",
   kind: "password",
@@ -76,76 +81,125 @@ export interface RuntimeHostSettingsIpcDeps {
   readonly applyClientSettings: (settings: AppSettings) => Promise<void>;
 }
 
+export type RuntimeHostSettingsModuleDeps = Omit<
+  RuntimeHostSettingsIpcDeps,
+  "ipcMain"
+>;
+
+export interface RuntimeHostSettingsModule {
+  get(): Promise<RuntimeHostAppSettings>;
+  update(
+    patch: UpdateAppSettingsInput,
+    guard?: RuntimeHostSettingsUpdateGuard,
+  ): Promise<RuntimeHostAppSettings>;
+  testNetworkProxy(input?: TestProxyInput): Promise<SettingsTestResult>;
+}
+
+export interface RuntimeHostSettingsExclusiveAccess {
+  get(): Promise<RuntimeHostAppSettings>;
+  update(patch: UpdateAppSettingsInput): Promise<RuntimeHostAppSettings>;
+  updateForConfigImport(
+    patch: UpdateAppSettingsInput,
+  ): Promise<RuntimeHostSettingsImportResult>;
+}
+
+export interface RuntimeHostSettingsImportResult {
+  readonly settings: RuntimeHostAppSettings;
+  readonly skippedCredentials: number;
+}
+
+type RuntimeHostSettingsExclusiveRunner = <T>(
+  operation: (access: RuntimeHostSettingsExclusiveAccess) => Promise<T>,
+) => Promise<T>;
+
+const exclusiveRunners = new WeakMap<
+  RuntimeHostSettingsModule,
+  RuntimeHostSettingsExclusiveRunner
+>();
+
+interface RuntimeHostSettingsIpcRegistrationDeps {
+  readonly ipcMain: ReconnectableReadIpcMain;
+  readonly module: RuntimeHostSettingsModule;
+}
+
+export function createRuntimeHostSettingsModule(
+  deps: RuntimeHostSettingsModuleDeps,
+): RuntimeHostSettingsModule {
+  let lane: Promise<void> = Promise.resolve();
+
+  function enqueue<T>(operation: () => Promise<T>): Promise<T> {
+    const result = lane.then(operation, operation);
+    lane = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
+  const module: RuntimeHostSettingsModule = {
+    get: () => enqueue(() => loadRuntimeHostSettingsWithoutLane(deps)),
+    update: (patch, guard) =>
+      enqueue(() =>
+        updateRuntimeHostSettingsForImportWithoutLane(deps, patch, guard).then(
+          (result) => result.settings,
+        ),
+      ),
+    testNetworkProxy: (input = {}) =>
+      enqueue(() => testNetworkProxyWithoutLane(deps.client, input)),
+  };
+  exclusiveRunners.set(module, (operation) =>
+    enqueue(() =>
+      operation({
+        get: () => loadRuntimeHostSettingsWithoutLane(deps),
+        update: (patch) =>
+          updateRuntimeHostSettingsForImportWithoutLane(deps, patch).then(
+            (result) => result.settings,
+          ),
+        updateForConfigImport: (patch) =>
+          updateRuntimeHostSettingsForImportWithoutLane(deps, patch),
+      }),
+    ),
+  );
+  return module;
+}
+
+/**
+ * Runs a compound Settings adapter operation in this Runtime Host's lane.
+ * The supplied accessors deliberately bypass re-entry into the public queue.
+ */
+export function runRuntimeHostSettingsExclusive<T>(
+  module: RuntimeHostSettingsModule,
+  operation: (access: RuntimeHostSettingsExclusiveAccess) => Promise<T>,
+): Promise<T> {
+  const run = exclusiveRunners.get(module);
+  if (!run) {
+    throw new Error('Runtime Host Settings module does not own an exclusive lane');
+  }
+  return run(operation);
+}
+
 export function registerRuntimeHostSettingsIpc(
-  deps: RuntimeHostSettingsIpcDeps,
+  deps: RuntimeHostSettingsIpcRegistrationDeps,
 ): void {
+  const module = deps.module;
   handleReconnectableRead(deps.ipcMain, "settings:get", async () =>
-    maskAppSettings(await loadRuntimeHostSettings(deps)),
+    maskAppSettings(await module.get()),
   );
   deps.ipcMain.handle(
     "settings:testNetworkProxy",
-    async (_event, input: TestProxyInput = {}) => {
-      const current = (await deps.client.queryRuntimePolicy()).policy
-        .networkProxy;
-      const candidate = input.proxy
-        ? toRuntimeHostProxyPolicy(input.proxy, current.autoBypassDomains)
-        : undefined;
-      const password = credentialOverride(input.proxy?.password);
-      const result = await deps.client.testNetworkProxy({
-        ...(candidate ? { networkProxy: candidate } : {}),
-        ...(password ? { password } : {}),
-        ...(input.url ? { url: input.url } : {}),
-        ...(input.timeoutMs ? { timeoutMs: input.timeoutMs } : {}),
-      });
-      const tested = candidate ?? current;
-      if (!result.ok) {
-        const failure = proxyTestFailure(result);
-        return {
-          ok: false,
-          ...failure,
-          latencyMs: result.latencyMs,
-          details: { status: result.status },
-        } satisfies SettingsTestResult;
-      }
-      return {
-        ok: true,
-        code: "proxy_reachable",
-        message: `The proxy ${tested.protocol}://${tested.host}:${tested.port} is reachable.`,
-        latencyMs: result.latencyMs,
-        details: {
-          endpoint: `${tested.protocol}://${tested.host}:${tested.port}`,
-          status: result.status,
-          ip: result.ip,
-          countryCode: result.countryCode,
-          countryFlag: result.countryFlag,
-          bypassList: tested.bypassList,
-        },
-      } satisfies SettingsTestResult;
-    },
+    async (_event, input: TestProxyInput = {}) => module.testNetworkProxy(input),
   );
   deps.ipcMain.handle(
     "settings:update",
     async (
       _event,
       patch: UpdateAppSettingsInput,
-    ): Promise<UpdateAppSettingsResult> => {
-      const settings = await updateRuntimeHostSettings(deps, patch);
+      guard?: RuntimeHostSettingsUpdateGuard,
+    ): Promise<UpdateAppSettingsResult<RuntimeHostAppSettings>> => {
+      const settings = await module.update(patch, guard);
       return buildSettingsUpdateResult(settings, patch);
     },
   );
-}
-
-export async function updateRuntimeHostSettings(
-  deps: RuntimeHostSettingsIpcDeps,
-  patch: UpdateAppSettingsInput,
-): Promise<AppSettings> {
-  await applyHostPatch(deps.client, patch);
-  const clientPatch = clientOwnedSettingsPatch(patch);
-  const local = hasSettingsPatch(clientPatch)
-    ? await deps.settingsStore.update(clientPatch)
-    : await deps.settingsStore.get();
-  await deps.applyClientSettings(local);
-  return loadRuntimeHostSettings(deps);
 }
 
 function toRuntimeHostProxyPolicy(
@@ -154,7 +208,7 @@ function toRuntimeHostProxyPolicy(
 ): RuntimePolicy["networkProxy"] {
   const username = proxy.username?.trim() ?? "";
   const authEnabled =
-    proxy.authEnabled ?? Boolean(username || proxy.password);
+    proxy.authEnabled ?? Boolean(username);
   return {
     enabled: proxy.enabled,
     protocol: proxy.type,
@@ -167,29 +221,66 @@ function toRuntimeHostProxyPolicy(
   };
 }
 
-function credentialOverride(value: string | undefined): string | undefined {
-  return !value || value === SENSITIVE_PLACEHOLDER ? undefined : value;
+async function testNetworkProxyWithoutLane(
+  client: RuntimeHostSettingsClient,
+  input: TestProxyInput,
+): Promise<SettingsTestResult> {
+  const current = (await client.queryRuntimePolicy()).policy.networkProxy;
+  const candidate = input.proxy
+    ? toRuntimeHostProxyPolicy(input.proxy, current.autoBypassDomains)
+    : undefined;
+  const result = await client.testNetworkProxy({
+    ...(candidate ? { networkProxy: candidate } : {}),
+    ...(input.url ? { url: input.url } : {}),
+    ...(input.timeoutMs ? { timeoutMs: input.timeoutMs } : {}),
+  });
+  const tested = candidate ?? current;
+  if (!result.ok) {
+    const failure = proxyTestFailure(result);
+    return {
+      ok: false,
+      ...failure,
+      latencyMs: result.latencyMs,
+      details: { status: result.status },
+    };
+  }
+  return {
+    ok: true,
+    code: "proxy_reachable",
+    message: `The proxy ${tested.protocol}://${tested.host}:${tested.port} is reachable.`,
+    latencyMs: result.latencyMs,
+    details: {
+      endpoint: `${tested.protocol}://${tested.host}:${tested.port}`,
+      status: result.status,
+      ip: result.ip,
+      countryCode: result.countryCode,
+      countryFlag: result.countryFlag,
+      bypassList: tested.bypassList,
+    },
+  };
 }
 
-export async function loadRuntimeHostSettings(
-  deps: RuntimeHostSettingsIpcDeps,
-): Promise<AppSettings> {
-  const [local, runtimePolicy, proxyCredential, webSearchCredential] =
+async function loadRuntimeHostSettingsWithoutLane(
+  deps: RuntimeHostSettingsModuleDeps,
+): Promise<RuntimeHostAppSettings> {
+  const [local, runtimePolicy, proxyCredential, webSearchCredential, jevCredential] =
     await Promise.all([
       deps.settingsStore.get(),
       deps.client.queryRuntimePolicy(),
       deps.client.queryCredential(PROXY_CREDENTIAL),
       deps.client.queryCredential(WEB_SEARCH_CREDENTIAL),
+      deps.client.queryCredential(JEV_CREDENTIAL),
     ]);
   const policy = runtimePolicy.policy;
   return {
     ...local,
+    jev: { enabled: policy.jev?.enabled === true, apiKey: jevCredential?.configured ? SENSITIVE_PLACEHOLDER : '' },
     network: {
       proxy: {
         ...policy.networkProxy,
         bypassList: [...policy.networkProxy.bypassList],
         autoBypassDomains: [...policy.networkProxy.autoBypassDomains],
-        password: proxyCredential?.configured ? SENSITIVE_PLACEHOLDER : "",
+        passwordConfigured: proxyCredential?.configured === true,
       },
     },
     personalization: {
@@ -200,6 +291,7 @@ export async function loadRuntimeHostSettings(
     workspaceInstructions: policy.workspaceInstructions,
     privacy: policy.privacy,
     chatDefaults: policy.chatDefaults,
+    externalAgents: policy.externalAgents,
     shell: policy.shell,
     webSearch: {
       ...local.webSearch,
@@ -209,6 +301,24 @@ export async function loadRuntimeHostSettings(
       },
     },
     subagents: policy.subagents,
+  };
+}
+
+async function updateRuntimeHostSettingsForImportWithoutLane(
+  deps: RuntimeHostSettingsModuleDeps,
+  patch: UpdateAppSettingsInput,
+  guard?: RuntimeHostSettingsUpdateGuard,
+): Promise<RuntimeHostSettingsImportResult> {
+  validateProxyPatch(patch.network?.proxy);
+  const skippedCredentials = await applyHostPatchWithoutLane(deps.client, patch, guard);
+  const clientPatch = clientOwnedSettingsPatch(patch);
+  const local = hasSettingsPatch(clientPatch)
+    ? await deps.settingsStore.update(clientPatch)
+    : await deps.settingsStore.get();
+  await deps.applyClientSettings(local);
+  return {
+    settings: await loadRuntimeHostSettingsWithoutLane(deps),
+    skippedCredentials,
   };
 }
 
@@ -234,26 +344,27 @@ function projectWebSearchCredential(
   };
 }
 
-async function applyHostPatch(
+async function applyHostPatchWithoutLane(
   client: RuntimeHostSettingsClient,
   patch: UpdateAppSettingsInput,
-): Promise<void> {
-  if (patch.network?.proxy) {
-    const proxy = patch.network.proxy;
-    await client.updateRuntimePolicy((policy) => ({
-      kind: "set_network_proxy",
-      value: { ...policy.networkProxy, ...withoutSecret(proxy) },
-    }));
-    if (proxy.authEnabled === false)
-      await deleteCredential(client, PROXY_CREDENTIAL);
-    else if (
-      proxy.password !== undefined &&
-      proxy.password !== SENSITIVE_PLACEHOLDER
-    ) {
-      if (proxy.password.length === 0)
-        await deleteCredential(client, PROXY_CREDENTIAL);
-      else await setCredential(client, PROXY_CREDENTIAL, proxy.password);
+  guard?: RuntimeHostSettingsUpdateGuard,
+): Promise<number> {
+  let skippedCredentials = 0;
+  if (patch.jev) {
+    const apiKey = patch.jev.apiKey;
+    const removingKey = typeof apiKey === "string" && !isSensitivePlaceholder(apiKey) && !apiKey.trim();
+    if (apiKey !== undefined && !isSensitivePlaceholder(apiKey)) {
+      if (apiKey.trim()) await setCredential(client, JEV_CREDENTIAL, apiKey.trim());
+      else await deleteCredential(client, JEV_CREDENTIAL);
     }
+    if (patch.jev.enabled !== undefined || removingKey) {
+      await client.updateRuntimePolicy(() => ({
+        kind: 'set_jev', value: { enabled: removingKey ? false : patch.jev!.enabled === true },
+      }));
+    }
+  }
+  if (patch.network?.proxy) {
+    skippedCredentials += await updateNetworkProxy(client, patch.network.proxy);
   }
   if (
     patch.personalization?.displayName !== undefined ||
@@ -294,6 +405,22 @@ async function applyHostPatch(
       "set_chat_defaults",
     );
   }
+  if (patch.externalAgents) {
+    const mutation = () => ({
+      kind: "set_external_agents" as const,
+      value: patch.externalAgents!,
+    });
+    if (guard?.expectedExternalAgentExecutable === undefined) {
+      await client.updateRuntimePolicy(mutation);
+    } else {
+      await client.updateRuntimePolicyIf(
+        (policy) =>
+          policy.externalAgents.antigravity.executable ===
+          guard.expectedExternalAgentExecutable,
+        mutation,
+      );
+    }
+  }
   if (patch.shell) {
     await mergePolicy(client, "shell", patch.shell, "set_shell");
   }
@@ -312,10 +439,10 @@ async function applyHostPatch(
       },
     }));
     const apiKey = webSearch.providers?.tavily?.apiKey;
-    if (apiKey !== undefined && apiKey !== SENSITIVE_PLACEHOLDER) {
-      if (apiKey.length === 0)
-        await deleteCredential(client, WEB_SEARCH_CREDENTIAL);
-      else await setCredential(client, WEB_SEARCH_CREDENTIAL, apiKey);
+    if (apiKey !== undefined && !isSensitivePlaceholder(apiKey)) {
+      if (apiKey.trim())
+        await setCredential(client, WEB_SEARCH_CREDENTIAL, apiKey.trim());
+      else await deleteCredential(client, WEB_SEARCH_CREDENTIAL);
     }
   }
   if (patch.subagents) {
@@ -324,6 +451,45 @@ async function applyHostPatch(
       value: patch.subagents!,
     }));
   }
+  return skippedCredentials;
+}
+
+async function updateNetworkProxy(
+  client: RuntimeHostSettingsClient,
+  patch: NonNullable<NonNullable<UpdateAppSettingsInput["network"]>["proxy"]>,
+): Promise<number> {
+  const [policy, credential] = await Promise.all([
+    client.queryRuntimePolicy(),
+    client.queryCredential(PROXY_CREDENTIAL),
+  ]);
+  const networkProxy = {
+    ...policy.policy.networkProxy,
+    ...withoutCredential(patch),
+  };
+  const operation =
+    patch.credential?.kind === "replace"
+      ? patch.credential
+      : !networkProxy.authEnabled || patch.credential?.kind === "delete"
+        ? ({ kind: "delete" } as const)
+        : ({ kind: "keep" } as const);
+  const result = await client.updateNetworkProxy({
+    expectedPolicyRevision: policy.revision,
+    expectedCredential: credential?.configured
+      ? {
+          locator: credential.locator,
+          credentialId: credential.credentialId,
+          revision: credential.revision,
+        }
+      : null,
+    networkProxy,
+    credential: operation,
+  });
+  if (result.kind === "committed") return 0;
+  if (result.kind === "proxy_target_mismatch") return 1;
+  if (result.kind === "revision_conflict") {
+    throw new Error("Runtime Host proxy policy changed while Desktop updated it");
+  }
+  throw new Error("Runtime Host proxy credential changed while Desktop updated it");
 }
 
 async function mergePolicy<
@@ -391,9 +557,38 @@ async function deleteCredential(
   throw new Error("Credential kept changing while Desktop removed it");
 }
 
-function withoutSecret(
+function withoutCredential(
   patch: NonNullable<NonNullable<UpdateAppSettingsInput["network"]>["proxy"]>,
 ): Partial<RuntimePolicy["networkProxy"]> {
-  const { password: _password, ...value } = patch;
+  const {
+    credential: _credential,
+    password: _legacyPassword,
+    passwordConfigured: _derivedStatus,
+    ...value
+  } = patch as typeof patch & {
+    password?: unknown;
+    passwordConfigured?: unknown;
+  };
   return value;
+}
+
+function validateProxyPatch(
+  proxy: NonNullable<UpdateAppSettingsInput["network"]>["proxy"] | undefined,
+): void {
+  const operation = proxy?.credential;
+  if (!operation) return;
+  if (operation.kind === "replace") {
+    if (typeof operation.secret !== "string" || operation.secret.length === 0) {
+      throw new Error("Proxy credential replacement requires a non-empty password");
+    }
+    if (proxy.authEnabled === false) {
+      throw new Error(
+        "Cannot replace the proxy credential while authentication is disabled",
+      );
+    }
+    return;
+  }
+  if (operation.kind !== "delete") {
+    throw new Error("Unsupported proxy credential operation");
+  }
 }

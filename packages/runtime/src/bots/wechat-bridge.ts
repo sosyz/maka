@@ -19,9 +19,11 @@
 
 import type { BotChannelSettings } from '@maka/core/bot-chat-settings';
 import { generalizedErrorMessage } from '@maka/core/redaction';
-import { randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { createRequire } from 'node:module';
-import { BaseBotAdapter, botReadinessFromSettings } from './base-adapter.js';
+import { BaseBotAdapter, botDiagnosticMessage, botReadinessFromSettings } from './base-adapter.js';
 import { proxiedFetch } from './proxied-fetch.js';
 import type {
   BotIncomingMessage,
@@ -80,8 +82,15 @@ export function normalizeWechatSendTarget(value: string): string | null {
 
 export class WechatBridge extends BaseBotAdapter implements SendCapable {
   private abortController: AbortController | null = null;
+  private contextTokens = new Map<string, string>();
+  private typingTickets = new Map<string, { context?: string; ticket: string; at: number }>();
+  private typingQueue: Promise<unknown> = Promise.resolve();
+  private lifecycleStart: Promise<void> = Promise.resolve();
 
-  constructor(settings: BotChannelSettings) {
+  constructor(
+    settings: BotChannelSettings,
+    private readonly contextDirectory?: string,
+  ) {
     super('wechat', settings);
   }
 
@@ -97,7 +106,8 @@ export class WechatBridge extends BaseBotAdapter implements SendCapable {
       : await testWechatBridge(this.settings);
     if (!probe.ok) {
       this.running = false;
-      this.reason = probe.error;
+      this.reason = probe.errorCode ?? 'connection_failed';
+      if (probe.error) this.recordFailure(probe.error, this.reason);
       this.readiness = botReadinessFromSettings(this.settings);
       this.emitStatusChange();
       return;
@@ -116,11 +126,13 @@ export class WechatBridge extends BaseBotAdapter implements SendCapable {
     // marked degraded instead of crashing the main process.
     const fail = (err: unknown) => {
       this.running = false;
-      this.reason = err instanceof Error ? err.message : 'stream-failed';
+      this.recordFailure(err, 'stream-failed');
       this.readiness = 'degraded';
       this.emitStatusChange();
     };
     if (isWechatIlinkChannel(this.settings)) {
+      this.lifecycleStart = this.notifyLifecycle('start');
+      await this.restoreContexts();
       void this.streamIlinkMessages('').catch(fail);
     } else {
       void this.streamLiveMessages(Math.floor(Date.now() / 1000)).catch(fail);
@@ -128,12 +140,97 @@ export class WechatBridge extends BaseBotAdapter implements SendCapable {
   }
 
   async stop(): Promise<void> {
+    const wasRunning = this.running;
     this.running = false;
     this.abortController?.abort();
     this.abortController = null;
+    await this.typingQueue;
+    await Promise.all([...this.typingTickets.keys()].map((id) => this.cancelTypingIndicator(id)));
+    this.contextTokens.clear();
+    this.typingTickets.clear();
+    if (wasRunning && isWechatIlinkChannel(this.settings)) {
+      await this.lifecycleStart;
+      await this.notifyLifecycle('stop');
+    }
     this.reason = 'stopped';
     this.readiness = botReadinessFromSettings(this.settings);
     this.emitStatusChange();
+  }
+
+  private async notifyLifecycle(kind: 'start' | 'stop'): Promise<void> {
+    try {
+      const response = await wechatIlinkPost(
+        this.settings.webhookUrl!,
+        `/ilink/bot/msg/notify${kind}`,
+        { base_info: WECHAT_ILINK_BASE_INFO },
+        this.settings.token,
+        undefined,
+        3000,
+      );
+      assertIlinkSuccess(response);
+    } catch {
+      // Presence is advisory: it must not disable an otherwise working channel.
+      console.warn(`[bots:wechat] notify${kind} failed`);
+    }
+  }
+
+  sendTypingIndicator(chatId: string): Promise<boolean> {
+    return this.setTyping(chatId, true);
+  }
+  cancelTypingIndicator(chatId: string): Promise<boolean> {
+    return this.setTyping(chatId, false);
+  }
+
+  private setTyping(chatId: string, active: boolean): Promise<boolean> {
+    // Serialize start/cancel so a slow start request cannot land after cancellation.
+    const pending = this.typingQueue.then(async () => {
+      if (!isWechatIlinkChannel(this.settings) || (active && !this.running)) return false;
+      if (this.settings.allowedUserIds?.length && !this.settings.allowedUserIds.includes(chatId))
+        return false;
+      try {
+        const context = this.contextTokens.get(chatId);
+        let cached = this.typingTickets.get(chatId);
+        if (active && (!cached || cached.context !== context || Date.now() - cached.at > 300000)) {
+          const response = await wechatIlinkPost(
+            this.settings.webhookUrl!,
+            '/ilink/bot/getconfig',
+            { ilink_user_id: chatId, context_token: context, base_info: WECHAT_ILINK_BASE_INFO },
+            this.settings.token,
+            undefined,
+            3000,
+          );
+          if (
+            response.ret !== 0 ||
+            typeof response.typing_ticket !== 'string' ||
+            !response.typing_ticket
+          )
+            return false;
+          cached = { context, ticket: response.typing_ticket, at: Date.now() };
+          this.typingTickets.set(chatId, cached);
+        }
+        if (!cached || (active && !this.running)) return false;
+        const response = await wechatIlinkPost(
+          this.settings.webhookUrl!,
+          '/ilink/bot/sendtyping',
+          {
+            ilink_user_id: chatId,
+            typing_ticket: cached.ticket,
+            status: active ? 1 : 2,
+            base_info: WECHAT_ILINK_BASE_INFO,
+          },
+          this.settings.token,
+          undefined,
+          3000,
+        );
+        assertIlinkSuccess(response);
+        return true;
+      } catch {
+        this.typingTickets.delete(chatId);
+        return false;
+      }
+    });
+    this.typingQueue = pending.catch(() => false);
+    return pending;
   }
 
   async sendMessage(
@@ -155,8 +252,7 @@ export class WechatBridge extends BaseBotAdapter implements SendCapable {
       const status = typeof response.status === 'string' ? response.status : '';
       if (status === 'failed') {
         this.readiness = 'degraded';
-        this.reason =
-          typeof response.diagnostic === 'string' ? response.diagnostic : 'wechat-send-failed';
+        this.recordFailure(response.diagnostic ?? 'wechat-send-failed', 'send-failed');
         this.emitStatusChange();
         return null;
       }
@@ -168,7 +264,7 @@ export class WechatBridge extends BaseBotAdapter implements SendCapable {
       return typeof id === 'string' || typeof id === 'number' ? String(id) : 'wechat-submitted';
     } catch (error) {
       this.readiness = 'degraded';
-      this.reason = generalizedErrorMessage(error);
+      this.recordFailure(error);
       this.emitStatusChange();
       return null;
     }
@@ -181,11 +277,12 @@ export class WechatBridge extends BaseBotAdapter implements SendCapable {
   private async streamLiveMessages(sinceEpochSeconds: number): Promise<void> {
     const baseUrl = normalizeWechatBridgeUrl(this.settings.webhookUrl);
     if (!baseUrl) return;
+    const cursor = { sinceEpochSeconds };
     while (this.running) {
       this.abortController = new AbortController();
       try {
         const response = await proxiedFetch(
-          `${baseUrl}/messages/stream?since=${sinceEpochSeconds}`,
+          `${baseUrl}/messages/stream?since=${cursor.sinceEpochSeconds}`,
           {
             method: 'GET',
             headers: wechatBridgeHeaders(this.settings),
@@ -195,28 +292,47 @@ export class WechatBridge extends BaseBotAdapter implements SendCapable {
         );
         if (!response.ok || !response.body)
           throw new Error(`WeChat stream HTTP ${response.status}`);
-        for await (const raw of readSseJsonObjects(response.body)) {
-          const messages = Array.isArray(raw) ? raw : [raw];
-          for (const message of messages) {
-            const event = mapWechatBridgeMessage(message);
-            if (!event) continue;
-            sinceEpochSeconds = Math.max(sinceEpochSeconds, Math.floor(event.receivedAt / 1000));
-            this.readiness = 'operational';
-            this.reason = undefined;
-            this.emitIncomingMessage(event);
-            this.emitStatusChange();
-          }
-        }
+        const messages = readSseJsonObjects(response.body);
+        while (await this.processNextLiveMessages(messages, cursor)) {}
         if (this.running) await sleep(1_000);
       } catch (error) {
         if (!this.running) return;
         if (error instanceof Error && error.name === 'AbortError') return;
         this.readiness =
           this.readiness === 'operational' ? 'degraded' : botReadinessFromSettings(this.settings);
-        this.reason = generalizedErrorMessage(error);
+        this.recordFailure(error);
         this.emitStatusChange();
         await sleep(3_000);
       }
+    }
+  }
+
+  private async processNextLiveMessages(
+    stream: AsyncGenerator<unknown>,
+    cursor: { sinceEpochSeconds: number },
+  ): Promise<boolean> {
+    // Keep the iterator result and mapped events out of the next idle read's frame.
+    const next = await stream.next();
+    if (next.done) return false;
+    try {
+      const messages = Array.isArray(next.value) ? next.value : [next.value];
+      for (const message of messages) {
+        const event = mapWechatBridgeMessage(message);
+        if (!event) continue;
+        cursor.sinceEpochSeconds = Math.max(
+          cursor.sinceEpochSeconds,
+          Math.floor(event.receivedAt / 1000),
+        );
+        if (!this.emitIncomingMessage(event)) continue;
+        this.readiness = 'operational';
+        this.reason = undefined;
+        this.emitStatusChange();
+      }
+      return true;
+    } catch (error) {
+      // Match for-await: close after processing failures, preserving the original error.
+      await stream.return(undefined).catch(() => {});
+      throw error;
     }
   }
 
@@ -243,7 +359,7 @@ export class WechatBridge extends BaseBotAdapter implements SendCapable {
         if (errcode === -14) continue;
         if (errcode !== 0) {
           this.readiness = this.readiness === 'operational' ? 'degraded' : 'credentials_valid';
-          this.reason = stringField(response.errmsg) ?? `ilink-${errcode}`;
+          this.recordFailure(stringField(response.errmsg) ?? `ilink-${errcode}`, 'stream-failed');
           this.emitStatusChange();
           await sleep(5_000);
           continue;
@@ -252,12 +368,24 @@ export class WechatBridge extends BaseBotAdapter implements SendCapable {
         if (nextCursor) cursor = nextCursor;
         const messages = Array.isArray(response.msgs) ? response.msgs : [];
         for (const message of messages) {
+          if (!this.running) break;
           const event = mapWechatIlinkMessage(message);
           if (!event) continue;
+          if (
+            this.settings.allowedUserIds?.length &&
+            !this.settings.allowedUserIds.includes(event.userId)
+          )
+            continue;
+          const contextToken = stringField((message as Record<string, unknown>).context_token);
+          if (contextToken) {
+            this.contextTokens.set(event.userId, contextToken);
+            while (this.contextTokens.size > 1000)
+              this.contextTokens.delete(this.contextTokens.keys().next().value!);
+            await this.saveContexts();
+          }
+          if (!this.emitIncomingMessage(event)) continue;
           this.readiness = 'operational';
           this.reason = undefined;
-          this.lastEventAt = Date.now();
-          this.emitIncomingMessage(event);
           this.emitStatusChange();
         }
         if (this.running && messages.length === 0) await sleep(800);
@@ -266,11 +394,53 @@ export class WechatBridge extends BaseBotAdapter implements SendCapable {
         if (error instanceof Error && error.name === 'AbortError') return;
         consecutiveErrors += 1;
         this.readiness = this.readiness === 'operational' ? 'degraded' : 'credentials_valid';
-        this.reason = generalizedErrorMessage(error);
+        this.recordFailure(error);
         this.emitStatusChange();
         await sleep(consecutiveErrors >= 3 ? 30_000 : 2_000);
         if (consecutiveErrors >= 3) consecutiveErrors = 0;
       }
+    }
+  }
+
+  private contextPath(): string | undefined {
+    if (!this.contextDirectory) return undefined;
+    const key = createHash('sha256')
+      .update(
+        JSON.stringify([this.settings.webhookUrl, this.settings.botUserId, this.settings.token]),
+      )
+      .digest('hex');
+    return join(this.contextDirectory, `${key}.json`);
+  }
+
+  private async restoreContexts(): Promise<void> {
+    const path = this.contextPath();
+    if (!path) return;
+    try {
+      const value: unknown = JSON.parse(await readFile(path, 'utf8'));
+      if (!Array.isArray(value)) throw Error('Invalid context cache');
+      this.contextTokens = new Map(
+        value
+          .filter(
+            (v) => Array.isArray(v) && v.length === 2 && v.every((s) => typeof s === 'string'),
+          )
+          .slice(-1000),
+      );
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT')
+        console.warn('[bots:wechat] Could not restore reply context; waiting for a new message');
+    }
+  }
+
+  private async saveContexts(): Promise<void> {
+    const path = this.contextPath();
+    if (!path) return;
+    try {
+      await mkdir(this.contextDirectory!, { recursive: true, mode: 0o700 });
+      const temporary = `${path}.${randomUUID()}.tmp`;
+      await writeFile(temporary, JSON.stringify([...this.contextTokens]), { mode: 0o600 });
+      await rename(temporary, path);
+    } catch {
+      console.warn('[bots:wechat] Could not persist reply context; using in-memory context');
     }
   }
 
@@ -279,7 +449,7 @@ export class WechatBridge extends BaseBotAdapter implements SendCapable {
     const token = this.settings.token.trim();
     if (!baseUrl || !token) return null;
     const clientId = randomUUID();
-    await wechatIlinkPost(
+    const response = await wechatIlinkPost(
       baseUrl,
       '/ilink/bot/sendmessage',
       {
@@ -289,21 +459,34 @@ export class WechatBridge extends BaseBotAdapter implements SendCapable {
           client_id: clientId,
           message_type: 2,
           message_state: 2,
-          context_token: '',
+          context_token: this.contextTokens.get(chatId),
           item_list: [{ type: 1, text_item: { text: stripMarkdownForWechat(text) } }],
         },
         base_info: WECHAT_ILINK_BASE_INFO,
       },
       token,
     );
+    if (
+      (typeof response.ret === 'number' && response.ret !== 0) ||
+      (typeof response.errcode === 'number' && response.errcode !== 0)
+    ) {
+      throw new Error(`WeChat send failed: ret=${response.ret}, errcode=${response.errcode}`);
+    }
     this.readiness = 'operational';
     this.reason = undefined;
     this.lastEventAt = Date.now();
     this.emitStatusChange();
-    return clientId;
+    // Submission acknowledgement only; this is not a delivery/read receipt.
+    return typeof response.message_id === 'string' && response.message_id
+      ? response.message_id
+      : Number.isSafeInteger(response.message_id)
+        ? String(response.message_id)
+        : clientId;
   }
 }
 
+/** Stable machine codes for QR sign-in guidance; presenters own copy. */
+export type WechatBridgeQrHintCode = 'wechat_bridge_remote_url' | 'wechat_bridge_unreachable';
 export type WechatBridgeQrCodeResult =
   | {
       ok: true;
@@ -314,8 +497,9 @@ export type WechatBridgeQrCodeResult =
     }
   | {
       ok: false;
+      /** Diagnostic for redacted logging only, never product copy. */
       error: string;
-      hint: string;
+      hintCode?: WechatBridgeQrHintCode;
     };
 
 export async function getWechatBridgeQrCode(
@@ -326,7 +510,7 @@ export async function getWechatBridgeQrCode(
     return {
       ok: false,
       error: 'WeChat bridge URL must be http://127.0.0.1 or http://localhost',
-      hint: '微信扫码登录只允许访问本机 wechat-bridge，不能指向远端 URL。',
+      hintCode: 'wechat_bridge_remote_url',
     };
   }
 
@@ -340,11 +524,10 @@ export async function getWechatBridgeQrCode(
       if (!isNotFoundLikeError(error)) break;
     }
   }
-
   return {
     ok: false,
     error: generalizedErrorMessage(lastError),
-    hint: '先启动本机 wechat-bridge，并确认它暴露了 iLink 兼容的 /api/weixin/qrcode 或 /qrcode 接口。',
+    hintCode: 'wechat_bridge_unreachable',
   };
 }
 
@@ -381,6 +564,7 @@ export function mapWechatBridgeMessage(raw: unknown): BotIncomingMessage | null 
 export function mapWechatIlinkMessage(raw: unknown): BotIncomingMessage | null {
   if (!raw || typeof raw !== 'object') return null;
   const message = raw as Record<string, unknown>;
+  if (message.message_type === 2 || message.group_id) return null;
   const itemList = Array.isArray(message.item_list) ? message.item_list : [];
   const textParts: string[] = [];
   let hasMedia = false;
@@ -405,7 +589,12 @@ export function mapWechatIlinkMessage(raw: unknown): BotIncomingMessage | null {
   if (!userId) return null;
   const messageId =
     firstStringField(message, ['msg_id', 'message_id', 'client_id', 'id']) ?? randomUUID();
-  const timestamp = firstNumberField(message, ['create_time', 'timestamp', 'createdAt']);
+  const timestamp = firstNumberField(message, [
+    'create_time_ms',
+    'create_time',
+    'timestamp',
+    'createdAt',
+  ]);
   return {
     platform: 'wechat',
     userId,
@@ -423,23 +612,63 @@ export async function* readSseJsonObjects(
   body: AsyncIterable<Uint8Array>,
 ): AsyncGenerator<unknown> {
   const decoder = new TextDecoder();
+  const iterator = body[Symbol.asyncIterator]();
   let buffer = '';
-  for await (const chunk of body) {
-    buffer += decoder.decode(chunk, { stream: true });
-    let boundary = findSseBoundary(buffer);
-    while (boundary) {
-      const event = buffer.slice(0, boundary.index);
-      buffer = buffer.slice(boundary.index + boundary.length);
-      const data = event
-        .split(/\r?\n/)
-        .filter((line) => line.startsWith('data:'))
-        .map((line) => line.slice(5).trimStart())
-        .join('\n')
-        .trim();
-      if (data) yield JSON.parse(data);
-      boundary = findSseBoundary(buffer);
+  let closeIterator = false;
+  try {
+    while (true) {
+      // A rejected next() does not close its iterator under for-await semantics.
+      closeIterator = false;
+      let text = await readSseTextChunk(iterator, decoder);
+      if (text === undefined) return;
+      closeIterator = true;
+      buffer += text;
+      text = undefined;
+      let boundary = findSseBoundary(buffer);
+      while (boundary) {
+        let data = sseEventData(buffer.slice(0, boundary.index));
+        buffer = buffer.slice(boundary.index + boundary.length);
+        if (data) yield JSON.parse(data);
+        data = '';
+        boundary = findSseBoundary(buffer);
+      }
     }
+  } catch (error) {
+    if (closeIterator) {
+      closeIterator = false;
+      try {
+        await iterator.return?.();
+      } catch {}
+    }
+    throw error;
+  } finally {
+    if (closeIterator) await iterator.return?.();
   }
+}
+
+async function readSseTextChunk(
+  iterator: AsyncIterator<Uint8Array>,
+  decoder: TextDecoder,
+): Promise<string | undefined> {
+  const next = await iterator.next();
+  if (next.done) return;
+  try {
+    return decoder.decode(next.value, { stream: true });
+  } catch (error) {
+    try {
+      await iterator.return?.();
+    } catch {}
+    throw error;
+  }
+}
+
+function sseEventData(event: string): string {
+  return event
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith('data:'))
+    .map((line) => line.slice(5).trimStart())
+    .join('\n')
+    .trim();
 }
 
 export async function testWechatBridge(channel: BotChannelSettings): Promise<BotTestResult> {
@@ -447,8 +676,7 @@ export async function testWechatBridge(channel: BotChannelSettings): Promise<Bot
   if (!baseUrl) {
     return {
       ok: false,
-      error: 'WeChat bridge URL must be http://127.0.0.1 or http://localhost',
-      hint: '微信本地桥接只允许访问本机 wechat-bridge，不能指向远端 URL。',
+      errorCode: 'wechat_bridge_url_invalid',
     };
   }
   try {
@@ -478,8 +706,8 @@ export async function testWechatBridge(channel: BotChannelSettings): Promise<Bot
   } catch (error) {
     return {
       ok: false,
-      error: generalizedErrorMessage(error),
-      hint: '先在本机启动 wechat-bridge，并确认 WeChat 已登录；发送能力需要 wxp_act_ 激活码。',
+      errorCode: 'connection_failed',
+      error: botDiagnosticMessage(channel, error),
     };
   }
 }
@@ -516,8 +744,7 @@ export async function testWechatIlinkCredentials(
   if (!baseUrl || !token) {
     return {
       ok: false,
-      error: 'WeChat iLink credentials are incomplete',
-      hint: '请先完成微信扫码登录，保存 iLink bot token 与 base URL。',
+      errorCode: 'wechat_ilink_credentials_incomplete',
     };
   }
   return {
@@ -528,12 +755,11 @@ export async function testWechatIlinkCredentials(
       displayName: channel.botUserId ? `iLink ${channel.botUserId}` : 'WeChat iLink',
     },
     capabilities: { auth: true, send: true },
-    hint: '扫码登录凭据已保存；运行态会通过 iLink 长轮询接收消息。',
   };
 }
 
 function isWechatIlinkChannel(channel: BotChannelSettings): boolean {
-  return Boolean(channel.token.trim() && normalizeWechatIlinkBaseUrl(channel.webhookUrl));
+  return Boolean(normalizeWechatIlinkBaseUrl(channel.webhookUrl));
 }
 
 async function wechatIlinkPost(
@@ -542,6 +768,7 @@ async function wechatIlinkPost(
   body: Record<string, unknown>,
   token: string,
   signal?: AbortSignal,
+  timeoutMs = WECHAT_ILINK_TIMEOUT_MS,
 ): Promise<Record<string, unknown>> {
   const response = await proxiedFetch(`${baseUrl}${path}`, {
     method: 'POST',
@@ -554,11 +781,29 @@ async function wechatIlinkPost(
     },
     body: JSON.stringify(body),
     signal,
-    timeoutMs: path.includes('getupdates') ? 0 : WECHAT_ILINK_TIMEOUT_MS,
+    timeoutMs: path.includes('getupdates') ? 0 : timeoutMs,
   });
   const text = await response.text();
   if (!response.ok) throw new Error(`HTTP ${response.status}: ${text}`);
-  return JSON.parse(text) as Record<string, unknown>;
+  // iLink IDs are uint64: preserve their original digits before Number rounding.
+  // sendTyping may acknowledge with an empty body.
+  if (!text.trim() && path.endsWith('/sendtyping')) return {};
+  return JSON.parse(text, (key, value, context?: { source?: string }) =>
+    key === 'message_id' &&
+    typeof value === 'number' &&
+    context?.source &&
+    /^\d+$/.test(context.source)
+      ? context.source
+      : value,
+  ) as Record<string, unknown>;
+}
+
+function assertIlinkSuccess(response: Record<string, unknown>): void {
+  if (
+    (typeof response.ret === 'number' && response.ret !== 0) ||
+    (typeof response.errcode === 'number' && response.errcode !== 0)
+  )
+    throw Error('WeChat request rejected');
 }
 
 function randomWechatUinHeader(): string {

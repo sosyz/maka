@@ -371,9 +371,9 @@ Structural reconciliation 也不拥有 resource permit 或 global fairness。Sha
 
 主 Agent 既不是每条 record 必经的 node，也不是 child execution 内部 callback。它是 external supervisor，承担三类职责：
 
-1. **Observe：**检查紧凑 schedule、topology、operator state、wait、failure 与 candidate result record。
-2. **Control：**添加 dependent work、follow up 已有 operator、stop/replace 失去价值的 work，并关闭 schedule。
-3. **Synthesize：**读取权威 child output、选择已提交 result record，并回答用户。
+1. **Observe**：检查紧凑 schedule、topology、operator state、wait、failure 与 candidate result record。
+2. **Control**：添加 dependent work、follow up 已有 operator、stop/replace 失去价值的 work，并关闭 schedule。
+3. **Synthesize**：读取权威 child output、选择已提交 result record，并回答用户。
 
 这个位置同时保留自治与响应性。Operator 可以按照持久 control decision 推进，root Agent 仍然是普通 conversation participant。用户可以通过 host 观察或停止 Graph，而不把 supervisor 变成 data-delivery bottleneck。
 
@@ -557,6 +557,8 @@ sequenceDiagram
 - Admission 与 wake row 目前只向 timeline reconstruction 暴露 latest state，reconcile-loop history 也没有持久化。
 
 这些都是有意保留的边界。它们让 Graph 有用，同时不把 workflow semantic、resource management 或 product presentation 塞进 Agent runtime。
+
+上述 replay timeline 与 reconcile history 缺口的跟踪：[Agent Graph operational topology #2596](https://github.com/apache/maka/issues/2596)、[Session Inspector #1625](https://github.com/apache/maka/issues/1625)
 
 ## Graph、Swarm、agent_spawn 与 Rive
 

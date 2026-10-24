@@ -44,11 +44,12 @@ export function createDesktopRuntimeHostLocalManagement(input: {
 }): DesktopRuntimeHostManagementProvider {
   return {
     profileId: LOCAL_RUNTIME_HOST_PROFILE.id,
+    platform: process.platform === 'win32' ? 'win32' : 'posix',
     accessManagementAvailable: false,
     run: (action, allowInterruptActiveTasks) => {
       const execute = (target: DesktopRuntimeHostLocalManagementTarget) =>
         input.operator.runService({
-          operatorPath: target.operatorPath,
+          operator: target.operator,
           action,
           target,
           ...(allowInterruptActiveTasks ? { allowInterruptActiveTasks: true } : {}),
@@ -83,7 +84,7 @@ export function createDesktopRuntimeHostLocalManagement(input: {
       input.remoteAccess.changeManaged(
         (target) =>
           input.operator.runService({
-            operatorPath: target.operatorPath,
+            operator: target.operator,
             action: 'configure',
             target,
             projectDirectoryRoots: roots,
@@ -94,14 +95,14 @@ export function createDesktopRuntimeHostLocalManagement(input: {
     updatePolicy: (policy) =>
       input.remoteAccess.inspectManaged((target) =>
         input.operator.runUpdatePolicy({
-          operatorPath: target.operatorPath,
+          operator: target.operator,
           target,
           ...(policy ? { policy } : {}),
         }).then((frame) => requireLocalFrame(frame, 'update_policy'))),
     reconcileUpdate: (onProgress) =>
       input.remoteAccess.changeManaged((target) =>
         input.operator.runUpdateReconciliation(
-          { operatorPath: target.operatorPath, target },
+          { operator: target.operator, target },
           onProgress,
         ).then((frame) => requireLocalFrame(frame, 'reconcile_update'))),
     currentHostEpoch: input.currentHostEpoch,

@@ -17,6 +17,7 @@
  * under the License.
  */
 
+import { RuntimeHostOperationError } from '@maka/runtime-host/client';
 import type { DesktopRuntimeHostClient } from './runtime-host-client.js';
 import {
   encodeDesktopCollaborationInvitation,
@@ -35,15 +36,18 @@ export function registerRuntimeHostCollaborationIpc(
     | 'createCollaborationTurnRequest'
     | 'decideCollaborationTurnRequest'
     | 'queryCollaborationTurnRequests'
+    | 'withdrawCollaborationTurnRequest'
     | 'queryCollaborationAccess'
     | 'revokeCollaborationGrant'
     | 'revokeCollaborationPrincipal'
+    | 'renameCollaborationPrincipal'
   >,
   ipcMain: ReconnectableReadIpcMain,
   resolveConnectionTarget: () =>
     | DesktopCollaborationConnectionTarget
     | Promise<DesktopCollaborationConnectionTarget>,
 ): void {
+  let backgroundInboxUnavailable = false;
   ipcMain.handle(
     'session-collaboration:prepare',
     async (
@@ -70,6 +74,14 @@ export function registerRuntimeHostCollaborationIpc(
             invitationCode: prepared.invitationCode,
             target,
           }),
+          connectivity:
+            target.transport.kind === 'libp2p-direct'
+              ? {
+                  kind: 'peer' as const,
+                  coordinationRelayCount:
+                    target.transport.reachability.lease.coordinationRoutes.length,
+                }
+              : { kind: 'configured' as const },
         },
       };
     },
@@ -84,13 +96,32 @@ export function registerRuntimeHostCollaborationIpc(
   handleReconnectableRead(
     ipcMain,
     'session-collaboration:turn-request:query',
-    (_event, sessionId: unknown) =>
-      client.queryCollaborationTurnRequests(requiredId(sessionId, 'Session')),
+    async (_event, sessionId: unknown) => {
+      const requestedSessionId =
+        sessionId === undefined ? undefined : requiredId(sessionId, 'Session');
+      if (requestedSessionId === undefined && backgroundInboxUnavailable) {
+        return { canRequestTurns: false, requests: [] };
+      }
+      try {
+        return await client.queryCollaborationTurnRequests(requestedSessionId);
+      } catch (error) {
+        if (requestedSessionId === undefined && isCollaborationInboxUnavailable(error)) {
+          backgroundInboxUnavailable = true;
+          return { canRequestTurns: false, requests: [] };
+        }
+        throw error;
+      }
+    },
   );
   ipcMain.handle(
     'session-collaboration:turn-request:acknowledge',
     (_event, requestId: unknown) =>
       client.acknowledgeCollaborationTurnRequest(requiredId(requestId, 'Turn request')),
+  );
+  ipcMain.handle(
+    'session-collaboration:turn-request:withdraw',
+    (_event, requestId: unknown) =>
+      client.withdrawCollaborationTurnRequest(requiredId(requestId, 'Turn request')),
   );
   ipcMain.handle(
     'session-collaboration:turn-request:decide',
@@ -115,6 +146,19 @@ export function registerRuntimeHostCollaborationIpc(
     'session-collaboration:revokePrincipal',
     (_event, principalId: unknown) =>
       client.revokeCollaborationPrincipal(requiredId(principalId, 'Principal')),
+  );
+  ipcMain.handle(
+    'session-collaboration:renamePrincipal',
+    (_event, principalId: unknown, displayName: unknown) =>
+      client.renameCollaborationPrincipal(requiredId(principalId, 'Principal'), requiredId(displayName, 'Alias')),
+  );
+}
+
+function isCollaborationInboxUnavailable(error: unknown): boolean {
+  return (
+    error instanceof RuntimeHostOperationError &&
+    error.operation === 'collaboration.turn-request.query' &&
+    error.code === 'operation_unavailable'
   );
 }
 

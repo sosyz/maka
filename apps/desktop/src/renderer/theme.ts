@@ -28,11 +28,10 @@ import {
   DEFAULT_TERMINAL_FONT_SIZE,
   DEFAULT_UI_FONT_SIZE,
   normalizeTerminalFontSize,
-  normalizeUiFontSize,
   type ThemePalette,
   type ThemePreference,
 } from '@maka/core/settings';
-import { TYPE_SCALE_BASE_PX } from './astryx-theme/type-scale.js';
+import { applyDocumentThemeMode, applyDocumentThemePalette, applyDocumentUiFontSize } from './platform/desktop/document-appearance.js';
 import { safeLocalStorageGet, safeLocalStorageSet } from './browser-storage';
 import { compositeScrimOverBackground, parseCssRgbColor } from './titlebar-dim-color.js';
 
@@ -43,14 +42,6 @@ const DARK_CLASS = 'dark';
 // frame, same rationale as `maka-theme-v1`.
 const UI_FONT_SIZE_STORAGE_KEY = 'maka-ui-font-size-v1';
 const TERMINAL_FONT_SIZE_STORAGE_KEY = 'maka-terminal-font-size-v1';
-// The renderer type scale is generated from TYPE_SCALE_BASE_PX (the same
-// constant makaTheme.ts feeds into expandTypeScale) and every --font-size-*
-// token is rem, so the root font-size that reproduces a chosen base px is
-// `16 * px / base`. At the base that is the 16px browser default (no change);
-// other values scale what is rem-derived — text and Astryx's rem icon atoms —
-// while px-literal spacing and widths stay fixed.
-const BROWSER_ROOT_FONT_SIZE_PX = 16;
-
 let currentUiFontSize: number = DEFAULT_UI_FONT_SIZE;
 let currentTerminalFontSize: number = DEFAULT_TERMINAL_FONT_SIZE;
 const terminalFontSizeListeners = new Set<(size: number) => void>();
@@ -65,9 +56,8 @@ export function getUiFontSize(): number {
  * Clamps out-of-range / wrong-typed input to a sane value.
  */
 export function applyUiFontSize(size: number): void {
-  const next = normalizeUiFontSize(size);
+  const next = applyDocumentUiFontSize(size);
   currentUiFontSize = next;
-  document.documentElement.style.fontSize = `${(BROWSER_ROOT_FONT_SIZE_PX * next) / TYPE_SCALE_BASE_PX}px`;
   safeLocalStorageSet(UI_FONT_SIZE_STORAGE_KEY, String(next));
 }
 
@@ -149,12 +139,8 @@ export function applyTheme(pref: ThemePreference): () => void {
 }
 
 function setDarkClass(isDark: boolean): void {
-  const root = document.documentElement;
-  root.classList.toggle(DARK_CLASS, isDark);
-  // Lets native form controls and scrollbars pick up the right base colors per
-  // the Vercel Web Interface Guidelines dark-mode rule.
-  root.style.colorScheme = isDark ? 'dark' : 'light';
-  syncTitleBarOverlay(root);
+  applyDocumentThemeMode(isDark);
+  syncTitleBarOverlay(document.documentElement);
 }
 
 /**
@@ -183,32 +169,24 @@ export function setTitlebarModalDimmed(dimmed: boolean): void {
  * live in `maka-tokens.css`. `default` removes the attribute so the
  * original Maka palette renders.
  *
- * Light/dark variants of each palette switch automatically with the
- * existing `.dark` class — no separate IPC needed.
+ * A palette carries both of its modes inside each value, so the light/dark
+ * variants follow `color-scheme` (set on <html> beside the class by
+ * setDarkClass) with no separate IPC and no second block per palette. Flipping
+ * the class alone no longer switches anything.
  */
 export function applyThemePalette(palette: ThemePalette): void {
-  const root = document.documentElement;
-  if (palette === 'default') {
-    root.removeAttribute('data-maka-theme');
-  } else {
-    root.setAttribute('data-maka-theme', palette);
-  }
+  applyDocumentThemePalette(palette);
   safeLocalStorageSet('maka-theme-palette-v1', palette);
-  // Palette variants override --background independently of light/dark mode.
-  // Re-sync after changing the attribute so the native Windows controls never
-  // retain the previous palette's titlebar color.
-  syncTitleBarOverlay(root);
+  // Palette changes also update the main window's native controls.
+  syncTitleBarOverlay(document.documentElement);
 }
 
 function syncTitleBarOverlay(root: HTMLElement): void {
   // The native Windows overlay sits on top of the renderer's content surface.
-  // Sample the actual resolved --background color instead of approximating it
+  // Sample the actual painted --background color instead of approximating it
   // with one hard-coded light and dark pair; this also follows every palette.
   const isDark = root.classList.contains(DARK_CLASS);
-  const backgroundColor = cssColorToHex(
-    getComputedStyle(root).getPropertyValue('--background'),
-    isDark ? '#1c1d21' : '#ffffff',
-  );
+  const backgroundColor = paintedBackgroundToHex(root, isDark ? '#1c1d21' : '#ffffff');
   void window.maka?.appWindow
     ?.setTitleBarOverlayTheme?.({
       isDark,
@@ -222,9 +200,7 @@ function syncTitleBarOverlay(root: HTMLElement): void {
 /**
  * The color the titlebar strip appears under an open modal: the dialog
  * backdrop scrim composited over `--background`. The scrim is sampled from
- * the open modal's own ::backdrop — the engine has already resolved its
- * `var()` indirection and `light-dark()` branch, which neither a token read
- * nor a canvas fillStyle can do — so the dim tracks theme and palette
+ * the open modal's own ::backdrop, so the dim tracks theme and palette
  * automatically.
  */
 function dimmedTitlebarColor(backgroundHex: string, isDark: boolean): string {
@@ -245,17 +221,28 @@ function readModalBackdropColor(): { r: number; g: number; b: number; a: number 
   return parseCssRgbColor(getComputedStyle(dialog, '::backdrop').backgroundColor);
 }
 
-function cssColorToHex(value: string, fallback: string): string {
-  const color = value.trim();
-  if (!color || !CSS.supports('color', color)) return fallback;
-
+/**
+ * The opaque color an element is painted, as hex. Takes the element rather
+ * than a color string because a palette token's declared value is not a
+ * color: `--background` is a `light-dark()` pair that only becomes one where
+ * it is used (DESIGN.md §8), and a canvas cannot resolve that — nor anything
+ * else that needs an element's context. Reading `background-color` off the
+ * element that paints it (`html`, maka-tokens.css) hands the canvas an
+ * already-resolved color.
+ */
+function paintedBackgroundToHex(element: Element, fallback: string): string {
   const canvas = document.createElement('canvas');
   canvas.width = 1;
   canvas.height = 1;
   const context = canvas.getContext('2d', { willReadFrequently: true });
   if (!context) return fallback;
 
-  context.fillStyle = color;
+  // A fillStyle the canvas cannot parse is ignored, leaving the previous value
+  // in place — so start transparent. Anything unparseable then reads back at
+  // alpha 0 and takes the fallback, rather than sampling the opaque black that
+  // fillStyle defaults to.
+  context.fillStyle = 'rgba(0, 0, 0, 0)';
+  context.fillStyle = getComputedStyle(element).backgroundColor;
   context.fillRect(0, 0, 1, 1);
   const [red, green, blue, alpha] = context.getImageData(0, 0, 1, 1).data;
   if (alpha !== 255) return fallback;

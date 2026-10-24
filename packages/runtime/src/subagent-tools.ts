@@ -18,7 +18,7 @@
  */
 
 import { z } from 'zod';
-import { TASK_ID_MAX_CHARS, isSafeTaskId, type TaskLedgerStore } from '@maka/core/task-ledger';
+import { isExecutorId } from '@maka/core/executor-id';
 import { decodeCanonicalToolResultContent } from '@maka/core/tool-result-record-schema';
 import { isSafeSubagentPresetId } from '@maka/core/subagent-settings';
 import { type ToolResultContent } from '@maka/core/events';
@@ -60,6 +60,8 @@ const AGENT_LIST_PAGE_SIZE = 8;
 const AGENT_LIST_MAX_RESPONSE_CHARS = 7_000;
 const AGENT_LIST_DESCRIPTION_MAX_CHARS = 240;
 const AGENT_LIST_MODEL_MAX_CHARS = 160;
+const CHILD_EXECUTOR_SELECTION_GUIDANCE =
+  'Use executor_mode=inherit for the preset or inherited execution route; executor_id is then ignored. Use executor_mode=plugin only for an explicitly selected registered plugin executor. Without executor_mode, omit executor_id to inherit; "default" is not a default selector.';
 
 /**
  * Which schema fields each `agent_output` locator needs. A rejection that only
@@ -89,15 +91,17 @@ export function buildChildAgentTools(tools: readonly MakaTool[]): MakaTool[] {
 }
 
 export function buildSubagentSpawnTool(
-  deps: { taskLedger?: TaskLedgerStore; definitions?: readonly AgentDefinition[] } = {},
+  deps: { definitions?: readonly AgentDefinition[] } = {},
 ): MakaTool<
   {
+    target_kind?: 'profile' | 'preset';
     profile?: string;
     subagent_id?: string;
+    executor_mode?: 'inherit' | 'plugin';
+    executor_id?: string;
     task: string;
     write_back?: string;
     isolation?: string;
-    task_id?: string;
   },
   unknown
 > {
@@ -107,19 +111,40 @@ export function buildSubagentSpawnTool(
     name: AGENT_SPAWN_TOOL_NAME,
     displayName: 'Agent',
     description:
-      'Run one bounded foreground child task. Prefer agent_list, then select the user-approved subagent_id whose description fits the task; profile is retained for legacy callers. If both selectors are present, subagent_id wins and profile is ignored.',
+      "Run one bounded foreground child task. Call agent_list and copy an available choice's spawn_args, then add task. target_kind=profile uses profile; target_kind=preset uses subagent_id. The unused selector is ignored. Empty presets does not disable built-in profiles. Without target_kind, subagent_id takes precedence for legacy callers. Independent child tasks may be called together in one parallel batch, including corrected retries after selector errors. " +
+      CHILD_EXECUTOR_SELECTION_GUIDANCE,
     parameters: z.preprocess(
-      (input) => cleanSubagentSpawnInput(input, deps.taskLedger !== undefined),
+      cleanSubagentSpawnInput,
       z
         .object({
-          profile: z.enum(profiles).optional().describe('Legacy child capability profile.'),
+          target_kind: z
+            .enum(['profile', 'preset'])
+            .optional()
+            .describe(
+              'Choose profile for legacy_profiles or preset for presets. Only the selected identity field is used; the other is ignored even if populated.',
+            ),
+          profile: z
+            .enum(profiles)
+            .optional()
+            .describe('Built-in child capability: copy legacy_profiles[].profile from agent_list.'),
           subagent_id: z
             .string()
             .min(1)
             .max(128)
             .refine(isSafeSubagentPresetId)
             .optional()
-            .describe('User-approved subagent preset id from agent_list.'),
+            .describe(
+              'For target_kind=preset, copy presets[].subagent_id from agent_list. Ignored for target_kind=profile.',
+            ),
+          executor_mode: z
+            .enum(['inherit', 'plugin'])
+            .optional()
+            .describe(CHILD_EXECUTOR_SELECTION_GUIDANCE),
+          executor_id: z
+            .string()
+            .refine(isExecutorId)
+            .optional()
+            .describe(CHILD_EXECUTOR_SELECTION_GUIDANCE),
           task: z
             .string()
             .min(1)
@@ -137,27 +162,35 @@ export function buildSubagentSpawnTool(
             .describe(
               'Requested child workspace isolation. Worktree profiles fail closed until a worktree child executor is available.',
             ),
-          ...(deps.taskLedger
-            ? {
-                task_id: z
-                  .string()
-                  .min(1)
-                  .max(TASK_ID_MAX_CHARS)
-                  .refine(isSafeTaskId)
-                  .optional()
-                  .describe('Existing task UUID or short key to bind to this child run.'),
-              }
-            : {}),
         })
         .strip()
         .superRefine((input, ctx) => {
-          if (!input.profile && !input.subagent_id) {
+          if (input.executor_mode === 'plugin' && !input.executor_id) {
             ctx.addIssue({
               code: z.ZodIssueCode.custom,
+              path: ['executor_id'],
               message:
-                'No child selector was provided. Call agent_list and pass a returned subagent_id to agent_spawn, ' +
-                `or pass one legacy profile: ${profiles.join(', ')}.`,
+                'executor_mode=plugin requires a registered executor_id. Use executor_mode=inherit for normal child execution.',
             });
+          }
+          if (!input.profile && !input.subagent_id) {
+            if (input.target_kind) {
+              const selector = input.target_kind === 'profile' ? 'profile' : 'subagent_id';
+              const catalogSection =
+                input.target_kind === 'profile' ? 'legacy_profiles' : 'presets';
+              ctx.addIssue({
+                code: z.ZodIssueCode.custom,
+                path: [selector],
+                message: `target_kind=${input.target_kind} requires ${selector}. Call agent_list and copy an available ${catalogSection} choice's spawn_args, then add task.`,
+              });
+            } else {
+              ctx.addIssue({
+                code: z.ZodIssueCode.custom,
+                message:
+                  'No child selector was provided. Call agent_list and pass a returned subagent_id to agent_spawn, ' +
+                  `or pass one legacy profile: ${profiles.join(', ')}.`,
+              });
+            }
             return;
           }
           if (input.subagent_id) return;
@@ -182,7 +215,6 @@ export function buildSubagentSpawnTool(
         }),
     ),
     categoryHint: 'subagent',
-    nesting: 'direct_only',
     impl: async (input, ctx) => {
       const definition = input.subagent_id
         ? await resolvePresetDefinition(input.subagent_id, ctx, definitions)
@@ -208,20 +240,6 @@ export function buildSubagentSpawnTool(
           },
         );
       }
-      // task_id is meaningful only in compositions that advertise task
-      // binding. Older or over-eager callers may still send it elsewhere;
-      // ignore it instead of turning an optional integration into a refusal.
-      const taskId = deps.taskLedger ? input.task_id : undefined;
-      const boundTask = taskId ? await deps.taskLedger!.get(ctx.sessionId, taskId) : undefined;
-      if (taskId && !boundTask) throw new Error(`No such task in this session: ${taskId}`);
-      let claimedOwner:
-        | {
-            actor: 'child_agent';
-            sessionId: string;
-            agentId: string;
-            turnId: string;
-          }
-        | undefined;
       let result: Omit<SubagentToolResult, 'kind'>;
       const progress = new ChildAgentProgressProjector(ctx);
       ctx.emitOutput('stdout', `Starting child agent: ${definition.name}\n`);
@@ -230,28 +248,8 @@ export function buildSubagentSpawnTool(
           await ctx.spawnChildSession({
             agentProfile: definition.profile,
             ...(input.subagent_id ? { subagentId: input.subagent_id } : {}),
+            ...(input.executor_id ? { executorId: input.executor_id } : {}),
             prompt: input.task,
-            ...(boundTask
-              ? {
-                  onReady: async ({ childSessionId, turnId, agentId }) => {
-                    const owner = {
-                      actor: 'child_agent' as const,
-                      sessionId: childSessionId,
-                      agentId,
-                      turnId,
-                    };
-                    await deps.taskLedger!.claim(ctx.sessionId, boundTask.id, owner, {
-                      runId: ctx.runId,
-                      turnId: ctx.turnId,
-                      toolCallId: ctx.toolCallId,
-                      source: 'system',
-                      actor: 'main_agent',
-                      reason: `assigned to child agent ${agentId}`,
-                    });
-                    claimedOwner = owner;
-                  },
-                }
-              : {}),
             onEvent: (event) => progress.observe(event),
           }),
         );
@@ -260,52 +258,9 @@ export function buildSubagentSpawnTool(
           'stderr',
           `Child agent ${definition.name} failed: ${boundedChildError(error)}\n`,
         );
-        if (boundTask && claimedOwner) {
-          await deps.taskLedger!.settleAgentOutcome(
-            ctx.sessionId,
-            boundTask.id,
-            {
-              status: 'failed',
-              owner: claimedOwner,
-              reason:
-                error instanceof Error
-                  ? error.message
-                  : 'Child agent failed before returning a result',
-            },
-            {
-              turnId: claimedOwner.turnId,
-              toolCallId: ctx.toolCallId,
-              source: 'system',
-              actor: 'child_agent',
-            },
-          );
-        }
         throw error;
       }
       ctx.emitOutput('stdout', `Child agent ${definition.name}: ${result.status}\n`);
-      if (boundTask && claimedOwner) {
-        const owner = {
-          ...claimedOwner,
-          ...(result.runId ? { runId: result.runId } : {}),
-          turnId: result.turnId,
-        };
-        await deps.taskLedger!.settleAgentOutcome(
-          ctx.sessionId,
-          boundTask.id,
-          {
-            status: result.status,
-            owner,
-            reason: result.failureClass ?? result.summary,
-          },
-          {
-            runId: result.runId,
-            turnId: result.turnId,
-            toolCallId: ctx.toolCallId,
-            source: 'system',
-            actor: 'child_agent',
-          },
-        );
-      }
       return {
         kind: 'subagent',
         ...result,
@@ -314,11 +269,13 @@ export function buildSubagentSpawnTool(
   };
 }
 
-function cleanSubagentSpawnInput(input: unknown, taskBindingAvailable: boolean): unknown {
+function cleanSubagentSpawnInput(input: unknown): unknown {
   if (!input || typeof input !== 'object' || Array.isArray(input)) return input;
   const cleaned = { ...(input as Record<string, unknown>) };
-  if (cleaned.subagent_id !== undefined) delete cleaned.profile;
-  if (!taskBindingAvailable) delete cleaned.task_id;
+  if (cleaned.target_kind === 'profile') delete cleaned.subagent_id;
+  else if (cleaned.target_kind === 'preset' || cleaned.subagent_id !== undefined)
+    delete cleaned.profile;
+  if (cleaned.executor_mode === 'inherit') delete cleaned.executor_id;
   return cleaned;
 }
 
@@ -344,7 +301,17 @@ async function resolvePresetDefinition(
       (candidate as { id?: unknown }).id === subagentId &&
       typeof (candidate as { profile?: unknown }).profile === 'string',
   );
-  if (!preset) throw new Error(`Unknown subagent_id "${subagentId}". Call agent_list first.`);
+  if (!preset) {
+    const legacy = definitions.find(
+      (definition) => definition.profile === subagentId || definition.id === subagentId,
+    );
+    const recovery = legacy
+      ? `"${subagentId}" identifies a built-in agent, not a configured preset. Use ${JSON.stringify({ target_kind: 'profile', profile: legacy.profile, executor_mode: 'inherit' })}, keeping your task. The unused subagent_id and executor_id fields are ignored in these modes.`
+      : "Call agent_list and copy an available choice's spawn_args, then add task. presets use subagent_id; legacy_profiles use profile.";
+    throw new Error(
+      `Unknown subagent_id "${subagentId}". No child was started. ${recovery} ${CHILD_EXECUTOR_SELECTION_GUIDANCE}`,
+    );
+  }
   if (preset.availability?.status !== 'available') {
     throw new Error(`Subagent preset "${subagentId}" is unavailable.`);
   }
@@ -393,7 +360,7 @@ export function buildSubagentListTool(): MakaTool<
     name: AGENT_LIST_TOOL_NAME,
     displayName: 'Agent List',
     description:
-      'List a compact page of subagents to select. The default selection view returns runnable user-approved subagent_id values first, followed by legacy choices with separate agent_id (Graph) and profile (agent_spawn) selectors. Use view=catalog only to diagnose unavailable routes. Child execution history is intentionally excluded; use refs returned by agent_spawn or asynchronous graph work with agent_output.',
+      "List a compact page of subagents to select. Copy an available choice's spawn_args into agent_spawn and add task. presets use subagent_id; legacy_profiles use profile, including when presets is empty. agent_id is for Graph only. Use view=catalog only to diagnose unavailable routes. Child execution history is intentionally excluded; use refs returned by agent_spawn or asynchronous graph work with agent_output.",
     parameters: z
       .object({
         view: z
@@ -410,7 +377,6 @@ export function buildSubagentListTool(): MakaTool<
       })
       .strip(),
     categoryHint: 'read',
-    nesting: 'direct_only',
     impl: async (input, ctx) => {
       // Runtime Host supplies this capability to production clients. Keep the
       // failure explicit at the embedding boundary.
@@ -467,6 +433,15 @@ function projectAgentList(
       return [
         {
           subagent_id: preset.id,
+          ...(availability.status === 'available'
+            ? {
+                spawn_args: {
+                  target_kind: 'preset',
+                  subagent_id: preset.id,
+                  executor_mode: 'inherit',
+                },
+              }
+            : {}),
           name: boundedCatalogText(preset.name, 128),
           description: boundedCatalogText(preset.description, AGENT_LIST_DESCRIPTION_MAX_CHARS),
           profile: preset.profile,
@@ -505,6 +480,15 @@ function projectAgentList(
       {
         agent_id: definition.id,
         profile: definition.profile,
+        ...(availability.status === 'available'
+          ? {
+              spawn_args: {
+                target_kind: 'profile',
+                profile: definition.profile,
+                executor_mode: 'inherit',
+              },
+            }
+          : {}),
         name: boundedCatalogText(definition.name, 128),
         description: boundedCatalogText(definition.description, AGENT_LIST_DESCRIPTION_MAX_CHARS),
         ...(typeof contract?.workspace === 'string'
@@ -658,7 +642,6 @@ export function buildSubagentOutputTool(): MakaTool<
         }),
     ),
     categoryHint: 'read',
-    nesting: 'direct_only',
     impl: async (input, ctx) => {
       if (!ctx.readChildAgentOutput) {
         // Same reachability as `agent_list` above.
@@ -753,7 +736,7 @@ export function buildSubagentProjectionTools(): MakaTool[] {
 }
 
 export function buildParentAgentTools(
-  deps: { taskLedger?: TaskLedgerStore; definitions?: readonly AgentDefinition[] } = {},
+  deps: { definitions?: readonly AgentDefinition[] } = {},
 ): MakaTool[] {
   const definitions = deps.definitions ?? BUILTIN_AGENT_DEFINITIONS;
   return [

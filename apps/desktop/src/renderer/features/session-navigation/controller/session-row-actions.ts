@@ -20,30 +20,17 @@
 import type { SessionSummary } from '@maka/core/session';
 import type { UiLocale } from '@maka/core/ui-locale';
 import { getShellCopy, localizedShellErrorMessage } from '../../../locales/shell-copy.js';
+import { getSettingsSharedCopy } from '../../../locales/settings-shared-copy.js';
+import { getSettingsTasksCopy } from '../../../locales/settings-tasks-copy.js';
+import { formatBytes } from '@maka/ui';
+import type { SessionRemovePreviewResult } from '@maka/runtime-host/protocol';
 import { revisionFamilySessionIds } from '@maka/core/session-revisions';
-import type { SessionNavigationSessionService } from '../ports.js';
-
-type RefBox<T> = { current: T };
-
-/** What `sessions.remove` settled on. `restored` means the task is still there. */
-type SessionRemoveDisposition = 'removed' | 'restored';
-
-type ToastApi = {
-  success(title: string, description?: string): void;
-  error(
-    title: string,
-    description?: string,
-    diagnosticDetails?: string,
-    diagnosticTarget?: { sessionId: string },
-  ): void;
-  confirm(options: {
-    title: string;
-    description: string;
-    confirmLabel: string;
-    cancelLabel: string;
-    destructive?: boolean;
-  }): Promise<boolean>;
-};
+import type { RefObject } from 'react';
+import type {
+  SessionNavigationRemoveOutcome,
+  SessionNavigationSessionService,
+  SessionNavigationToastApi,
+} from '../ports.js';
 
 /**
  * What a sweep can honestly say afterwards. `verified: false` means the catalog
@@ -52,6 +39,12 @@ type ToastApi = {
 export interface SessionPurgeOutcome {
   /** Tasks confirmed gone. */
   removed: number;
+  /**
+   * Linked subtasks the Host moved to the archive across the sweep, summed from
+   * each removal's executed count. Reported so a bulk purge does not silently
+   * archive active subtasks.
+   */
+  archivedSubtasks: number;
   /** Tasks the catalog still reports. Empty when `verified` is false. */
   remaining: string[];
   /**
@@ -59,6 +52,8 @@ export interface SessionPurgeOutcome {
    * failed: the deletion was called off because its premise was gone.
    */
   restored: string[];
+  /** Tasks the Host kept because, by its clock, they were archived too recently. */
+  tooRecent: string[];
   verified: boolean;
   /** First rejection and the Session whose Host produced it. */
   firstFailure?: {
@@ -67,46 +62,110 @@ export interface SessionPurgeOutcome {
   };
 }
 
+/**
+ * What a bulk archive can honestly say afterwards. There is no third
+ * disposition: a task is archived or its call failed.
+ *
+ * Not on `SessionNavigationRowActions`: `archiveSelected` is the rail's whole
+ * bulk archive, and this is what it reads on the way to its own report.
+ */
+interface SessionArchiveOutcome {
+  archived: number;
+  /** Tasks the sweep could not archive, including ones it had to skip. */
+  failed: string[];
+  /** First rejection and the Session whose Host produced it. */
+  firstFailure?: {
+    error: unknown;
+    sessionId: string;
+  };
+}
+
+export interface ArchivedPurgeRequest {
+  /** Frozen at the click: what is previewed is exactly what is deleted. */
+  readonly sessionIds: readonly string[];
+  /** A search or filter narrowed the list, which changes the confirm's title. */
+  readonly narrowed: boolean;
+  /** An age filter's threshold, which the Host enforces on its own clock. */
+  readonly requireArchivedForMs?: number;
+  /** False once the page closed or its scope changed: a late preview asks nothing. */
+  isCurrent(): boolean;
+}
+
 export interface SessionNavigationRowActions {
   flagSession(sessionId: string, flagged: boolean): Promise<void>;
   archiveSession(sessionId: string): Promise<void>;
   unarchiveSession(sessionId: string): Promise<void>;
   renameSession(sessionId: string, name: string): Promise<void>;
+  /**
+   * Re-files a task under another project, or out of every project (`null`).
+   * Not a revision-family action: one working directory moves.
+   */
+  moveSessionToProject(sessionId: string, projectId: string | null): Promise<void>;
   deleteSession(sessionId: string): Promise<void>;
-  purgeSessions(sessionIds: readonly string[]): Promise<SessionPurgeOutcome>;
+  purgeSessions(
+    sessionIds: readonly string[],
+    options?: { requireArchivedForMs?: number },
+  ): Promise<SessionPurgeOutcome>;
+  /**
+   * Settings › Archived tasks' bulk delete, as one flow the way a single
+   * delete is: preview, confirm, sweep, report.
+   */
+  purgeArchived(request: ArchivedPurgeRequest): Promise<void>;
+  /** Sweeps and reports — the rail's own wording. */
+  archiveSelected(sessionIds: readonly string[]): Promise<void>;
+  /** Pins or unpins a picked set in one sweep. */
+  flagSelected(sessionIds: readonly string[], flagged: boolean): Promise<void>;
 }
 
 export function createSessionNavigationRowActions(deps: {
   uiLocale: UiLocale;
-  activeIdRef: RefBox<string | undefined>;
-  clearActiveMessages: () => void;
+  acquireAutomaticQueryBlock: (sessionIds: readonly string[]) => { release(): void };
   clearSessionRendererState: (sessionId: string) => void;
-  pendingSessionRowActionsRef: RefBox<Set<string>>;
+  pendingSessionRowActionsRef: RefObject<Set<string>>;
   refreshSessions: () => Promise<ReadonlyArray<SessionSummary>>;
   service: SessionNavigationSessionService;
-  sessionsRef: RefBox<ReadonlyArray<SessionSummary>>;
-  setActiveId: (sessionId: string | undefined) => void;
-  toastApi: ToastApi;
+  sessionsRef: RefObject<ReadonlyArray<SessionSummary>>;
+  toastApi: SessionNavigationToastApi;
 }): SessionNavigationRowActions {
   const {
     uiLocale,
-    activeIdRef,
-    clearActiveMessages,
+    acquireAutomaticQueryBlock,
     clearSessionRendererState,
     pendingSessionRowActionsRef,
     refreshSessions,
     service,
     sessionsRef,
-    setActiveId,
     toastApi,
   } = deps;
   const copy = getShellCopy(uiLocale).sessionRowActions;
+  const tasksCopy = getSettingsTasksCopy(uiLocale);
+
+  async function withAutomaticQueryBlockOn<T>(
+    sessionIds: readonly string[],
+    action: () => Promise<T>,
+  ): Promise<T> {
+    const lease = acquireAutomaticQueryBlock(sessionIds);
+    try {
+      return await action();
+    } finally {
+      lease.release();
+    }
+  }
+
+  async function withAutomaticQueryBlock<T>(
+    sessionId: string,
+    action: (familyIds: readonly string[]) => Promise<T>,
+  ): Promise<T> {
+    const familyIds = revisionFamilySessionIds(sessionsRef.current, sessionId);
+    return withAutomaticQueryBlockOn(familyIds, () => action(familyIds));
+  }
 
   async function runSessionRowAction(
     sessionId: string,
-    actionId: 'flag' | 'archive' | 'rename' | 'delete',
+    actionId: 'flag' | 'archive' | 'rename' | 'delete' | 'move',
     errorTitle: string,
     action: () => Promise<void>,
+    describeError?: (error: unknown) => string | undefined,
   ): Promise<void> {
     const sessionPrefix = `${sessionId}:`;
     if (Array.from(pendingSessionRowActionsRef.current).some((key) => key.startsWith(sessionPrefix))) return;
@@ -117,13 +176,30 @@ export function createSessionNavigationRowActions(deps: {
     } catch (error) {
       toastApi.error(
         errorTitle,
-        localizedShellErrorMessage(error, copy.actionFallback, uiLocale),
+        describeError?.(error) ?? localizedShellErrorMessage(error, copy.actionFallback, uiLocale),
         undefined,
         { sessionId },
       );
     } finally {
       pendingSessionRowActionsRef.current.delete(key);
     }
+  }
+
+  /**
+   * Archive refusals worth explaining arrive re-keyed by the main process as
+   * `session_archive_refused: <reason>` — Electron IPC strips the error class,
+   * so the guard's session_busy message cannot carry it any other way. Each
+   * token names the action that unblocks the archive; anything else keeps the
+   * generic failure line.
+   */
+  function archiveRefusalDescription(error: unknown): string | undefined {
+    const reason = (error instanceof Error ? error.message : String(error)).match(
+      /session_archive_refused: (\S+)/,
+    )?.[1];
+    if (reason === 'workhub_delegation') return copy.archiveRefusedDelegation;
+    if (reason === 'workhub_result') return copy.archiveRefusedResult;
+    if (reason === 'linked_child') return copy.archiveRefusedSubtasks;
+    return undefined;
   }
 
   async function flagSession(sessionId: string, flagged: boolean) {
@@ -134,16 +210,19 @@ export function createSessionNavigationRowActions(deps: {
   }
 
   async function archiveSession(sessionId: string) {
-    return runSessionRowAction(sessionId, 'archive', copy.archiveFailedTitle, async () => {
-      const familyIds = revisionFamilySessionIds(sessionsRef.current, sessionId);
-      await service.archive(sessionId, { revisionFamily: true });
-      if (activeIdRef.current && familyIds.includes(activeIdRef.current)) {
-        setActiveId(undefined);
-        clearActiveMessages();
-      }
-      for (const id of familyIds) clearSessionRendererState(id);
-      await refreshSessions();
-    });
+    return runSessionRowAction(
+      sessionId,
+      'archive',
+      copy.archiveFailedTitle,
+      async () => {
+        await withAutomaticQueryBlock(sessionId, async (familyIds) => {
+          await service.archive(sessionId, { revisionFamily: true });
+          for (const id of familyIds) clearSessionRendererState(id);
+          await refreshSessions();
+        });
+      },
+      archiveRefusalDescription,
+    );
   }
 
   async function unarchiveSession(sessionId: string) {
@@ -164,9 +243,30 @@ export function createSessionNavigationRowActions(deps: {
     return runSessionRowAction(sessionId, 'delete', copy.deleteFailedTitle, async () => {
       const session = sessionsRef.current.find((entry) => entry.id === sessionId);
       const name = session?.name ?? copy.currentConversation;
+      // Ask the Host how many subtasks the delete would archive. It owns the
+      // removal plan; the renderer's catalog projection lacks the operator
+      // marker and copy state, so a renderer estimate would over-promise (e.g.
+      // claim archival for a parent whose only children are graph operators).
+      // A preview failure is not silence: fall back to an uncertain warning so
+      // the confirm never hides that subtasks may survive. The toast still
+      // reports the real executed count afterwards.
+      let previewSubtaskCount: number | undefined;
+      try {
+        previewSubtaskCount = await service.previewRemoval(sessionId);
+      } catch {
+        previewSubtaskCount = undefined;
+      }
+      const subtaskNote =
+        previewSubtaskCount === undefined
+          ? copy.deleteSubtaskNoteUncertain()
+          : previewSubtaskCount > 0
+            ? copy.deleteSubtaskNote()
+            : undefined;
       const ok = await toastApi.confirm({
         title: copy.deleteTitle(name),
-        description: copy.deleteDescription,
+        description: subtaskNote
+          ? `${copy.deleteDescription} ${subtaskNote}`
+          : copy.deleteDescription,
         confirmLabel: copy.deleteLabel,
         cancelLabel: copy.cancelLabel,
         destructive: true,
@@ -174,12 +274,24 @@ export function createSessionNavigationRowActions(deps: {
       if (!ok) return;
       // The confirm named an archived task, so a restore revokes it. An active
       // task has no such premise to lose.
-      const disposition = await removeSessionFamily(sessionId, {
-        requireArchived: session?.isArchived === true,
-      });
-      await refreshSessions();
+      const { disposition, archivedSubtaskCount } = await withAutomaticQueryBlock(
+        sessionId,
+        async () => {
+          const outcome = await removeSessionFamily(sessionId, {
+            requireArchived: session?.isArchived === true,
+          });
+          await refreshSessions();
+          return outcome;
+        },
+      );
+      // `restored` means nothing was deleted, so no subtask moved either. On a
+      // real delete the count is the Host's executed number, not an estimate.
       if (disposition === 'restored') toastApi.success(copy.deleteRestoredTitle(name));
-      else toastApi.success(copy.deletedTitle(name));
+      else
+        toastApi.success(
+          copy.deletedTitle(name),
+          archivedSubtaskCount > 0 ? copy.deletedSubtaskNote(archivedSubtaskCount) : undefined,
+        );
     });
   }
 
@@ -192,31 +304,30 @@ export function createSessionNavigationRowActions(deps: {
    */
   async function removeSessionFamily(
     sessionId: string,
-    options: { requireArchived: boolean },
-  ): Promise<SessionRemoveDisposition> {
+    options: { requireArchived: boolean; requireArchivedForMs?: number },
+  ): Promise<SessionNavigationRemoveOutcome> {
     // Read before the write: the family comes off the live catalog, which no
     // longer lists it afterwards.
     const familyIds = revisionFamilySessionIds(sessionsRef.current, sessionId);
-    const disposition = await service.remove(sessionId, {
+    const outcome = await service.remove(sessionId, {
       revisionFamily: true,
-      requireArchived: options.requireArchived,
+      ...options,
     });
-    if (disposition === 'restored') return disposition;
-    if (activeIdRef.current && familyIds.includes(activeIdRef.current)) {
-      setActiveId(undefined);
-      clearActiveMessages();
-    }
+    if (outcome.disposition !== 'removed') return outcome;
     for (const id of familyIds) clearSessionRendererState(id);
-    return disposition;
+    return outcome;
   }
 
   /**
-   * Deletes a set of archived tasks in one sweep.
+   * Settings › 已归档任务, sweeping a set of archived tasks in one pass. The one
+   * bulk delete the product has: the rail cannot delete at all, so every target
+   * here is archived by definition, and the premise is asserted anyway so a task
+   * restored between the confirm and the write is kept rather than removed.
    *
-   * Every id takes one path and lands in exactly one outcome. A task still
-   * archived is removed; one restored meanwhile answers `restored` and is kept;
-   * one already gone elsewhere rejects and settles as removed against the
-   * catalog; anything else is an error to explain. The archived premise is
+   * Every id takes one path and lands in exactly one outcome. A task whose
+   * premise still holds is removed; one restored meanwhile answers `restored`
+   * and is kept; one already gone elsewhere rejects and settles as removed
+   * against the catalog; anything else is an error to explain. The premise is
    * asserted where it can be held — inside the Host's compare-and-set (#3050) —
    * rather than against a renderer snapshot that a second window can outdate
    * between the check and the write.
@@ -234,11 +345,16 @@ export function createSessionNavigationRowActions(deps: {
    * No confirm and no toast: the caller owns the wording for a sweep, which is
    * the one thing single-row delete cannot phrase.
    */
-  async function purgeSessions(sessionIds: readonly string[]): Promise<SessionPurgeOutcome> {
+  async function purgeSessions(
+    sessionIds: readonly string[],
+    options: { requireArchivedForMs?: number } = {},
+  ): Promise<SessionPurgeOutcome> {
     const unsettled: string[] = [];
     const restored: string[] = [];
+    const tooRecent: string[] = [];
     let firstFailure: SessionPurgeOutcome['firstFailure'];
     let removed = 0;
+    let archivedSubtasks = 0;
     for (const sessionId of sessionIds) {
       const key = `${sessionId}:delete`;
       if (
@@ -251,9 +367,16 @@ export function createSessionNavigationRowActions(deps: {
       }
       pendingSessionRowActionsRef.current.add(key);
       try {
-        const disposition = await removeSessionFamily(sessionId, { requireArchived: true });
+        const { disposition, archivedSubtaskCount } = await removeSessionFamily(sessionId, {
+          requireArchived: true,
+          ...options,
+        });
         if (disposition === 'restored') restored.push(sessionId);
-        else removed += 1;
+        else if (disposition === 'too_recent') tooRecent.push(sessionId);
+        else {
+          removed += 1;
+          archivedSubtasks += archivedSubtaskCount;
+        }
       } catch (error) {
         unsettled.push(sessionId);
         firstFailure ??= { error, sessionId };
@@ -265,8 +388,10 @@ export function createSessionNavigationRowActions(deps: {
       await refreshSessions();
       return {
         removed,
+        archivedSubtasks,
         remaining: [],
         restored,
+        tooRecent,
         verified: true,
         firstFailure,
       };
@@ -281,8 +406,10 @@ export function createSessionNavigationRowActions(deps: {
     if (!listed) {
       return {
         removed,
+        archivedSubtasks,
         remaining: [],
         restored,
+        tooRecent,
         verified: false,
         firstFailure,
       };
@@ -291,11 +418,264 @@ export function createSessionNavigationRowActions(deps: {
     const remaining = unsettled.filter((sessionId) => present.has(sessionId));
     return {
       removed: removed + (unsettled.length - remaining.length),
+      archivedSubtasks,
       remaining,
       restored,
+      tooRecent,
       verified: true,
       firstFailure,
     };
+  }
+
+  async function purgeArchived(request: ArchivedPurgeRequest): Promise<void> {
+    // Frozen here: what the confirm counts is exactly what the sweep deletes.
+    const sessionIds = [...request.sessionIds];
+    // Measured, and only archived targets, as the sweep will find them. A
+    // failed preview is not silence: the confirm falls back to the note every
+    // bulk delete carries, as a single delete does.
+    let preview: SessionRemovePreviewResult | undefined;
+    try {
+      preview = await service.previewRemovals(sessionIds, {
+        measureBytes: true,
+        requireArchived: true,
+      });
+    } catch {
+      preview = undefined;
+    }
+    if (!request.isCurrent()) return;
+    const count = sessionIds.length;
+    const ok = await toastApi.confirm({
+      title: request.narrowed
+        ? tasksCopy.purgeShownConfirmTitle(count)
+        : tasksCopy.purgeAllConfirmTitle(count),
+      description: [tasksCopy.purgeConfirmBody, ...purgePreviewNotes(preview)].join(' '),
+      confirmLabel: tasksCopy.purgeConfirmAction,
+      cancelLabel: getSettingsSharedCopy(uiLocale).cancel,
+      destructive: true,
+    });
+    if (!ok) return;
+    const outcome = await purgeSessions(
+      sessionIds,
+      request.requireArchivedForMs === undefined
+        ? {}
+        : { requireArchivedForMs: request.requireArchivedForMs },
+    );
+    reportPurge(outcome);
+  }
+
+  /** Only the figures the Host stated, each clause only when it is not zero. */
+  function purgePreviewNotes(preview: SessionRemovePreviewResult | undefined): string[] {
+    if (!preview) return [tasksCopy.purgeSubtaskNote];
+    const notes: string[] = [];
+    if (preview.removedSubtaskCount > 0) {
+      notes.push(tasksCopy.purgeGraphSubtaskNote(preview.removedSubtaskCount));
+    }
+    if (preview.worktreeCount > 0) notes.push(tasksCopy.purgeWorktreeNote(preview.worktreeCount));
+    if (preview.archivableSubtaskCount > 0) {
+      notes.push(tasksCopy.purgeArchivableNote(preview.archivableSubtaskCount));
+    }
+    if (preview.bytes) notes.push(tasksCopy.purgeSizeNote(formatBytes(preview.bytes, uiLocale)));
+    return notes;
+  }
+
+  /**
+   * The person agreed to a number, so a sweep that lands on a smaller one owes
+   * them the whole account. Kept tasks and failures are independent —
+   * reporting one and dropping the other is how a count stops adding up.
+   */
+  function reportPurge(outcome: SessionPurgeOutcome): void {
+    const detail = [
+      outcome.archivedSubtasks > 0 ? tasksCopy.purgedSubtaskNote(outcome.archivedSubtasks) : '',
+      outcome.restored.length > 0 ? tasksCopy.purgeKeptRestored(outcome.restored.length) : '',
+      outcome.tooRecent.length > 0 ? tasksCopy.purgeKeptTooRecent(outcome.tooRecent.length) : '',
+    ].filter(Boolean);
+    if (outcome.verified && outcome.remaining.length === 0) {
+      toastApi.success(
+        tasksCopy.purgedToast(outcome.removed),
+        detail.length > 0 ? detail.join(' ') : undefined,
+      );
+      return;
+    }
+    // A reason beats a count: a task refuses to retire while its turn is still
+    // running, and "N still there" gives the reader nothing to do.
+    const reason = !outcome.verified
+      ? tasksCopy.purgeUnverified
+      : outcome.firstFailure
+        ? localizedShellErrorMessage(outcome.firstFailure.error, copy.actionFallback, uiLocale)
+        : tasksCopy.purgeFailedBody(outcome.remaining.length);
+    toastApi.error(
+      tasksCopy.purgeFailedTitle,
+      [reason, ...detail].join(' '),
+      undefined,
+      outcome.firstFailure ? { sessionId: outcome.firstFailure.sessionId } : undefined,
+    );
+  }
+
+  /**
+   * The rail's multi-select archive.
+   *
+   * Archiving has no disposition to report — a task is archived or the call
+   * failed — so this accounts by count and first failure rather than reusing
+   * the delete sweep's shape, which would carry a `restored` field that can
+   * never be anything but empty.
+   *
+   * A selection can hold a parent picked before its own subtask; the Host
+   * refuses that first call while the subtask is still live. One retry after
+   * the sweep settles the order inside the selection without teaching the rail
+   * about subtask links — and a refusal that was never about ordering fails
+   * once more, exactly as before.
+   *
+   * Like the sweep, it raises no toast per task: one action is one message, and
+   * a run of them is what a sweep exists to avoid.
+   */
+  async function archiveSessions(sessionIds: readonly string[]): Promise<SessionArchiveOutcome> {
+    const familyIds = Array.from(
+      new Set(sessionIds.flatMap((sessionId) => revisionFamilySessionIds(sessionsRef.current, sessionId))),
+    );
+    return withAutomaticQueryBlockOn(familyIds, async () => {
+      let archived = 0;
+      const failures = new Map<string, { error?: unknown }>();
+      const attempt = async (sessionId: string): Promise<void> => {
+        const key = `${sessionId}:archive`;
+        if (
+          Array.from(pendingSessionRowActionsRef.current).some((pending) =>
+            pending.startsWith(`${sessionId}:`),
+          )
+        ) {
+          failures.set(sessionId, {});
+          return;
+        }
+        pendingSessionRowActionsRef.current.add(key);
+        try {
+          const rowFamilyIds = revisionFamilySessionIds(sessionsRef.current, sessionId);
+          await service.archive(sessionId, { revisionFamily: true });
+          for (const id of rowFamilyIds) clearSessionRendererState(id);
+          archived += 1;
+          failures.delete(sessionId);
+        } catch (error) {
+          failures.set(sessionId, { error });
+        } finally {
+          pendingSessionRowActionsRef.current.delete(key);
+        }
+      };
+      for (const sessionId of sessionIds) await attempt(sessionId);
+      for (const sessionId of [...failures.keys()]) await attempt(sessionId);
+      const failed = [...failures.keys()];
+      const firstFailedId = failed.find((sessionId) => failures.get(sessionId)?.error !== undefined);
+      // Once, after the whole sweep. Refreshing per task would re-render the rail
+      // under the user's cursor for every id in the selection.
+      await refreshSessions();
+      return {
+        archived,
+        failed,
+        firstFailure: firstFailedId
+          ? { error: failures.get(firstFailedId)!.error, sessionId: firstFailedId }
+          : undefined,
+      };
+    });
+  }
+
+  /**
+   * The rail's own bulk archive, wording included.
+   *
+   * `archiveSessions` above it stays silent on purpose: it counts, and the
+   * caller words the count. The rail's phrasing belongs to the rail, and this
+   * module is where the feature already holds its copy. Putting it in the
+   * selection hook instead would have made that hook the feature's second
+   * importer of renderer legacy copy, which the architecture check refuses.
+   *
+   * NO CONFIRM, at one row or twenty. Archiving is reversible, the single-row
+   * ⋯ has never asked, and a dialog in front of one of two identical verbs
+   * teaches that the count is what makes an action dangerous rather than the
+   * action. The dialog's one piece of information — where the tasks went — is
+   * kept, as the success toast's description.
+   */
+  async function archiveSelected(sessionIds: readonly string[]): Promise<void> {
+    if (sessionIds.length === 0) return;
+    const outcome = await archiveSessions(sessionIds);
+    if (outcome.failed.length === 0) {
+      toastApi.success(copy.bulkArchivedTitle(outcome.archived), copy.bulkArchiveDescription);
+      return;
+    }
+    toastApi.error(
+      copy.bulkArchiveFailedTitle,
+      outcome.firstFailure
+        ? archiveRefusalDescription(outcome.firstFailure.error) ??
+            localizedShellErrorMessage(outcome.firstFailure.error, copy.actionFallback, uiLocale)
+        : copy.bulkFailedBody(outcome.failed.length),
+      undefined,
+      outcome.firstFailure ? { sessionId: outcome.firstFailure.sessionId } : undefined,
+    );
+  }
+
+  /**
+   * The rail's bulk pin, in one direction for the whole set.
+   *
+   * The direction is the caller's: the menu shows 取消置顶 only when every
+   * picked row is already pinned, so a mixed set pins — which is the one rule
+   * that keeps a set-wide toggle from meaning something different for each row
+   * in it.
+   *
+   * Silent on success. Pinning moves the rows between 置顶 and 最近 in front of
+   * the user, which says it better than a toast, and the single-row pin has
+   * never raised one either.
+   */
+  async function flagSelected(sessionIds: readonly string[], flagged: boolean): Promise<void> {
+    if (sessionIds.length === 0) return;
+    const failed: string[] = [];
+    let firstFailure: { error: unknown; sessionId: string } | undefined;
+    for (const sessionId of sessionIds) {
+      const key = `${sessionId}:flag`;
+      if (
+        Array.from(pendingSessionRowActionsRef.current).some((pending) =>
+          pending.startsWith(`${sessionId}:`),
+        )
+      ) {
+        failed.push(sessionId);
+        continue;
+      }
+      pendingSessionRowActionsRef.current.add(key);
+      try {
+        await service.setFlagged(sessionId, flagged, { revisionFamily: true });
+      } catch (error) {
+        failed.push(sessionId);
+        firstFailure ??= { error, sessionId };
+      } finally {
+        pendingSessionRowActionsRef.current.delete(key);
+      }
+    }
+    // Once, after the whole sweep. Refreshing per task would re-render the rail
+    // under the user's cursor for every id in the set.
+    await refreshSessions();
+    if (failed.length === 0) return;
+    toastApi.error(
+      flagged ? copy.flagFailedTitle : copy.unflagFailedTitle,
+      firstFailure
+        ? localizedShellErrorMessage(firstFailure.error, copy.actionFallback, uiLocale)
+        : copy.bulkFailedBody(failed.length),
+      undefined,
+      firstFailure ? { sessionId: firstFailure.sessionId } : undefined,
+    );
+  }
+
+  /**
+   * Re-file one task into another project, or out of every project.
+   *
+   * The refusals worth explaining — a running Turn, a project that is gone —
+   * arrive as an outcome rather than a thrown error, so the toast can name the
+   * reason instead of falling back to the generic line.
+   */
+  async function moveSessionToProject(sessionId: string, projectId: string | null) {
+    return runSessionRowAction(sessionId, 'move', copy.moveFailedTitle, async () => {
+      const outcome = await service.moveToProject(sessionId, projectId);
+      if (!outcome.ok) {
+        toastApi.error(copy.moveFailedTitle, copy.moveFailures[outcome.code], undefined, {
+          sessionId,
+        });
+        return;
+      }
+      await refreshSessions();
+    });
   }
 
   return {
@@ -303,7 +683,11 @@ export function createSessionNavigationRowActions(deps: {
     archiveSession,
     unarchiveSession,
     renameSession,
+    moveSessionToProject,
     deleteSession,
     purgeSessions,
+    purgeArchived,
+    archiveSelected,
+    flagSelected,
   };
 }

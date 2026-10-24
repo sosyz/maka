@@ -20,7 +20,8 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import net from 'node:net';
-import { expect } from '../../test-helpers.js';
+import { ProxyAgent } from 'undici';
+import { withTimeout } from '@maka/core/test-only/async-primitives';
 import { PROXY_DEFAULTS } from '@maka/core/settings/network-settings';
 import { testProxyConnection } from '../proxy-test.js';
 
@@ -32,8 +33,8 @@ describe('testProxyConnection', () => {
       timeoutMs: 1_000,
     });
 
-    expect(result.ok).toBe(false);
-    expect(result.error ?? '').toMatch(/ECONNREFUSED|fetch failed|bad port|timeout/i);
+    assert.strictEqual(result.ok, false);
+    assert.match(String(result.error ?? ''), /ECONNREFUSED|fetch failed|bad port|timeout/i);
   });
 
   test('does not depend on the ambient global fetch when using the proxy dispatcher', async () => {
@@ -88,14 +89,98 @@ describe('testProxyConnection', () => {
         timeoutMs: 1_000,
       });
 
-      expect(result.ok).toBe(true);
-      expect(result.status).toBe(200);
-      expect(ambientFetchCalled).toBe(false);
+      assert.strictEqual(result.ok, true);
+      assert.strictEqual(result.status, 200);
+      assert.strictEqual(ambientFetchCalled, false);
     } finally {
       globalThis.fetch = originalFetch;
       for (const socket of sockets) socket.destroy();
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
+  });
+
+  test('settles after a successful probe even when the dispatcher close stalls', async (t) => {
+    const sockets = new Set<net.Socket>();
+    const server = net.createServer((socket) => {
+      sockets.add(socket);
+      socket.on('close', () => sockets.delete(socket));
+      socket.on('error', () => sockets.delete(socket));
+
+      let buffer = '';
+      let tunnelEstablished = false;
+      socket.on('data', (chunk) => {
+        buffer += chunk.toString('latin1');
+        const headerEnd = buffer.indexOf('\r\n\r\n');
+        if (headerEnd === -1) return;
+
+        const requestHead = buffer.slice(0, headerEnd);
+        buffer = buffer.slice(headerEnd + 4);
+        if (!tunnelEstablished && requestHead.startsWith('CONNECT ')) {
+          tunnelEstablished = true;
+          socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+          return;
+        }
+
+        socket.end('HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n');
+      });
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', () => resolve());
+    });
+    const address = server.address();
+    assert.ok(address && typeof address === 'object');
+
+    // Reproduce the dispatcher completion failure independently of
+    // Undici/Node version: a graceful close that never settles must not keep
+    // testProxyConnection (and the serialized settings lane it occupies)
+    // pending forever after the probe itself has finished.
+    t.mock.method(ProxyAgent.prototype, 'close', () => new Promise<void>(() => {}));
+
+    try {
+      const result = await withTimeout(
+        testProxyConnection({
+          proxy: {
+            ...PROXY_DEFAULTS,
+            enabled: true,
+            type: 'http',
+            host: '127.0.0.1',
+            port: address.port,
+          },
+          url: 'http://example.com',
+          timeoutMs: 2_000,
+        }),
+        5_000,
+        'testProxyConnection never settled after a stalled dispatcher close',
+      );
+
+      assert.strictEqual(result.ok, true);
+    } finally {
+      for (const socket of sockets) socket.destroy();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  test('destroys the dispatcher when a stalled close outlives the teardown grace', async (t) => {
+    // Reproduce the dispatcher completion failure independently of
+    // Undici/Node version: once the bounded teardown grace expires with the
+    // graceful close still pending, the abandoned dispatcher must be
+    // destroyed instead of leaking.
+    t.mock.method(ProxyAgent.prototype, 'close', () => new Promise<void>(() => {}));
+    const destroyMock = t.mock.method(ProxyAgent.prototype, 'destroy', () => {});
+
+    const result = await withTimeout(
+      testProxyConnection({
+        proxy: { ...PROXY_DEFAULTS, enabled: true, type: 'http', host: '127.0.0.1', port: 1 },
+        url: 'http://example.com',
+        timeoutMs: 1_000,
+      }),
+      5_000,
+      'testProxyConnection never settled after the teardown grace expired',
+    );
+
+    assert.strictEqual(result.ok, false);
+    assert.ok(destroyMock.mock.callCount() > 0);
   });
 
   test('times out when the proxy accepts TCP but never responds', async () => {
@@ -128,8 +213,8 @@ describe('testProxyConnection', () => {
         timeoutMs: 100,
       });
 
-      expect(result.ok).toBe(false);
-      expect(result.error ?? '').toMatch(/timeout|fetch failed/i);
+      assert.strictEqual(result.ok, false);
+      assert.match(String(result.error ?? ''), /timeout|fetch failed/i);
       assert.ok(Date.now() - started < 2_000);
     } finally {
       for (const socket of sockets) socket.destroy();

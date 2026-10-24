@@ -18,14 +18,17 @@
  */
 
 import { join } from 'node:path';
+import { popupNativeMenu } from './native-menu.js';
 import { arch as osArch, homedir, release as osRelease } from 'node:os';
 import { app, ipcMain, shell } from 'electron';
 import { resolveProjectGitInfo } from '@maka/runtime/system-prompt/project-context';
 import type { createMainWindowController } from './main-window.js';
 import type { ProjectRootController } from './project-root-controller.js';
 import { resolveOpenPath, type OpenPathResult } from './open-path-guard.js';
+import type { ManagedTaskDirectoryClass } from './managed-task-directory.js';
 import { getE2eFixtureState, type resolveE2eFixture } from './e2e-fixture.js';
 import type { resolveBuildInfo } from './build-info.js';
+import type { DesktopUpdateChannel } from './app-update-attestation.js';
 import type {
   AppUpdateInstallRequest,
   AppUpdateService,
@@ -47,9 +50,16 @@ export interface AppIpcDeps {
   getProjectRoot(sessionId: unknown): Promise<string>;
   workspaceRoot: string;
   buildInfo: BuildInfo;
+  updateChannel: DesktopUpdateChannel;
   e2eFixture: E2eFixture;
   projectManagement: ProjectManagementService;
   allowLocalProjectPaths?: boolean;
+  /**
+   * Classifies the directory a Session's workspace is bound to. Absent on
+   * Hosts that cannot manage Client task directories — the field is then
+   * simply not reported.
+   */
+  getSessionTaskDirectoryBinding?(sessionId: string): Promise<ManagedTaskDirectoryClass | undefined>;
 }
 
 export interface AppClientIpcDeps {
@@ -63,12 +73,20 @@ export function registerAppClientIpc(
   targetIpc: Pick<ReconnectableReadIpcMain, 'handle'> = ipcMain,
 ): void {
   const { mainWindowController, e2eFixture, updateService } = deps;
+  targetIpc.handle('window:popupMenu', (event, input: unknown) => {
+    if (!mainWindowController.isMainRenderer(event.sender) || event.senderFrame !== event.sender.mainFrame) {
+      throw new Error('Native menus require the main renderer');
+    }
+    const window = mainWindowController.browserWindow();
+    return window ? popupNativeMenu(window, input) : null;
+  });
   targetIpc.handle('window:setTitlebarControlsVisible', (event, visible: unknown): void => {
     mainWindowController.setTitlebarControlsVisible(event.sender, visible);
   });
-  targetIpc.handle('window:notifyRendererReady', (): void => {
-    mainWindowController.notifyRendererReady();
-  });
+  // `window:notifyRendererReady` is registered directly on ipcMain by
+  // early-window.js: it is a window-lifecycle signal that must exist before
+  // this scoped router does, or the first React commit can outrun it.
+
   targetIpc.handle('window:setThemeSource', (event, themePref: unknown): void => {
     mainWindowController.setThemeSource(event.sender, themePref);
   });
@@ -89,7 +107,7 @@ export function registerAppIpc(
   deps: AppIpcDeps,
   targetIpc: ReconnectableReadIpcMain = ipcMain,
 ): void {
-  const { projectRoot, workspaceRoot, buildInfo, e2eFixture } = deps;
+  const { projectRoot, workspaceRoot, buildInfo, updateChannel, e2eFixture } = deps;
   const allowLocalProjectPaths = deps.allowLocalProjectPaths !== false;
   // Call-time read of the shared project-root authority: every handler must
   // observe the latest selection, not a snapshot taken at registration.
@@ -120,13 +138,17 @@ export function registerAppIpc(
         : { isGitRepo: false },
       buildMode: buildInfo.mode,
       buildCommit: buildInfo.commit,
+      updateChannel,
     };
   });
   handleReconnectableRead(targetIpc, 'projects:getSnapshot', () =>
     deps.projectManagement.getSnapshot(),
   );
-  targetIpc.handle('projects:add', (_event, options?: { select?: unknown }) =>
-    deps.projectManagement.add({ select: options?.select !== false }));
+  targetIpc.handle('projects:add', (_event, options?: { select?: unknown; name?: unknown }) =>
+    deps.projectManagement.add({
+      select: options?.select !== false,
+      ...(options?.name === undefined ? {} : { name: requireProjectName(options.name) }),
+    }));
   handleReconnectableRead(targetIpc, 'projects:directoryRoots', () =>
     deps.projectManagement.directoryRoots());
   handleReconnectableRead(targetIpc, 'projects:listDirectory', (_event, input: unknown) =>
@@ -167,6 +189,10 @@ export function registerAppIpc(
     return {
       projectPath,
       projectGit: await resolveProjectGitInfo(projectPath),
+      // An optional classification: its failure must not take down the
+      // project and Git info this read exists to return.
+      taskDirectory: await deps.getSessionTaskDirectoryBinding?.(sessionId)
+        .catch(() => undefined),
     };
   });
   targetIpc.handle('app:openPath', async (_event, key: string, sessionId: unknown): Promise<OpenPathResult> => {
@@ -209,4 +235,20 @@ function isAppUpdateInstallRequest(input: unknown): input is AppUpdateInstallReq
     input !== null &&
     'allowInterruptActiveTasks' in input &&
     typeof input.allowInterruptActiveTasks === 'boolean';
+}
+
+/**
+ * A project name the user typed in the New project dialog.
+ *
+ * Bounded the same way the catalog's own validation is: a name is a label, not
+ * a document. Rejecting rather than silently truncating keeps the dialog's
+ * promise — what you typed is what the project is called. The service trims and
+ * treats a blank name as "no name given", so this only has to reject a
+ * non-string.
+ */
+function requireProjectName(value: unknown): string {
+  if (typeof value !== 'string' || value.length > 200 || /[\u0000-\u001f\u007f]/u.test(value)) {
+    throw new TypeError('Invalid project name.');
+  }
+  return value;
 }

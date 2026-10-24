@@ -18,6 +18,11 @@
  */
 
 import type {
+  ModelCallUsageBuckets,
+  ModelCallUsageLogs,
+  ModelCallUsageSummary,
+} from '@maka/core/model-call-usage-projection';
+import type {
   PricingConfig,
   UsageBucket,
   UsageGroupBy,
@@ -25,6 +30,8 @@ import type {
   UsageQuery,
   UsageSummaryV2,
 } from '@maka/core/usage-stats/types';
+import type { UsageScreenRequest, UsageScreenResult } from '@maka/core/settings';
+import { createUsageScreenReader } from './usage-screen.js';
 import { throwDeduplicatedFailures } from './failure-utils.js';
 import {
   createSqliteModelCallLedger,
@@ -33,8 +40,9 @@ import {
   ModelCallLedgerClosedError,
   ModelCallLedgerPublicationError,
   type ModelCallLedger,
-  type ModelCallLedgerPage,
   type ModelCallLedgerReader,
+  type RunSettlementCoverage,
+  type UsageUnknownModelCallRecord,
 } from './model-call-ledger.js';
 import {
   PricingCommitUnknownError,
@@ -74,6 +82,7 @@ const writerOpeningByLease = new WeakMap<object, Promise<InteractiveUsageStoresW
 
 export interface TelemetryIndexReader {
   summary(query: UsageQuery): Promise<UsageSummaryV2>;
+  toolSummary(query: UsageQuery): Promise<{ requests: number; durationMs: number }>;
   buckets(query: UsageQuery, groupBy: UsageGroupBy): Promise<UsageBucket[]>;
   logs(
     query: UsageQuery,
@@ -98,20 +107,46 @@ export interface TelemetryIndexWriter extends TelemetryIndexReader {
  * synchronous store beneath it — because every authority read goes through the
  * storage-root lease.
  */
+/** One Usage answer from the canonical ledger, with the rows it could not read. */
+export interface ModelCallLedgerResult<T> {
+  readonly projection: T;
+  readonly unreadableRecords: number;
+}
+
 export interface ModelCallIndexReader {
-  modelCallAttempts(
-    range: {
-      readonly from: number;
-      readonly to: number;
-    },
-    sessionId?: string,
-  ): Promise<ModelCallLedgerPage>;
+  modelCallSummary(
+    query: UsageQuery,
+    now: number,
+  ): Promise<ModelCallLedgerResult<ModelCallUsageSummary>>;
+  modelCallBuckets(
+    query: UsageQuery,
+    groupBy: UsageGroupBy,
+    now: number,
+  ): Promise<ModelCallLedgerResult<ModelCallUsageBuckets>>;
+  modelCallLogs(
+    query: UsageQuery,
+    now: number,
+    offset: number,
+    limit: number,
+  ): Promise<ModelCallLedgerResult<ModelCallUsageLogs>>;
+  /**
+   * What the settlement window itself left unsettled (#5890) — what hosted
+   * execution settlement checks instead of the ledger-wide coverage, which
+   * must also count rows no run owns.
+   */
+  modelCallRunSettlementCoverage(from: number, to: number): Promise<RunSettlementCoverage>;
 }
 
 export interface ModelCallIndexWriter extends ModelCallIndexReader {
   catchUpModelCallProjection(
     input?: CatchUpModelCallProjectionInput,
   ): Promise<CatchUpModelCallProjectionResult>;
+  /**
+   * Records one usage-unknown row for a model call outside any AgentRun
+   * (#5691) — auxiliary Host calls the event stream cannot project. The owning
+   * Session, when known, is published after the write.
+   */
+  recordUsageUnknownAttempt(record: UsageUnknownModelCallRecord): Promise<void>;
 }
 
 export interface PricingAuthorityReader {
@@ -124,6 +159,7 @@ export interface PricingAuthorityWriter extends PricingAuthorityReader {
 }
 
 export interface InteractiveUsageStoresReader {
+  readUsageScreen(input: UsageScreenRequest): Promise<UsageScreenResult>;
   readonly kind: 'interactive';
   readonly access: 'read';
   readonly [readerBrand]: true;
@@ -134,6 +170,7 @@ export interface InteractiveUsageStoresReader {
 }
 
 export interface InteractiveUsageStoresWriter {
+  readUsageScreen(input: UsageScreenRequest): Promise<UsageScreenResult>;
   readonly kind: 'interactive';
   readonly access: 'write';
   readonly [writerBrand]: true;
@@ -258,12 +295,20 @@ export async function openInteractiveUsageStoresForRead(
     openRepos(root, false),
   );
   let closed = false;
+  let barrier: Promise<void> = Promise.resolve();
   let closePromise: Promise<void> | undefined;
   const run = <T>(operation: () => T | Promise<T>): Promise<T> => {
     if (closed) return Promise.reject(new InteractiveUsageStoresClosedError());
-    return runWithStorageRootLease(lease, 'interactive', 'read', async () => operation());
+    const admitted = runWithStorageRootLease(lease, 'interactive', 'read', async () => operation());
+    const settled = admitted.then(
+      () => undefined,
+      () => undefined,
+    );
+    barrier = Promise.all([barrier, settled]).then(() => undefined);
+    return admitted;
   };
   const stores: InteractiveUsageStoresReader = {
+    readUsageScreen: (input) => run(() => repos.screen.read(input)),
     kind: 'interactive',
     access: 'read',
     [readerBrand]: true,
@@ -273,7 +318,11 @@ export async function openInteractiveUsageStoresForRead(
     close: () => {
       if (closePromise) return closePromise;
       closed = true;
-      closePromise = closeRepos(repos.telemetry, repos.modelCalls, repos.pricing);
+      const accepted = barrier;
+      closePromise = accepted.then(async () => {
+        repos.screen.close();
+        await closeRepos(repos.telemetry, repos.modelCalls, repos.pricing);
+      });
       return closePromise;
     },
   };
@@ -291,7 +340,13 @@ export async function openInteractiveUsageStoresForWrite(
   if (opening) return opening;
   const pending = runWithStorageRootLease(lease, 'interactive', 'write', async (root) => {
     const repos = await openRepos(root, true);
-    const stores = createWriterFacade(lease, repos.telemetry, repos.modelCalls, repos.pricing);
+    const stores = createWriterFacade(
+      lease,
+      repos.telemetry,
+      repos.modelCalls,
+      repos.pricing,
+      repos.screen,
+    );
     writers.add(stores);
     writerByLease.set(lease, stores);
     return stores;
@@ -307,14 +362,19 @@ export async function openInteractiveUsageStoresForWrite(
 async function openRepos(
   root: string,
   createIfMissing: boolean,
-): Promise<{ telemetry: TelemetryRepo; modelCalls: ModelCallLedger; pricing: PricingStore }> {
+): Promise<{
+  telemetry: TelemetryRepo;
+  modelCalls: ModelCallLedger;
+  pricing: PricingStore;
+  screen: ReturnType<typeof createUsageScreenReader>;
+}> {
   const telemetry = createSqliteTelemetryRepo(root, { createIfMissing, managePricing: false });
   await telemetry.load();
   const modelCalls = createSqliteModelCallLedger(root);
   const pricing = createSqlitePricingStore(root, { createIfMissing });
   try {
     await pricing.load();
-    return { telemetry, modelCalls, pricing };
+    return { telemetry, modelCalls, pricing, screen: createUsageScreenReader(root) };
   } catch (error) {
     const closed = await Promise.allSettled([
       telemetry.close(),
@@ -332,6 +392,7 @@ function createWriterFacade(
   telemetry: TelemetryRepo,
   modelCalls: ModelCallLedger,
   pricing: PricingStore,
+  screen: ReturnType<typeof createUsageScreenReader>,
 ): InteractiveUsageStoresWriter {
   const run = <T>(operation: () => T | Promise<T>): Promise<T> =>
     runWithStorageRootLease(lease, 'interactive', 'write', async () => operation());
@@ -396,7 +457,13 @@ function createWriterFacade(
     });
   const read = <T>(operation: () => T): Promise<T> => {
     assertOpen();
-    return run(operation);
+    const admitted = Promise.resolve().then(() => run(operation));
+    const settled = admitted.then(
+      () => undefined,
+      () => undefined,
+    );
+    barrier = Promise.all([barrier, settled]).then(() => undefined);
+    return admitted;
   };
 
   const beginDrain = (): Promise<void> => {
@@ -444,16 +511,19 @@ function createWriterFacade(
       .finally(() => {
         state = 'closed';
         sessionUsageChangeListeners.clear();
+        screen.close();
       });
     return closePromise;
   };
 
   const stores: InteractiveUsageStoresWriter = {
+    readUsageScreen: (input) => read(() => screen.read(input)),
     kind: 'interactive',
     access: 'write',
     [writerBrand]: true,
     telemetry: {
       summary: (query) => read(() => telemetry.summary(query)),
+      toolSummary: (query) => read(() => telemetry.toolSummary(query)),
       buckets: (query, groupBy) => read(() => telemetry.buckets(query, groupBy)),
       logs: (query, offset, limit) => read(() => telemetry.logs(query, offset, limit)),
       toolLogs: (query, offset, limit) => read(() => telemetry.toolLogs(query, offset, limit)),
@@ -462,11 +532,21 @@ function createWriterFacade(
       recordLlmCall: (record) =>
         admitSessionUsageMutation(record.sessionId, () => telemetry.insertLlmCall(record)),
       recordToolInvocation: (record) =>
-        admit(() => run(() => telemetry.insertToolInvocation(record))),
+        admitSessionUsageMutation(record.sessionId, () => telemetry.insertToolInvocation(record)),
     },
     modelCalls: {
-      modelCallAttempts: (range, sessionId) => read(() => modelCalls.read(range, sessionId)),
+      modelCallSummary: (query, now) => read(() => modelCalls.summary(query, now)),
+      modelCallBuckets: (query, groupBy, now) =>
+        read(() => modelCalls.buckets(query, groupBy, now)),
+      modelCallLogs: (query, now, offset, limit) =>
+        read(() => modelCalls.logs(query, now, offset, limit)),
+      modelCallRunSettlementCoverage: (from, to) =>
+        read(() => modelCalls.runSettlementCoverage(from, to)),
       catchUpModelCallProjection: admitModelCallProjectionCatchUp,
+      recordUsageUnknownAttempt: (record) =>
+        admitSessionUsageMutation(record.sessionId, () =>
+          modelCalls.recordUsageUnknownAttempt(record),
+        ),
     },
     pricing: {
       snapshot: () => read(() => pricing.snapshot()),
@@ -497,6 +577,7 @@ function telemetryReader(
 ): Readonly<TelemetryIndexReader> {
   return Object.freeze({
     summary: (query: UsageQuery) => run(() => repo.summary(query)),
+    toolSummary: (query: UsageQuery) => run(() => repo.toolSummary(query)),
     buckets: (query: UsageQuery, groupBy: UsageGroupBy) => run(() => repo.buckets(query, groupBy)),
     logs: (query: UsageQuery, offset?: number, limit?: number) =>
       run(() => repo.logs(query, offset, limit)),
@@ -512,10 +593,13 @@ function modelCallReader(
   run: <T>(operation: () => T | Promise<T>) => Promise<T>,
 ): Readonly<ModelCallIndexReader> {
   return Object.freeze({
-    modelCallAttempts: (
-      range: { readonly from: number; readonly to: number },
-      sessionId?: string,
-    ) => run(() => ledger.read(range, sessionId)),
+    modelCallSummary: (query: UsageQuery, now: number) => run(() => ledger.summary(query, now)),
+    modelCallBuckets: (query: UsageQuery, groupBy: UsageGroupBy, now: number) =>
+      run(() => ledger.buckets(query, groupBy, now)),
+    modelCallLogs: (query: UsageQuery, now: number, offset: number, limit: number) =>
+      run(() => ledger.logs(query, now, offset, limit)),
+    modelCallRunSettlementCoverage: (from: number, to: number) =>
+      run(() => ledger.runSettlementCoverage(from, to)),
   });
 }
 

@@ -17,6 +17,7 @@
  * under the License.
  */
 
+import { deferred } from '@maka/core/test-only/async-primitives';
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 import type { SessionEvent } from '@maka/core/events';
@@ -34,12 +35,35 @@ import {
   type SubscriptionFrame,
 } from '@maka/runtime-host/protocol';
 import { resolveRuntimeHostCliTarget } from '../runtime-host-cli-context.js';
+import { RunQuestionAvailable } from '../run-session-result.js';
 import { createRuntimeHostRunContext, runRuntimeHostTextCli } from '../runtime-host-run-command.js';
 import type { RuntimeHostMakaSessionDriver } from '../runtime-host-session-driver.js';
 import type { MakaRunContextInput, MakaRunOutcome } from '../run-command-core.js';
 import type { MakaTranscriptReplacementReason } from '../session-driver.js';
 
 describe('Runtime Host maka run adapter', () => {
+  test('preserves a non-user trigger through the production run adapter', async () => {
+    const fixture = runFixture({});
+    const session = await fixture.context.runtime.createSession({
+      cwd: '/workspace',
+      llmConnectionSlug: 'openai-main',
+      model: 'gpt-5',
+      permissionMode: 'ask',
+    });
+
+    await collect(
+      fixture.context.runtime.sendMessage(session.id, {
+        turnId: 'turn-activation',
+        text: 'Inspect the workspace',
+        origin: { kind: 'cloud_activation', activationId: 'activation-1' },
+      }),
+    );
+
+    assert.deepEqual(fixture.preparedOrigins, [
+      { kind: 'cloud_activation', activationId: 'activation-1' },
+    ]);
+  });
+
   test('stops before context creation when CLI preflight finds a confirmed blocker', async () => {
     const stderr: string[] = [];
     let contextCreations = 0;
@@ -237,7 +261,76 @@ describe('Runtime Host maka run adapter', () => {
     assert.equal(stderr.join(''), 'maka run: Turn failed\n');
   });
 
-  test('returns exit code 1 when a same-step sibling succeeds after a sandbox failure', async () => {
+  test('returns the Session ID and terminal failure for --json', async () => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const fixture = runFixture({ turnEvents: failedEvents('turn-1', 'provider_failure') });
+    const exit = await runFixtureCommand(
+      fixture,
+      ['fail once', '--json'],
+      (text) => stdout.push(text),
+      (text) => stderr.push(text),
+    );
+    assert.equal(exit, 1);
+    assert.deepEqual(JSON.parse(stdout.join('')), {
+      sessionId: 'session-created',
+      status: 'failed',
+      error: 'Turn failed',
+    });
+    assert.equal(stderr.join(''), '');
+  });
+
+  test('detached admission leaves early interactions unanswered', async () => {
+    for (const request of [
+      {
+        kind: 'sandbox_boundary' as const,
+        expansion: { network: { enabled: true as const } },
+        justification: 'test',
+      },
+      pendingQuestion('turn-1').request,
+      pendingForm('turn-1').request,
+      pendingPermission('turn-1').request,
+    ]) {
+      const gate = deferred<void>();
+      const preparing = deferred<void>();
+      const fixture = runFixture({
+        prepareGate: gate.promise,
+        onPrepareStarted: () => preparing.resolve(),
+      });
+      const context = fixture.createContext({
+        workspaceRoot: '/data',
+        cwd: '/workspace',
+        noWait: true,
+      });
+      try {
+        const sending = collect(
+          context.runtime.sendMessage('session-created', { turnId: 'turn-1', text: 'go' }),
+        );
+        await preparing.promise;
+        fixture.publishPendingInteraction({
+          schemaVersion: 1,
+          sessionId: 'session-created',
+          turnId: 'turn-1',
+          runId: 'run-1',
+          interactionId: 'early',
+          revision: 1,
+          status: 'pending',
+          outcome: null,
+          request,
+        });
+        await Promise.resolve();
+        gate.resolve();
+        await sending;
+        assert.deepEqual(fixture.sandboxResponses, [], request.kind);
+        assert.deepEqual(fixture.exactTurnStops, [], request.kind);
+      } finally {
+        gate.resolve();
+        await context.close();
+      }
+    }
+  });
+
+  test('honors Runtime completion after a same-step tool failure', async () => {
     const stdout: string[] = [];
     const stderr: string[] = [];
     const fixture = runFixture({
@@ -250,15 +343,12 @@ describe('Runtime Host maka run adapter', () => {
       (text) => stderr.push(text),
     );
 
-    assert.equal(exitCode, 1);
-    assert.equal(stdout.join(''), '');
-    assert.equal(
-      stderr.join(''),
-      'maka run: sandbox boundary expansion is unavailable in non-interactive mode\n',
-    );
+    assert.equal(exitCode, 0);
+    assert.equal(stdout.join(''), 'Incomplete answer\n');
+    assert.equal(stderr.join(''), '');
   });
 
-  test('returns exit code 1 when a denied boundary request follows a sandbox failure', async () => {
+  test('honors Runtime completion after a rejected boundary request', async () => {
     const stdout: string[] = [];
     const stderr: string[] = [];
     const fixture = runFixture({
@@ -277,15 +367,77 @@ describe('Runtime Host maka run adapter', () => {
       (text) => stderr.push(text),
     );
 
-    assert.equal(exitCode, 1);
-    assert.equal(stdout.join(''), '');
-    assert.equal(
-      stderr.join(''),
-      'maka run: sandbox boundary expansion is unavailable in non-interactive mode\n',
-    );
+    assert.equal(exitCode, 0);
+    assert.equal(stdout.join(''), 'Boundary was not widened\n');
+    assert.equal(stderr.join(''), '');
   });
 
-  test('returns exit code 1 when reconnect restores a missed sandbox failure', async () => {
+  test('preserves the final answer after an unrelated tool succeeds', async () => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const fixture = runFixture({
+      turnEvents: sandboxBoundaryEvents(
+        'turn-1',
+        'step-1',
+        'step-2',
+        'Boundary was not widened',
+        'tool_search',
+      ),
+    });
+    const exitCode = await runFixtureCommand(
+      fixture,
+      ['request inaccessible work'],
+      (text) => stdout.push(text),
+      (text) => stderr.push(text),
+    );
+
+    assert.equal(exitCode, 0);
+    assert.equal(stdout.join(''), 'Boundary was not widened\n');
+    assert.equal(stderr.join(''), '');
+  });
+
+  test('honors live completion without matching tool retries', async () => {
+    const fixture = runFixture({
+      turnEvents: sandboxBoundaryEvents('turn-1', 'step-1', 'step-2', 'Partial answer', 'Read'),
+    });
+
+    const exitCode = await runFixtureCommand(fixture, ['accept same-name different target']);
+
+    assert.equal(exitCode, 0);
+  });
+
+  test('honors durable completion without matching tool retries', async () => {
+    const fixture = runFixture({
+      graph: true,
+      finalMessages: sandboxBoundaryMessages('step-1', 'step-2', 'Read'),
+    });
+
+    const exitCode = await runFixtureCommand(fixture, [
+      'accept durable same-name different target',
+      '--graph',
+    ]);
+
+    assert.equal(exitCode, 0);
+  });
+
+  test('honors Runtime completion after denied widening and later tool success', async () => {
+    const stderr: string[] = [];
+    const fixture = runFixture({
+      turnEvents: deniedWideningEvents('turn-1'),
+    });
+
+    const exitCode = await runFixtureCommand(
+      fixture,
+      ['accept post-denial success'],
+      () => {},
+      (text) => stderr.push(text),
+    );
+
+    assert.equal(exitCode, 0);
+    assert.equal(stderr.join(''), '');
+  });
+
+  test('reconnected tool failure does not override Runtime completion', async () => {
     let publishReplacement = () => {};
     const fixture = runFixture({
       turnEvents: eventsAfterTranscriptReplacement(() => publishReplacement()),
@@ -299,17 +451,75 @@ describe('Runtime Host maka run adapter', () => {
 
     const exitCode = await runFixtureCommand(fixture, ['resume protected work']);
 
-    assert.equal(exitCode, 1);
+    assert.equal(exitCode, 0);
   });
 
-  test('returns exit code 1 when one retry follows two sandbox failures', async () => {
+  test('prints the transcript answer when the live stream never carried one', async () => {
+    const stdout: string[] = [];
+    let publishReplacement = () => {};
+    const fixture = runFixture({
+      turnEvents: eventsWithoutStreamedAnswer(() => publishReplacement()),
+    });
+    publishReplacement = () =>
+      fixture.publishTranscriptReplacement(
+        'turn-1',
+        [
+          {
+            type: 'assistant',
+            id: 'assistant-1',
+            turnId: 'turn-1',
+            ts: 1,
+            text: 'Answer only the transcript saw',
+            modelId: 'gpt-5',
+          },
+        ],
+        'reconnect',
+      );
+
+    const exitCode = await runFixtureCommand(fixture, ['reattach'], (text) => stdout.push(text));
+
+    assert.equal(exitCode, 0);
+    assert.equal(stdout.join(''), 'Answer only the transcript saw\n');
+  });
+
+  test('prints the answer when a durable transcript read lands after it', async () => {
+    const stdout: string[] = [];
+    let publishReplacement = () => {};
+    const fixture = runFixture({
+      turnEvents: eventsWithLateTranscriptRead(() => publishReplacement()),
+    });
+    publishReplacement = () =>
+      fixture.publishTranscriptReplacement(
+        'turn-1',
+        [
+          {
+            type: 'assistant',
+            id: 'assistant-step-1',
+            turnId: 'turn-1',
+            ts: 1,
+            text: 'Reading the file',
+            modelId: 'gpt-5',
+          },
+          storedToolCall('turn-1', 'tool-2', 'step-1', 1),
+          successfulToolResult('turn-1', 2),
+        ],
+        'reconcile',
+      );
+
+    const exitCode = await runFixtureCommand(fixture, ['answer once'], (text) => stdout.push(text));
+
+    assert.equal(exitCode, 0);
+    assert.equal(stdout.join(''), 'Host answer\n');
+  });
+
+  test('honors Runtime completion after multiple tool failures', async () => {
     const fixture = runFixture({
       turnEvents: multipleSandboxFailureEvents('turn-1'),
     });
 
     const exitCode = await runFixtureCommand(fixture, ['retry one blocked operation']);
 
-    assert.equal(exitCode, 1);
+    assert.equal(exitCode, 0);
   });
 
   test('returns exit code 0 when the final Graph Turn completes', async () => {
@@ -323,31 +533,36 @@ describe('Runtime Host maka run adapter', () => {
     assert.equal(stdout.join(''), 'Final graph answer\n');
   });
 
-  test('returns exit code 0 when a root Graph boundary failure recovers', async () => {
+  test('honors Graph completion after a root tool failure', async () => {
     const stdout: string[] = [];
+    const stderr: string[] = [];
     const fixture = runFixture({
       graph: true,
       turnEvents: sandboxBoundaryEvents('turn-1', 'step-1', 'step-2', 'Recovered answer'),
     });
-    const exitCode = await runFixtureCommand(fixture, ['recover once', '--graph'], (text) =>
-      stdout.push(text),
+    const exitCode = await runFixtureCommand(
+      fixture,
+      ['recover once', '--graph'],
+      (text) => stdout.push(text),
+      (text) => stderr.push(text),
     );
 
     assert.equal(exitCode, 0);
     assert.equal(stdout.join(''), 'Final graph answer\n');
+    assert.equal(stderr.join(''), '');
   });
 
-  test('returns exit code 1 when a same-step Graph sibling succeeds after a sandbox failure', async () => {
+  test('honors Graph completion after a same-step tool failure', async () => {
     const fixture = runFixture({
       graph: true,
       finalMessages: sandboxBoundaryMessages('step-1', 'step-1'),
     });
     const exitCode = await runFixtureCommand(fixture, ['run parallel tools', '--graph']);
 
-    assert.equal(exitCode, 1);
+    assert.equal(exitCode, 0);
   });
 
-  test('returns exit code 1 when a denied Graph boundary request follows a sandbox failure', async () => {
+  test('honors Graph completion after a denied boundary request', async () => {
     const stdout: string[] = [];
     const fixture = runFixture({
       graph: true,
@@ -359,11 +574,11 @@ describe('Runtime Host maka run adapter', () => {
       (text) => stdout.push(text),
     );
 
-    assert.equal(exitCode, 1);
-    assert.equal(stdout.join(''), '');
+    assert.equal(exitCode, 0);
+    assert.equal(stdout.join(''), 'Final graph answer\n');
   });
 
-  test('returns exit code 1 when one Graph retry follows two sandbox failures', async () => {
+  test('honors Graph completion after multiple tool failures', async () => {
     const fixture = runFixture({
       graph: true,
       finalMessages: multipleSandboxFailureMessages(),
@@ -371,10 +586,10 @@ describe('Runtime Host maka run adapter', () => {
 
     const exitCode = await runFixtureCommand(fixture, ['retry one blocked operation', '--graph']);
 
-    assert.equal(exitCode, 1);
+    assert.equal(exitCode, 0);
   });
 
-  test('returns exit code 1 when the final Graph Turn fails', async () => {
+  test('returns the stored Graph failure class when no original message exists', async () => {
     const stderr: string[] = [];
     const fixture = runFixture({
       graph: true,
@@ -388,7 +603,7 @@ describe('Runtime Host maka run adapter', () => {
     );
 
     assert.equal(exitCode, 1);
-    assert.equal(stderr.join(''), 'maka run: Agent Graph final Turn failed\n');
+    assert.equal(stderr.join(''), 'maka run: provider_failure\n');
   });
 
   test('waits for Host-started graph supervisor Turns before returning', async () => {
@@ -437,7 +652,7 @@ describe('Runtime Host maka run adapter', () => {
     assert.equal(observed.at(-1)?.finalOutput, 'Final graph answer');
   });
 
-  test('reports a recovered sandbox boundary from live and durable Turns', async () => {
+  test('keeps the sandbox boundary unresolved across live and durable Turns', async () => {
     const live = await observeFixtureOutcome({
       turnEvents: sandboxBoundaryEvents('turn-1', 'step-1', 'step-2', 'Recovered answer'),
     });
@@ -446,8 +661,8 @@ describe('Runtime Host maka run adapter', () => {
       finalMessages: sandboxBoundaryMessages('step-1', 'step-2'),
     });
 
-    assert.equal(live.sandboxBoundary, 'recovered');
-    assert.equal(durable.sandboxBoundary, 'recovered');
+    assert.equal(live.sandboxBoundary, 'unresolved');
+    assert.equal(durable.sandboxBoundary, 'unresolved');
   });
 
   test('leaves sandbox failures unresolved when their provider steps are unavailable', async () => {
@@ -463,7 +678,7 @@ describe('Runtime Host maka run adapter', () => {
     assert.equal(durable.sandboxBoundary, 'unresolved');
   });
 
-  test('returns a recovered boundary to unresolved after a later sandbox failure', async () => {
+  test('keeps the boundary unresolved across interleaved successes and a later sandbox failure', async () => {
     const outcome = await observeFixtureOutcome({
       turnEvents: sandboxFailureAfterRecoveryEvents('turn-1'),
     });
@@ -484,6 +699,56 @@ describe('Runtime Host maka run adapter', () => {
     assert.equal(durable.failure?.class, 'aborted');
   });
 
+  test('observes a resumed Host Turn through the same outcome path as a fresh Turn', async () => {
+    const observed: MakaRunOutcome[] = [];
+    const fixture = runFixture({ observed, resumeReady: true });
+    const session = await fixture.context.runtime.createSession({
+      cwd: '/workspace',
+      llmConnectionSlug: 'openai-main',
+      model: 'gpt-5',
+      permissionMode: 'ask',
+    });
+
+    assert.ok(fixture.context.runtime.resumeLatest);
+    const resumed = await fixture.context.runtime.resumeLatest(session.id);
+    assert.ok(resumed);
+    await collect(resumed);
+
+    assert.equal(observed.length, 1);
+    assert.equal(observed[0]?.outcomeId, 'run-resumed');
+    assert.equal(observed[0]?.status, 'completed');
+    assert.equal(observed[0]?.finalOutput, 'Resumed answer');
+  });
+
+  test('stops a resumed Host Turn if cancellation races its start', async () => {
+    const resumeStarted = deferred<void>();
+    const resumeGate = deferred<void>();
+    const fixture = runFixture({
+      resumeReady: true,
+      resumeGate: resumeGate.promise,
+      onResumeStarted: () => resumeStarted.resolve(),
+    });
+    const session = await fixture.context.runtime.createSession({
+      cwd: '/workspace',
+      llmConnectionSlug: 'openai-main',
+      model: 'gpt-5',
+      permissionMode: 'ask',
+    });
+    assert.ok(fixture.context.runtime.resumeLatest);
+    const resumed = await fixture.context.runtime.resumeLatest(session.id);
+    assert.ok(resumed);
+    const draining = collect(resumed);
+    await resumeStarted.promise;
+
+    await fixture.context.runtime.stopSession(session.id);
+    resumeGate.resolve();
+    await draining;
+
+    assert.deepEqual(fixture.exactTurnStops, [
+      { sessionId: 'session-created', turnId: 'turn-resumed', runId: 'run-resumed' },
+    ]);
+  });
+
   test('classifies live and durable step-cap failures equally', async () => {
     const live = await observeFixtureOutcome({
       turnEvents: completionEvents('turn-1', 'step_limit'),
@@ -497,15 +762,6 @@ describe('Runtime Host maka run adapter', () => {
     assert.equal(live.failure?.class, 'tool_step_cap_reached');
     assert.equal(durable.status, 'failed');
     assert.equal(durable.failure?.class, 'tool_step_cap_reached');
-  });
-
-  test('classifies a standalone context-budget completion as failed', async () => {
-    const outcome = await observeFixtureOutcome({
-      turnEvents: completionEvents('turn-1', 'context_budget_exhausted'),
-    });
-
-    assert.equal(outcome.status, 'failed');
-    assert.equal(outcome.failure?.class, 'context_budget_exhausted');
   });
 
   test('uses the latest durable terminal state for a Graph Turn', async () => {
@@ -633,6 +889,7 @@ describe('Runtime Host maka run adapter', () => {
           providerType: 'openai' as const,
           enabled: true,
           enabledModelIds: ['gpt-5'],
+          catalogEntries: [],
           models: [{ id: 'gpt-5' }, { id: 'gpt-6-preview' }],
         },
       ],
@@ -672,6 +929,7 @@ describe('Runtime Host maka run adapter', () => {
     const prepareStarted = deferred<void>();
     const fixture = runFixture({
       graph: true,
+      strictTurnStopInput: true,
       prepareGate: prepareGate.promise,
       onPrepareStarted: () => prepareStarted.resolve(),
     });
@@ -700,7 +958,7 @@ describe('Runtime Host maka run adapter', () => {
     assert.deepEqual(fixture.graphStops, [session.id, session.id]);
   });
 
-  test('fails and stops instead of waiting for an interactive question', async () => {
+  test('returns an AskUser handoff without stopping its Host Turn', async () => {
     const fixture = runFixture({
       turnEvents: questionEvents('turn-1'),
       pendingInteractions: [pendingQuestion('turn-1')],
@@ -720,7 +978,98 @@ describe('Runtime Host maka run adapter', () => {
           text: 'ask me something',
         }),
       ),
-      new Error('interactive user questions are unavailable in non-interactive mode'),
+      RunQuestionAvailable,
+    );
+    assert.deepEqual(fixture.exactTurnStops, []);
+  });
+
+  test('public run returns questions with exit 0 and keeps the original Turn waiting', async () => {
+    const fixture = runFixture({
+      turnEvents: questionEvents('turn-1'),
+      pendingInteractions: [pendingQuestion('turn-1')],
+      pendingAfterTurnStarts: true,
+    });
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const code = await runFixtureCommand(
+      fixture,
+      ['ask something'],
+      (text) => stdout.push(text),
+      (text) => stderr.push(text),
+    );
+    assert.equal(code, 0, stderr.join(''));
+    assert.equal(JSON.parse(stdout.join('')).status, 'needs_input');
+    assert.equal(JSON.parse(stdout.join('')).sessionId, 'session-created');
+    assert.ok(JSON.parse(stdout.join('')).questions.length);
+    assert.deepEqual(fixture.exactTurnStops, []);
+    assert.deepEqual(stderr, []);
+  });
+
+  test('no-wait returns after admission instead of consuming the event stream', async () => {
+    const fixture = runFixture({
+      turnEvents: (async function* (): AsyncIterable<SessionEvent> {
+        throw new Error('no-wait must not consume events');
+      })(),
+    });
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const code = await runFixtureCommand(
+      fixture,
+      ['execute in background', '--no-wait'],
+      (text) => stdout.push(text),
+      (text) => stderr.push(text),
+    );
+    assert.equal(code, 0, stderr.join(''));
+    assert.deepEqual(JSON.parse(stdout.join('')), {
+      sessionId: 'session-created',
+      status: 'running',
+      submission: 'started',
+    });
+    assert.deepEqual(fixture.exactTurnStops, []);
+  });
+
+  test('preserves the concrete provider failure stored with a Turn', async () => {
+    const messages = structuredClone(graphMessages());
+    const terminal = messages.find(
+      (message) => message.type === 'turn_state' && message.turnId === 'turn-2',
+    );
+    assert.ok(terminal && terminal.type === 'turn_state');
+    terminal.status = 'failed';
+    terminal.errorClass = 'quota_exhausted';
+    terminal.failureMessage = 'Selected provider has no remaining quota';
+    const fixture = runFixture({ graph: true, finalMessages: messages });
+    const stderr: string[] = [];
+    const code = await runFixtureCommand(
+      fixture,
+      ['execute', '--graph'],
+      () => {},
+      (text) => stderr.push(text),
+    );
+    assert.equal(code, 1);
+    assert.match(stderr.join(''), /Selected provider has no remaining quota/);
+  });
+
+  test('fails and stops instead of dropping an interactive form', async () => {
+    const fixture = runFixture({
+      turnEvents: formEvents('turn-1'),
+      pendingInteractions: [pendingForm('turn-1')],
+      pendingAfterTurnStarts: true,
+    });
+    const session = await fixture.context.runtime.createSession({
+      cwd: '/workspace',
+      llmConnectionSlug: 'openai-main',
+      model: 'gpt-5',
+      permissionMode: 'ask',
+    });
+
+    await assert.rejects(
+      collect(
+        fixture.context.runtime.sendMessage(session.id, {
+          turnId: 'turn-1',
+          text: 'configure deployment',
+        }),
+      ),
+      new Error('interactive user forms are unavailable in non-interactive mode'),
     );
     assert.deepEqual(fixture.exactTurnStops, [
       { sessionId: session.id, turnId: 'turn-1', runId: 'run-1' },
@@ -854,6 +1203,9 @@ function runFixture(input: {
   prepareGate?: Promise<void>;
   onPrepareStarted?: () => void;
   turnEvents?: AsyncIterable<SessionEvent>;
+  resumeReady?: boolean;
+  resumeGate?: Promise<void>;
+  onResumeStarted?: () => void;
   pendingInteractions?: InteractionPendingSnapshot[];
   pendingAfterTurnStarts?: boolean;
   graphProjectionRace?: boolean;
@@ -868,6 +1220,7 @@ function runFixture(input: {
   onGraphStop?: () => void;
   initialMessages?: StoredMessage[];
   finalMessages?: StoredMessage[];
+  strictTurnStopInput?: boolean;
 }) {
   const switches: string[] = [];
   const moves: string[] = [];
@@ -886,6 +1239,7 @@ function runFixture(input: {
   >();
   let messageReads = 0;
   const preparedMaxSteps: Array<number | undefined> = [];
+  const preparedOrigins: unknown[] = [];
   const driver = {
     createSession: async () => sessionSummary('session-created'),
     readMessages: async () => {
@@ -952,9 +1306,10 @@ function runFixture(input: {
     },
     preparePrompt: async (
       _prompt: string,
-      options: { turnId?: string; maxSteps?: number } = {},
+      options: { turnId?: string; maxSteps?: number; origin?: unknown } = {},
     ) => {
       preparedMaxSteps.push(options.maxSteps);
+      preparedOrigins.push(options.origin);
       input.onPrepareStarted?.();
       await input.prepareGate;
       const events = input.turnEvents ?? eventsFor(options.turnId ?? 'turn-1', 'Host answer');
@@ -969,6 +1324,16 @@ function runFixture(input: {
               input.pendingInteractions ?? [],
             )
           : events,
+      };
+    },
+    resumeLatestTurn: async () => {
+      input.onResumeStarted?.();
+      await input.resumeGate;
+      return {
+        sessionId: switches.at(-1) ?? 'session-created',
+        turnId: 'turn-resumed',
+        runId: 'run-resumed',
+        events: eventsFor('turn-resumed', 'Resumed answer'),
       };
     },
     respondToSandboxBoundary: async (response: { requestId: string; decision: 'deny' }) => {
@@ -994,6 +1359,15 @@ function runFixture(input: {
   const connection = {
     hostEpoch: 'host-1',
     request: async (operation: string, requestInput: Record<string, unknown>) => {
+      if (operation === 'turn.resume.query' && input.resumeReady) {
+        return {
+          sessionId: requestInput.sessionId,
+          disposition: 'ready',
+          sourceRunId: 'run-source',
+          sourceTurnId: 'turn-source',
+          sourceRuntimeEventHighWater: 3,
+        };
+      }
       if (operation === 'session.execution_boundary.query') {
         return { kind: 'managed', access: 'writable', revision: 0 };
       }
@@ -1008,6 +1382,13 @@ function runFixture(input: {
         return { rootSessionId: requestInput.rootSessionId, graphId: 'graph-1' };
       }
       if (operation === 'turn.stop') {
+        if (input.strictTurnStopInput) {
+          const allowed = new Set(['sessionId', 'turnId', 'runId']);
+          const unexpected = Object.keys(requestInput).filter((key) => !allowed.has(key));
+          if (unexpected.length > 0) {
+            throw new Error(`Unknown turn.stop input field: ${unexpected.join(', ')}`);
+          }
+        }
         exactTurnStops.push({
           sessionId: String(requestInput.sessionId),
           turnId: String(requestInput.turnId),
@@ -1048,6 +1429,7 @@ function runFixture(input: {
     graphStops,
     exactTurnStops,
     preparedMaxSteps,
+    preparedOrigins,
     sandboxResponses,
     createContext,
     publishPendingInteraction(pending: InteractionPendingSnapshot) {
@@ -1140,6 +1522,7 @@ function connectionCatalog() {
         providerType: 'openai' as const,
         enabled: true,
         enabledModelIds: ['gpt-5'],
+        catalogEntries: [],
         models: [{ id: 'gpt-5' }],
       },
     ],
@@ -1239,14 +1622,19 @@ async function* questionEvents(turnId: string): AsyncIterable<SessionEvent> {
   };
 }
 
-function deferred<T>() {
-  let resolve!: (value: T | PromiseLike<T>) => void;
-  const promise = new Promise<T>((settle) => {
-    resolve = settle;
-  });
-  return { promise, resolve };
+async function* formEvents(turnId: string): AsyncIterable<SessionEvent> {
+  yield {
+    type: 'form_request',
+    id: `${turnId}-form`,
+    turnId,
+    ts: 1,
+    requestId: 'form-1',
+    toolUseId: 'tool-1',
+    message: 'Configure deployment',
+    requester: { name: 'deploy', source: 'Acme MCP' },
+    fields: [{ kind: 'string', name: 'version', label: 'Version', required: true }],
+  };
 }
-
 function pendingQuestion(turnId: string): InteractionPendingSnapshot {
   return {
     schemaVersion: 1,
@@ -1261,6 +1649,26 @@ function pendingQuestion(turnId: string): InteractionPendingSnapshot {
       kind: 'question',
       toolUseId: 'tool-question',
       questions: [{ question: 'Continue?', options: [{ label: 'Yes' }] }],
+    },
+  };
+}
+
+function pendingForm(turnId: string): InteractionPendingSnapshot {
+  return {
+    schemaVersion: 1,
+    interactionId: 'form-1',
+    sessionId: 'session-created',
+    turnId,
+    runId: turnId === 'turn-1' ? 'run-1' : 'run-2',
+    revision: 1,
+    status: 'pending',
+    outcome: null,
+    request: {
+      kind: 'form',
+      toolUseId: 'tool-form',
+      message: 'Configure deployment',
+      requester: { name: 'deploy', source: 'Acme MCP' },
+      fields: [{ kind: 'string', name: 'version', label: 'Version', required: true }],
     },
   };
 }
@@ -1321,7 +1729,6 @@ function graphMessages(includeTerminal = true): StoredMessage[] {
       turnId: 'turn-2',
       ts: 5,
       status: 'completed',
-      partialOutputRetained: false,
     });
   }
   return messages;
@@ -1348,7 +1755,6 @@ function sandboxBoundaryMessages(
       turnId: 'turn-2',
       ts: 10,
       status: 'completed',
-      partialOutputRetained: true,
     },
   ];
 }
@@ -1368,7 +1774,6 @@ function multipleSandboxFailureMessages(): StoredMessage[] {
       turnId: 'turn-2',
       ts: 11,
       status: 'completed',
-      partialOutputRetained: true,
     },
   ];
 }
@@ -1383,7 +1788,6 @@ function abortedGraphMessages(): StoredMessage[] {
       ts: 5,
       status: 'aborted',
       abortSource: 'user_interrupt',
-      partialOutputRetained: true,
     },
   ];
 }
@@ -1398,7 +1802,6 @@ function failedGraphMessages(errorClass: string): StoredMessage[] {
       ts: 5,
       status: 'failed',
       errorClass,
-      partialOutputRetained: true,
     },
   ];
 }
@@ -1412,7 +1815,6 @@ function failedThenCompletedGraphMessages(): StoredMessage[] {
       turnId: 'turn-2',
       ts: 6,
       status: 'completed',
-      partialOutputRetained: true,
     },
   ];
 }
@@ -1449,7 +1851,6 @@ function multiWakeGraphMessages(includeFinalTerminal: boolean): StoredMessage[] 
       turnId: 'turn-3',
       ts: 8,
       status: 'completed',
-      partialOutputRetained: false,
     });
   }
   return messages;
@@ -1467,6 +1868,45 @@ async function* eventsFor(turnId: string, text: string, ts = 1): AsyncIterable<S
   yield { type: 'complete', id: `${turnId}-complete`, turnId, ts: ts + 1, stopReason: 'end_turn' };
 }
 
+async function* eventsWithLateTranscriptRead(publish: () => void): AsyncIterable<SessionEvent> {
+  yield toolStart('turn-1', 'tool-2', 'step-1', 1);
+  yield successfulToolResult('turn-1', 2);
+  yield {
+    type: 'text_complete',
+    id: 'turn-1-text',
+    turnId: 'turn-1',
+    messageId: 'turn-1-message',
+    ts: 3,
+    text: 'Host answer',
+  };
+  // The read this tool result triggered only reaches the transcript as far as
+  // the Host had committed it, which is behind the answer that just streamed.
+  publish();
+  yield {
+    type: 'complete',
+    id: 'turn-1-complete',
+    turnId: 'turn-1',
+    ts: 4,
+    stopReason: 'end_turn',
+  };
+}
+
+// Reattaching to a Turn whose answer was produced before this client arrived:
+// only the transcript can supply it, so a stored answer has to be able to set
+// the final output when the stream never delivered one.
+async function* eventsWithoutStreamedAnswer(publish: () => void): AsyncIterable<SessionEvent> {
+  yield toolStart('turn-1', 'tool-1', 'step-1', 1);
+  yield successfulToolResult('turn-1', 2);
+  publish();
+  yield {
+    type: 'complete',
+    id: 'turn-1-complete',
+    turnId: 'turn-1',
+    ts: 3,
+    stopReason: 'end_turn',
+  };
+}
+
 async function* eventsAfterTranscriptReplacement(publish: () => void): AsyncIterable<SessionEvent> {
   publish();
   yield* eventsFor('turn-1', 'Incomplete answer', 3);
@@ -1480,14 +1920,28 @@ async function* sandboxBoundaryEvents(
   successToolName = 'Read',
 ): AsyncIterable<SessionEvent> {
   const sameStep = failureStepId !== undefined && failureStepId === successStepId;
-  if (failureStepId !== undefined) yield toolStart(turnId, 'tool-1', failureStepId, 1);
-  if (sameStep) yield toolStart(turnId, 'tool-2', successStepId, 2, successToolName);
+  if (failureStepId !== undefined) {
+    yield toolStart(turnId, 'tool-1', failureStepId, 1);
+  }
+  if (sameStep) {
+    yield toolStart(turnId, 'tool-2', successStepId, 2, successToolName);
+  }
   yield sandboxFailureToolResult(turnId, 3);
   if (successStepId !== undefined && !sameStep) {
     yield toolStart(turnId, 'tool-2', successStepId, 4, successToolName);
   }
   yield successfulToolResult(turnId, 5);
   yield* eventsFor(turnId, text, 6);
+}
+
+async function* deniedWideningEvents(turnId: string): AsyncIterable<SessionEvent> {
+  yield toolStart(turnId, 'tool-1', 'step-1', 1);
+  yield sandboxFailureToolResult(turnId, 2);
+  yield toolStart(turnId, 'tool-2', 'step-2', 3, 'request_sandbox_boundary');
+  yield successfulToolResult(turnId, 4, 'tool-2');
+  yield toolStart(turnId, 'tool-3', 'step-3', 5);
+  yield successfulToolResult(turnId, 6, 'tool-3');
+  yield* eventsFor(turnId, 'Recovered answer', 7);
 }
 
 async function* projectedSameStepSandboxFailureEvents(turnId: string): AsyncIterable<SessionEvent> {

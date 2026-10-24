@@ -24,22 +24,51 @@ import {
   lookupModelMetadata,
   modelIdAliasesForProvider,
 } from '../model-metadata.js';
-import { curatedCatalogFallbackModelsForProvider } from '../model-metadata.js';
+import { PROVIDER_REGISTRY, providerFallbackModelIds } from '../provider-registry.js';
 import {
-  authorizeConnectionModel,
-  backendKindOf,
   effectiveBaseUrl,
   normalizeConnectionBaseUrl,
-  persistedBaseUrl,
   providerAuthRequiresSecret,
   providerDefaultsOf,
   providerAuthSupportsApiKey,
   reconcileConnectionAfterModelFetch,
   validateConnectionBaseUrl,
+  validateSlug,
+  type IdentifiedLlmConnection,
   type ProviderType,
 } from '../llm-connections.js';
 import { isRealConnection } from '../connection-readiness.js';
+import { normalizeCatalogConnectionBaseUrl } from '../runtime-policy/connection-catalog-codec.js';
+import { resolveConnectionModelCatalog } from '../model-catalog.js';
 import { buildChatModelChoices } from '../chat-model-choice.js';
+import { deriveProviderAuthContract } from '../provider-auth.js';
+
+/**
+ * The Host resolves a connection's catalog and projects it; the menu is built
+ * over that projection. Tests go through the same resolution so they exercise
+ * the path a client actually sees.
+ */
+function chatModelChoicesFor(
+  connections: readonly IdentifiedLlmConnection[],
+): ReturnType<typeof buildChatModelChoices> {
+  return buildChatModelChoices(
+    connections.map((connection) => ({
+      ...connection,
+      catalogEntries: resolveConnectionModelCatalog(connection),
+    })),
+  );
+}
+
+test('slug validation returns stable issues and preserves format and length boundaries', () => {
+  for (const slug of ['', '  ']) assert.equal(validateSlug(slug), 'required');
+  for (const slug of ['A-slug', 'with space', '-slug', 'slug-', 'a']) {
+    assert.equal(validateSlug(slug), 'format', slug);
+  }
+  assert.equal(validateSlug('a'.repeat(65)), 'too_long');
+  for (const slug of ['ab', 'valid-slug-1', 'a'.repeat(64)]) {
+    assert.equal(validateSlug(slug), null, slug);
+  }
+});
 
 test('connection base URLs allow HTTP(S) and reject unsafe or malformed inputs', () => {
   assert.equal(validateConnectionBaseUrl(undefined), null);
@@ -54,18 +83,55 @@ test('connection base URLs allow HTTP(S) and reject unsafe or malformed inputs',
   assert.equal(validateConnectionBaseUrl(exactLimit), null);
 });
 
-test('persisted base URLs retain only meaningful overrides', () => {
-  for (const value of [undefined, '  ', 'https://api.openai.com/v1']) {
-    assert.equal(persistedBaseUrl('openai', value), undefined);
+test('connection base URL gate agrees with the Runtime Host contract (#3672)', () => {
+  // The Host codec is the authority. Accepting what it refuses sends the rejection back
+  // unclassified, so the form shows generic "service unavailable" copy on the wrong field.
+  const hostRejects = (value: string): boolean => {
+    try {
+      normalizeCatalogConnectionBaseUrl(value);
+      return false;
+    } catch {
+      return true;
+    }
+  };
+
+  for (const [value, rule] of [
+    ['https://user:pw@gw.example.com/v1', 'credentials'],
+    ['https://gw.example.com/v1?api-version=2024-06', 'query or fragment'],
+    ['https://gw.example.com/v1#main', 'query or fragment'],
+    ['https://gw.example.com/v1?api-version=2024-06#main', 'query or fragment'],
+  ] as const) {
+    const gate = validateConnectionBaseUrl(value);
+    assert.notEqual(gate, null, value);
+    assert.match(gate ?? '', new RegExp(rule), value);
+    assert.equal(hostRejects(value), true, value);
   }
+
+  for (const value of [
+    'https://gw.example.com/v1',
+    'https://gw.example.com',
+    'http://localhost:11434/v1',
+  ]) {
+    assert.equal(validateConnectionBaseUrl(value), null, value);
+    assert.equal(hostRejects(value), false, value);
+  }
+});
+
+test('connection base URL gate bounds bytes like the Host, not only characters (#3672)', () => {
+  const multibyte = `https://gw.example.com/${'é'.repeat(1200)}`;
   assert.equal(
-    persistedBaseUrl('openai', '  https://proxy.example.com/v1  '),
-    'https://proxy.example.com/v1',
+    multibyte.length <= 2048,
+    true,
+    `character cap must not reject it: ${multibyte.length}`,
   );
-  assert.equal(
-    persistedBaseUrl('openai-compatible', 'https://gateway.example.com/v1'),
-    'https://gateway.example.com/v1',
-  );
+  assert.match(validateConnectionBaseUrl(multibyte) ?? '', /2048 bytes/);
+  let hostThrew = false;
+  try {
+    normalizeCatalogConnectionBaseUrl(multibyte);
+  } catch {
+    hostThrew = true;
+  }
+  assert.equal(hostThrew, true);
 });
 
 test('base URL normalization preserves clear intent and rejects untrusted runtime types', () => {
@@ -81,10 +147,6 @@ test('base URL normalization preserves clear intent and rejects untrusted runtim
 
 test('unknown provider ids fail closed without breaking persisted connections', () => {
   const unknown = 'branch-only-provider' as ProviderType;
-  // `backendKindOf` no longer invents a backend for a provider this build
-  // cannot describe (#3211); the readiness projection is the non-throwing
-  // answer to "can this connection be used?".
-  assert.throws(() => backendKindOf({ providerType: unknown }), /Unknown providerType/);
   assert.equal(isRealConnection({ providerType: unknown }), false);
   assert.equal(providerDefaultsOf(unknown), undefined);
   assert.equal(
@@ -92,7 +154,6 @@ test('unknown provider ids fail closed without breaking persisted connections', 
     'https://example.test/v1',
   );
   assert.equal(effectiveBaseUrl({ providerType: unknown }), '');
-  assert.equal(persistedBaseUrl(unknown, '  '), undefined);
   assert.equal(providerAuthRequiresSecret(unknown), false);
   assert.equal(providerAuthSupportsApiKey(unknown), false);
 });
@@ -125,6 +186,52 @@ test('a fetch never deletes a choice the user made', () => {
   assert.deepEqual(
     reconcileConnectionAfterModelFetch({ defaultModel: 'saved', enabledModelIds: ['saved'] }, []),
     { defaultModel: 'saved', enabledModelIds: ['saved'] },
+  );
+});
+
+test('an authoritative account catalog removes unavailable bootstrap and stale models', () => {
+  assert.deepEqual(
+    reconcileConnectionAfterModelFetch(
+      {
+        defaultModel: 'fallback-unavailable',
+        enabledModelIds: ['fallback-unavailable', 'account-available'],
+        hasModelInventory: false,
+      },
+      [{ id: 'account-available' }, { id: 'newly-available' }],
+      { authoritative: true },
+    ),
+    {
+      defaultModel: 'account-available',
+      enabledModelIds: ['account-available', 'newly-available'],
+    },
+  );
+  // Once an account inventory exists, a refresh removes withdrawn selections
+  // without automatically opting the user into newly introduced models.
+  assert.deepEqual(
+    reconcileConnectionAfterModelFetch(
+      {
+        defaultModel: 'account-available',
+        enabledModelIds: ['account-available', 'withdrawn'],
+        hasModelInventory: true,
+      },
+      [{ id: 'account-available' }, { id: 'newly-available' }],
+      { authoritative: true },
+    ),
+    { defaultModel: 'account-available', enabledModelIds: ['account-available'] },
+  );
+  // Losing every selected model does not silently opt the user into the first
+  // catalogue entry. A model that later returns remains available but opt-in.
+  assert.deepEqual(
+    reconcileConnectionAfterModelFetch(
+      {
+        defaultModel: 'withdrawn',
+        enabledModelIds: ['withdrawn'],
+        hasModelInventory: true,
+      },
+      [{ id: 'replacement' }],
+      { authoritative: true },
+    ),
+    { defaultModel: '', enabledModelIds: [] },
   );
 });
 
@@ -225,9 +332,9 @@ test('the alias table is selected by provider and names only renames', () => {
       providerType,
     );
   }
-  const offered = curatedCatalogFallbackModelsForProvider('claude-subscription') ?? [];
+  const offered = providerFallbackModelIds(PROVIDER_REGISTRY['claude-subscription']);
   for (const [renamed, target] of Object.entries(CLAUDE_SUBSCRIPTION_MODEL_ID_ALIASES)) {
-    assert.ok(offered.includes(target), `${target} is not offered by the curated inventory`);
+    assert.ok(offered.includes(target), `${target} is not offered by the shipped baseline`);
     // A withdrawn model must be repaired against the live list, never rewritten.
     assert.notEqual(lookupModelMetadata('anthropic', renamed).lifecycle, 'deprecated');
   }
@@ -240,7 +347,7 @@ test('the model picker lists an enabled model a snapshot provider never listed',
   // nothing to ask. Projecting the enabled ids as user choices is what keeps a
   // model the user picked — one their Ark plan serves but Maka's snapshot
   // predates — from vanishing out of every picker (#1584).
-  const choices = buildChatModelChoices([
+  const choices = chatModelChoicesFor([
     {
       connectionId: 'connection-1',
       slug: 'ark-plan',
@@ -262,19 +369,78 @@ test('the model picker lists an enabled model a snapshot provider never listed',
   ]);
 });
 
+test('chat model choices project exact vision support for attachment composition', () => {
+  const choices = chatModelChoicesFor([
+    {
+      connectionId: 'connection-vision',
+      slug: 'openai-compatible',
+      name: 'OpenAI compatible',
+      providerType: 'custom',
+      enabled: true,
+      defaultModel: 'text-model',
+      enabledModelIds: ['text-model', 'vision-model'],
+      models: [
+        { id: 'text-model', capabilities: { vision: false } },
+        { id: 'vision-model', capabilities: { vision: true } },
+      ],
+      createdAt: 1,
+      updatedAt: 1,
+    },
+  ]);
+
+  assert.deepEqual(
+    choices.map(({ model, supportsVision }) => ({ model, supportsVision })),
+    [
+      { model: 'text-model', supportsVision: false },
+      { model: 'vision-model', supportsVision: true },
+    ],
+  );
+});
+
+test('chat model choices keep provider metadata separate from user context declarations', () => {
+  const choices = chatModelChoicesFor([
+    {
+      connectionId: 'connection-context',
+      slug: 'openai-compatible',
+      name: 'OpenAI compatible',
+      providerType: 'custom',
+      enabled: true,
+      defaultModel: 'declared-model',
+      enabledModelIds: ['declared-model', 'reported-model'],
+      models: [
+        { id: 'declared-model', contextWindow: 64_000, inputLimit: 48_000 },
+        { id: 'reported-model', contextWindow: 128_000 },
+      ],
+      modelOverrides: { 'declared-model': { compactionThreshold: 32_000 } },
+      createdAt: 1,
+      updatedAt: 1,
+    },
+  ]);
+
+  assert.deepEqual(
+    choices.map(({ model, contextWindow, declaredContextWindow }) => ({
+      model,
+      contextWindow,
+      declaredContextWindow,
+    })),
+    [
+      { model: 'declared-model', contextWindow: 64_000, declaredContextWindow: 32_000 },
+      { model: 'reported-model', contextWindow: 128_000, declaredContextWindow: undefined },
+    ],
+  );
+});
+
 test('provider recognition does not resolve inherited object members', () => {
-  // `PROVIDER_DEFAULTS` is an object literal, so plain indexing answers truthy
+  // `PROVIDER_REGISTRY` is an object literal, so plain indexing answers truthy
   // for `__proto__` / `toString` / `constructor` and they would read as
-  // registered providers. #3211 made `backendKindOf` throw for unknown types,
-  // which turns that leak from a wrong-but-closed `'fake'` into an `undefined`
-  // masquerading as a BackendKind — so recognition owns the own-property check.
+  // registered providers. Recognition owns the own-property check so no
+  // caller has to repeat it.
   for (const inherited of ['__proto__', 'toString', 'constructor', 'valueOf']) {
     const providerType = inherited as ProviderType;
     assert.equal(providerDefaultsOf(inherited), undefined, inherited);
     assert.equal(isRealConnection({ providerType }), false, inherited);
-    assert.throws(() => backendKindOf({ providerType }), /Unknown providerType/, inherited);
     assert.deepEqual(
-      buildChatModelChoices([
+      chatModelChoicesFor([
         {
           slug: 'inherited',
           name: 'inherited',
@@ -287,17 +453,31 @@ test('provider recognition does not resolve inherited object members', () => {
       [],
       inherited,
     );
+    // The auth contract has its own unknown-provider branch, and its comment
+    // says it mirrors `isRealConnection`. It only does so while it asks the
+    // same question the same way: indexing the registry directly handed it an
+    // inherited member instead of `undefined`, and the branch never ran.
+    const contract = deriveProviderAuthContract({ providerType, hasSecret: false });
+    assert.equal(
+      Object.values(contract.actionAvailability).every((value) => value === false),
+      true,
+      inherited,
+    );
   }
 });
 
-test('a quarantined model id is vetoed even when enabled and present in the inventory', () => {
+test('stored OpenCode Free models cannot be selected', () => {
   const connection = {
+    connectionId: 'stored-free',
+    slug: 'opencode-free',
+    name: 'OpenCode Free',
     providerType: 'opencode-free' as ProviderType,
-    enabledModelIds: ['nemotron-3-ultra-free', 'muse-spark-1.2-contributor-free'],
-    models: [{ id: 'nemotron-3-ultra-free' }, { id: 'muse-spark-1.2-contributor-free' }],
+    enabled: true,
+    defaultModel: 'nemotron-3-ultra-free',
+    enabledModelIds: ['nemotron-3-ultra-free'],
+    models: [{ id: 'nemotron-3-ultra-free' }],
+    createdAt: 1,
+    updatedAt: 1,
   };
-  assert.equal(authorizeConnectionModel(connection, 'muse-spark-1.2-contributor-free'), undefined);
-  assert.deepEqual(authorizeConnectionModel(connection, 'nemotron-3-ultra-free'), {
-    id: 'nemotron-3-ultra-free',
-  });
+  assert.deepEqual(chatModelChoicesFor([connection]), []);
 });

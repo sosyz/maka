@@ -19,13 +19,16 @@
 
 export { SessionNavigationServicesProvider } from './services-context.js';
 export { SessionNavigationProvider } from './ui/session-navigation-provider.js';
+export {
+  ArchivedTaskScope,
+  type ArchivedTaskScopeView,
+} from './ui/archived-task-scope.js';
+export type { ArchivedTaskProjectScope } from './model/archived-task-scope.js';
 export { createSessionOpenCommand } from './controller/session-open-command.js';
 export { useSessionNavigationReads } from './controller/use-session-navigation-reads.js';
-export type { SessionNavigationPorts } from './controller/use-session-navigation-controller.js';
-export { deriveSessionRail } from './model/session-rail.js';
 export { sessionRailLayoutStore } from './model/session-rail-layout-store.js';
+export type { SessionNavigationRowActions } from './controller/session-row-actions.js';
 export type {
-  SessionNavigationRowActions,
-  SessionPurgeOutcome,
-} from './controller/session-row-actions.js';
-export type { SessionNavigationServices } from './ports.js';
+  SessionNavigationPorts,
+  SessionNavigationServices,
+} from './ports.js';

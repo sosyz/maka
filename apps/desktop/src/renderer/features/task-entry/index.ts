@@ -17,10 +17,13 @@
  * under the License.
  */
 
+export { ProjectRegistrationBoundary } from './ui/project-registration-boundary.js';
+export type { ProjectRegistration } from './controller/use-project-registration.js';
 export { TaskEntryHost } from './ui/task-entry-host.js';
+export {
+  TaskEntryRoot,
+  TaskEntryWorkspacePickerConsumer,
+} from './ui/task-entry-provider.js';
+export type { TaskEntryShellProjection } from './ui/task-entry-provider.js';
 export { TaskEntryServicesProvider } from './services-context.js';
-export { useTaskEntryController } from './controller/use-task-entry-controller.js';
-export type {
-  TaskEntryError,
-} from './controller/use-task-entry-controller.js';
 export type { TaskEntryServices } from './ports.js';

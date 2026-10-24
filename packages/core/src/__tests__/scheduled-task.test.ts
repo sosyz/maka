@@ -18,6 +18,7 @@
  */
 
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { describe, it } from 'node:test';
 import { markPersisted } from '../persisted-value.js';
 import {
@@ -62,7 +63,7 @@ describe('scheduled-task catalog', () => {
     assert.equal(next.fireCount, 1);
   });
 
-  it('pause and resume restore nextFireAt', () => {
+  it('pause and resume preserve a pending occurrence', () => {
     const now = Date.UTC(2026, 0, 5, 8, 0, 0);
     const next = computeNextFireAt({ kind: 'interval', everySeconds: 3600, startAt: now }, now);
     assert.ok(next);
@@ -87,12 +88,41 @@ describe('scheduled-task catalog', () => {
     assert.equal(isScheduledTaskDue(task, next), true);
     const paused = pauseScheduledTask(task, now + 1);
     assert.equal(paused.status, 'paused');
-    assert.equal(paused.nextFireAt, null);
+    assert.equal(paused.nextFireAt, next);
+    assert.equal(isScheduledTaskDue(paused, next), false);
     const resumed = resumeScheduledTask(paused, now + 2);
     assert.ok(!('error' in resumed));
     if ('error' in resumed) return;
     assert.equal(resumed.status, 'active');
-    assert.ok(typeof resumed.nextFireAt === 'number');
+    assert.equal(resumed.nextFireAt, next);
+  });
+
+  it('resume recomputes an occurrence that elapsed while paused', () => {
+    const now = Date.UTC(2026, 0, 5, 8, 0, 0);
+    const pending = now + 10 * 60_000;
+    const task: ScheduledTask = {
+      id: 'snoozed-daily',
+      title: 'Daily',
+      intent: { kind: 'text', body: 'tick' },
+      schedule: { kind: 'calendar', recurrence: 'daily', anchorAt: now },
+      effect: { kind: 'notify', channel: 'local' },
+      status: 'paused',
+      nextFireAt: pending,
+      lastFireAt: null,
+      fireCount: 0,
+      maxFires: null,
+      expiresAt: null,
+      createdBy: { kind: 'user' },
+      createdAt: now,
+      updatedAt: now,
+      runs: [],
+      lastError: null,
+    };
+
+    const resumed = resumeScheduledTask(task, pending + 1);
+    assert.ok(!('error' in resumed));
+    if ('error' in resumed) return;
+    assert.equal(resumed.nextFireAt, computeNextFireAt(task.schedule, pending + 1));
   });
 
   it('does not resume a task whose fire budget is already spent', () => {
@@ -152,6 +182,95 @@ describe('scheduled-task catalog', () => {
     assert.equal(new Date(february!).getDate(), 28);
   });
 
+  it('reconstructs daily and weekly wall times after a DST gap', () => {
+    const moduleUrl = new URL('../scheduled-task.js', import.meta.url).href;
+    const cases = [
+      {
+        timezone: 'America/New_York',
+        anchor: '2026-03-01T02:30:15.125-05:00',
+        after: '2026-03-08T04:00:00-04:00',
+        daily: '2026-03-09T02:30:15.125-04:00',
+        weekly: '2026-03-15T02:30:15.125-04:00',
+      },
+      {
+        timezone: 'America/New_York',
+        anchor: '2026-03-03T02:30:15.125-05:00',
+        after: '2026-03-08T00:00:00-05:00',
+        daily: '2026-03-08T03:30:15.125-04:00',
+        weekly: '2026-03-10T02:30:15.125-04:00',
+      },
+      {
+        timezone: 'Australia/Lord_Howe',
+        anchor: '2026-09-27T02:15:15.125+10:30',
+        after: '2026-10-04T04:00:00+11:00',
+        daily: '2026-10-05T02:15:15.125+11:00',
+        weekly: '2026-10-11T02:15:15.125+11:00',
+      },
+      {
+        timezone: 'America/New_York',
+        anchor: '2026-10-25T01:30:15.125-04:00',
+        after: '2026-11-01T01:30:15.125-05:00',
+        daily: '2026-11-02T01:30:15.125-05:00',
+        weekly: '2026-11-08T01:30:15.125-05:00',
+      },
+    ];
+    for (const scenario of cases) {
+      const script = `
+        import { computeNextFireAt } from ${JSON.stringify(moduleUrl)};
+        const scenario = ${JSON.stringify(scenario)};
+        const result = ['daily', 'weekly'].map((recurrence) =>
+          computeNextFireAt({
+            kind: 'calendar', recurrence, anchorAt: Date.parse(scenario.anchor),
+          }, Date.parse(scenario.after)));
+        process.stdout.write(JSON.stringify(result));
+      `;
+      const actual = JSON.parse(
+        execFileSync(process.execPath, ['--input-type=module', '-e', script], {
+          env: { ...process.env, TZ: scenario.timezone },
+          encoding: 'utf8',
+        }),
+      );
+      assert.deepEqual(
+        actual,
+        [Date.parse(scenario.daily), Date.parse(scenario.weekly)],
+        `${scenario.timezone}: ${scenario.after}`,
+      );
+    }
+  });
+
+  it('returns to the anchor wall time after firing on a DST gap day', () => {
+    const moduleUrl = new URL('../scheduled-task.js', import.meta.url).href;
+    const script = `
+      import { computeNextFireAt } from ${JSON.stringify(moduleUrl)};
+      const anchors = {
+        daily: '2026-03-01T02:30:15.125-05:00',
+        weekly: '2026-03-01T02:30:15.125-05:00',
+        monthly: '2026-01-08T02:30:15.125-05:00',
+      };
+      const result = Object.entries(anchors).map(([recurrence, anchor]) => {
+        const schedule = { kind: 'calendar', recurrence, anchorAt: Date.parse(anchor) };
+        let after = Date.parse('2026-03-08T00:00:00-05:00');
+        return Array.from({length: 2}, () => {
+          after = computeNextFireAt(schedule, after);
+          return after;
+        });
+      });
+      process.stdout.write(JSON.stringify(result));
+    `;
+    const actual = JSON.parse(
+      execFileSync(process.execPath, ['--input-type=module', '-e', script], {
+        env: { ...process.env, TZ: 'America/New_York' },
+        encoding: 'utf8',
+      }),
+    );
+    const gap = Date.parse('2026-03-08T03:30:15.125-04:00');
+    assert.deepEqual(actual, [
+      [gap, Date.parse('2026-03-09T02:30:15.125-04:00')],
+      [gap, Date.parse('2026-03-15T02:30:15.125-04:00')],
+      [gap, Date.parse('2026-04-08T02:30:15.125-04:00')],
+    ]);
+  });
+
   it('rejects tasks whose first fire is not before expiration', () => {
     const now = Date.UTC(2026, 0, 5, 8, 0, 0);
     const result = normalizeCreateScheduledTaskInput(
@@ -175,6 +294,7 @@ describe('scheduled-task catalog', () => {
     const now = Date.UTC(2026, 0, 5, 8, 0, 0);
     const execution = {
       cwd: '/tmp/project',
+      llmConnectionId: 'connection-anthropic',
       llmConnectionSlug: 'anthropic',
       model: 'claude-sonnet-4-5-20250929',
       permissionMode: 'ask',
@@ -204,6 +324,34 @@ describe('scheduled-task catalog', () => {
       if (result.value.effect.kind !== 'agent_run') return;
       assert.equal('backend' in result.value.effect.execution, false);
     }
+  });
+
+  it('requires an immutable Connection identity for new Agent tasks', () => {
+    const now = Date.UTC(2026, 0, 5, 8, 0, 0);
+    const result = normalizeCreateScheduledTaskInput(
+      {
+        title: 'Missing identity',
+        intentBody: 'run',
+        schedule: { kind: 'once', runAt: now + 60_000 },
+        effect: {
+          kind: 'agent_run',
+          execution: {
+            cwd: '/tmp/project',
+            llmConnectionSlug: 'anthropic',
+            model: 'claude',
+            permissionMode: 'ask',
+            collaborationMode: 'agent',
+            orchestrationMode: 'default',
+          },
+        },
+        createdBy: { kind: 'user' },
+      },
+      now,
+    );
+    assert.deepEqual(result, {
+      ok: false,
+      message: 'execution.llmConnectionId is required',
+    });
   });
 
   it('rejects future recurrence anchors outside the scheduling horizon', () => {
@@ -240,6 +388,7 @@ describe('decodePersistedScheduledTask', () => {
       kind: 'agent_run',
       execution: {
         cwd: '/repo',
+        llmConnectionId: 'connection-anthropic',
         llmConnectionSlug: 'anthropic',
         model: 'claude',
         permissionMode: 'ask',
@@ -273,6 +422,19 @@ describe('decodePersistedScheduledTask', () => {
 
   it('returns the same task when nothing needs folding', () => {
     assert.equal(decodePersistedScheduledTask(markPersisted<ScheduledTask>(base)), base);
+  });
+
+  it('keeps legacy slug-only Agent tasks readable', () => {
+    const { llmConnectionId: _legacyId, ...legacyExecution } =
+      base.effect.kind === 'agent_run' ? base.effect.execution : {};
+    const legacy = {
+      ...base,
+      effect: { kind: 'agent_run' as const, execution: legacyExecution },
+    } as ScheduledTask;
+    const decoded = decodePersistedScheduledTask(markPersisted<ScheduledTask>(legacy));
+    assert.equal(decoded.effect.kind, 'agent_run');
+    if (decoded.effect.kind !== 'agent_run') return;
+    assert.equal(decoded.effect.execution.llmConnectionId, undefined);
   });
 
   it('leaves effects without an execution template alone', () => {

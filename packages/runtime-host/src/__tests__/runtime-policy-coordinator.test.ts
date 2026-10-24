@@ -17,6 +17,9 @@
  * under the License.
  */
 
+import { assertMaximalJsonPages } from './fixtures/json-pages.js';
+
+import { deferred } from '@maka/core/test-only/async-primitives';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { mkdtemp, open, rm, writeFile } from 'node:fs/promises';
@@ -28,7 +31,11 @@ import type {
   ConnectionCatalogSnapshot,
   CredentialLocator,
 } from '@maka/core/runtime-policy';
-import { REQUEST_BODY_OVERLAY_MAX_BYTES } from '@maka/core/runtime-policy';
+import {
+  connectionCredentialTarget,
+  REQUEST_BODY_OVERLAY_MAX_BYTES,
+} from '@maka/core/runtime-policy';
+import { resolveConnectionModelCatalog } from '@maka/core/model-catalog';
 import { FAKE_ASK_USER_QUESTION_PROMPT, FakeBackend } from '@maka/runtime/test-only/fake-backend';
 import { type MakaToolContext } from '@maka/runtime/tool-runtime';
 import { openInteractiveExecutionStoresForWrite } from '@maka/storage/execution-stores';
@@ -44,6 +51,7 @@ import { createExecutionRuntimeHostComposition } from '../server/execution-compo
 import type { ConnectionContext } from '../server/operation-dispatcher.js';
 import { RuntimePolicyActivationGate } from '../server/runtime-policy-activation-gate.js';
 import { HostRuntimePolicyCoordinator } from '../server/runtime-policy-coordinator.js';
+import { waitFor as pollFor } from '@maka/core/test-only/async-primitives';
 
 const context: ConnectionContext = {
   hostEpoch: 'runtime-policy-test-epoch',
@@ -51,6 +59,19 @@ const context: ConnectionContext = {
   principal: 'local_os_user',
   acquireResidency: () => ({ release: () => undefined }),
 };
+
+test('default-target protocol keeps legacy requests unchanged and requires explicit enable consent', () => {
+  const decode =
+    RUNTIME_POLICY_OPERATION_SPECS['connection.catalog.set-default-target'].decodeInput;
+  const legacy = {
+    expectedCatalogRevision: 7,
+    target: { connectionId: randomUUID(), modelId: 'chosen' },
+  };
+  assert.deepEqual(decode(legacy), legacy);
+  assert.deepEqual(decode({ ...legacy, enableModel: true }), { ...legacy, enableModel: true });
+  assert.throws(() => decode({ ...legacy, enableModel: 'true' }));
+  assert.throws(() => decode({ ...legacy, target: null, enableModel: true }));
+});
 
 test('model settings tool confirms and atomically updates canonical Runtime Policy', async () => {
   await withCoordinator(async ({ coordinator, stores }) => {
@@ -362,17 +383,22 @@ test('production policy mutation drains and poisons activation when cached backe
     if (!started.ok) return;
     assert.equal(started.result.kind, 'started');
     if (started.result.kind !== 'started') return;
+    const host = composition;
     let snapshot = started.result.turn;
-    for (let attempt = 0; attempt < 100 && !isTerminalTurnStatus(snapshot.status); attempt += 1) {
-      await new Promise<void>((resolve) => setTimeout(resolve, 20));
-      const queried = await composition.handlers['turn.query'](
-        { sessionId: session.id, turnId: firstTurnId },
-        context,
-      );
-      assert.equal(queried.ok, true);
-      if (!queried.ok) return;
-      snapshot = queried.result;
-    }
+    await pollFor(
+      async () => {
+        if (isTerminalTurnStatus(snapshot.status)) return true;
+        const queried = await host.handlers['turn.query'](
+          { sessionId: session.id, turnId: firstTurnId },
+          context,
+        );
+        assert.equal(queried.ok, true);
+        if (!queried.ok) return false;
+        snapshot = queried.result;
+        return isTerminalTurnStatus(snapshot.status);
+      },
+      { timeoutMs: 5_000, pollMs: 20 },
+    );
     assert.equal(isTerminalTurnStatus(snapshot.status), true);
 
     disposalSpy = mock.method(FakeBackend.prototype, 'dispose', async () => {
@@ -461,6 +487,79 @@ test('projects runtime policy CAS results without returning the committed snapsh
       result: { kind: 'revision_conflict', expectedRevision: 0, actualRevision: 1 },
     });
     assert.equal(invalidations, 1);
+  });
+});
+
+test('two clients cannot recreate a proxy credential after authentication is disabled', async () => {
+  await withCoordinator(async ({ coordinator, stores }) => {
+    const initial = await stores.runtimePolicy.getSnapshot();
+    const configured = await coordinator.handlers['runtime.policy.network-proxy.update'](
+      {
+        expectedPolicyRevision: initial.revision,
+        expectedCredential: null,
+        networkProxy: {
+          ...initial.policy.networkProxy,
+          enabled: true,
+          authEnabled: true,
+          username: 'proxy-user',
+        },
+        credential: { kind: 'replace', secret: 'initial-secret' },
+      },
+      context,
+    );
+    assert.equal(configured.ok, true);
+    if (!configured.ok || configured.result.kind !== 'committed') return;
+    assert.equal(configured.result.credentialStatus.configured, true);
+    if (!configured.result.credentialStatus.configured) return;
+    assert.equal(JSON.stringify(configured).includes('initial-secret'), false);
+    const sharedCredentialBasis = {
+      locator: configured.result.credentialStatus.locator,
+      credentialId: configured.result.credentialStatus.credentialId,
+      revision: configured.result.credentialStatus.revision,
+    };
+    const configuredPolicy = await stores.runtimePolicy.getSnapshot();
+
+    const disabled = await coordinator.handlers['runtime.policy.network-proxy.update'](
+      {
+        expectedPolicyRevision: configured.result.revision,
+        expectedCredential: sharedCredentialBasis,
+        networkProxy: {
+          ...configuredPolicy.policy.networkProxy,
+          authEnabled: false,
+          username: '',
+        },
+        credential: { kind: 'delete' },
+      },
+      context,
+    );
+    assert.equal(disabled.ok, true);
+    if (!disabled.ok || disabled.result.kind !== 'committed') return;
+
+    // Client A prepared its request from the shared pre-disable basis, but its
+    // Host command arrives after client B's disable command has committed.
+    const stale = await coordinator.handlers['runtime.policy.network-proxy.update'](
+      {
+        expectedPolicyRevision: configured.result.revision,
+        expectedCredential: sharedCredentialBasis,
+        networkProxy: configuredPolicy.policy.networkProxy,
+        credential: { kind: 'replace', secret: 'must-not-return' },
+      },
+      context,
+    );
+    assert.equal(stale.ok, true);
+    if (!stale.ok) return;
+    assert.ok(
+      stale.result.kind === 'revision_conflict' || stale.result.kind === 'credential_stale',
+    );
+
+    const finalPolicy = await stores.runtimePolicy.getSnapshot();
+    const finalCredential = await stores.credentialVault.getStatus({
+      scope: 'network_proxy',
+      kind: 'password',
+    });
+    assert.equal(finalPolicy.policy.networkProxy.authEnabled, false);
+    assert.equal(finalCredential.kind, 'status');
+    if (finalCredential.kind === 'status') assert.equal(finalCredential.status.configured, false);
   });
 });
 
@@ -741,7 +840,7 @@ test('projects state-dependent OAuth endpoint overrides as invalid requests', as
           baseUrl: 'https://copilot.example.test/v1',
           enabled: connection.enabled,
           enabledModelIds: connection.enabledModelIds,
-          relayModelProfiles: null,
+          modelOverrides: null,
         },
       },
       context,
@@ -809,12 +908,99 @@ test('returns connection_not_found when deleting a credential after its connecti
   });
 });
 
+test('two Host clients cannot write an imported credential after retargeting its Connection', async () => {
+  await withCoordinator(async ({ coordinator, stores }) => {
+    const created = await stores.connectionCatalog.create({
+      expectedCatalogRevision: 0,
+      connection: {
+        slug: 'bound-import',
+        name: 'Bound import',
+        providerType: 'openai',
+        enabled: true,
+        enabledModelIds: [],
+      },
+    });
+    assert.equal(created.kind, 'committed');
+    if (created.kind !== 'committed') return;
+    const connection = created.snapshot.connections[0];
+    assert.ok(connection);
+    if (!connection) return;
+    const locator: CredentialLocator = {
+      scope: 'connection',
+      connectionId: connection.connectionId,
+      kind: 'api_key',
+    };
+    const seeded = await stores.credentialVault.set({
+      locator,
+      expected: null,
+      secret: 'target-secret',
+    });
+    assert.equal(seeded.kind, 'committed');
+    if (seeded.kind !== 'committed') return;
+    const status = seeded.snapshot.entries.find((entry) => entry.locator.scope === 'connection');
+    assert.ok(status?.configured);
+    if (!status?.configured) return;
+
+    // Client A observed this exact target and credential generation.
+    const expectedConnection = connectionCredentialTarget(connection);
+    const expectedCredential = {
+      credentialId: status.credentialId,
+      revision: status.revision,
+    };
+
+    // Client B wins the Host mutation lane and retargets the same entity.
+    const moved = await coordinator.handlers['connection.catalog.update'](
+      {
+        expected: {
+          connectionId: connection.connectionId,
+          revision: connection.revision,
+        },
+        changes: {
+          name: connection.name,
+          baseUrl: 'https://target-relay.example/v1',
+          enabled: connection.enabled,
+          enabledModelIds: connection.enabledModelIds,
+          modelOverrides: null,
+        },
+      },
+      context,
+    );
+    assert.equal(moved.ok, true);
+    if (!moved.ok || moved.result.kind !== 'committed') return;
+
+    const stale = await coordinator.handlers['credential.vault.set'](
+      {
+        locator,
+        expected: expectedCredential,
+        expectedConnection,
+        secret: 'source-import-secret',
+      },
+      context,
+    );
+
+    assert.deepEqual(stale, {
+      ok: true,
+      result: {
+        kind: 'connection_stale',
+        expected: {
+          connectionId: connection.connectionId,
+          revision: connection.revision,
+        },
+        actual: moved.result.connection,
+      },
+    });
+    assert.equal(
+      (await stores.operations.exportCredentialMaterial(locator))?.secret,
+      'target-secret',
+    );
+  });
+});
+
 test('a fully profiled relay catalog paginates with profiles riding per item', async () => {
   await withCoordinator(async ({ coordinator, stores }) => {
     // Every claim in one header table used to be what made a long catalog
     // unreadable: the header item is atomic to the paginator. Profiles now
-    // travel with their own enabled_model_id item, so a connection whose
-    // EVERY enabled model declares a full profile must still paginate.
+    // travel with catalog entries, including disabled models.
     const modelIds = Array.from({ length: 40 }, (_, index) => `relay-model-${index}`);
     const profiles = Object.fromEntries(
       modelIds.map((modelId) => [
@@ -831,17 +1017,18 @@ test('a fully profiled relay catalog paginates with profiles riding per item', a
       connection: {
         slug: 'profiled-relay',
         name: 'Profiled relay',
-        providerType: 'openai-compatible',
+        providerType: 'custom',
+        defaultApiProtocol: 'openai-chat',
         baseUrl: 'https://relay.example/v1',
         enabled: true,
-        enabledModelIds: modelIds,
-        relayModelProfiles: profiles,
+        enabledModelIds: [],
+        modelOverrides: profiles,
       },
     });
     assert.equal(created.kind, 'committed');
     if (created.kind !== 'committed') return;
 
-    const seen: Extract<ConnectionCatalogPageItem, { kind: 'enabled_model_id' }>[] = [];
+    const seen: Extract<ConnectionCatalogPageItem, { kind: 'catalog_entry' }>[] = [];
     const first = await coordinator.handlers['connection.catalog.query'](
       { kind: 'start' },
       context,
@@ -856,9 +1043,9 @@ test('a fully profiled relay catalog paginates with profiles riding per item', a
       );
       for (const item of observed.items) {
         if (item.kind === 'connection') {
-          assert.ok(!('relayModelProfiles' in item), 'header must not carry the profile table');
+          assert.ok(!('modelOverrides' in item), 'header must not carry the profile table');
         }
-        if (item.kind === 'enabled_model_id') seen.push(item);
+        if (item.kind === 'catalog_entry') seen.push(item);
       }
       if (observed.nextCursor) {
         const next = await coordinator.handlers['connection.catalog.query'](
@@ -872,8 +1059,86 @@ test('a fully profiled relay catalog paginates with profiles riding per item', a
     }
     assert.equal(seen.length, modelIds.length);
     for (const item of seen) {
-      assert.deepEqual(item.relayProfile, profiles[item.modelId]);
+      assert.deepEqual(item.modelOverride, profiles[item.entry.id]);
     }
+  });
+});
+
+test('catalog pages carry the model facts a user overrode, not the stored row', async () => {
+  await withCoordinator(async ({ coordinator, root, stores }) => {
+    const created = await stores.connectionCatalog.create({
+      expectedCatalogRevision: 0,
+      connection: {
+        slug: 'facts-backed',
+        name: 'Facts backed',
+        providerType: 'openai',
+        enabled: true,
+        enabledModelIds: ['custom-model'],
+      },
+    });
+    assert.equal(created.kind, 'committed');
+    if (created.kind !== 'committed') return;
+    const connection = created.snapshot.connections[0];
+    assert.ok(connection);
+    if (!connection) return;
+    const credential = await stores.credentialVault.set({
+      locator: {
+        scope: 'connection',
+        connectionId: connection.connectionId,
+        kind: 'api_key',
+      },
+      expected: null,
+      secret: 'facts-backed-test-key',
+    });
+    assert.equal(credential.kind, 'committed');
+    if (credential.kind !== 'committed') return;
+    const fetch = await stores.operations.beginModelFetch(connection.connectionId);
+    assert.equal(fetch.kind, 'ready');
+    if (fetch.kind !== 'ready') return;
+    const discovered = await stores.operations.completeModelFetch(fetch.ticket, {
+      models: [{ id: 'provider-model' }],
+      source: 'fetched',
+      fetchedAt: 1,
+    });
+    assert.equal(discovered.kind, 'committed');
+    if (discovered.kind !== 'committed') return;
+    const latest = discovered.snapshot.connections[0]!;
+    assert.equal(
+      (
+        await stores.connectionCatalog.update({
+          expected: { connectionId: latest.connectionId, revision: latest.revision },
+          changes: {
+            name: latest.name,
+            enabled: latest.enabled,
+            enabledModelIds: latest.enabledModelIds,
+            modelOverrides: { 'custom-model': { contextWindow: 200_000 } },
+          },
+        })
+      ).kind,
+      'committed',
+    );
+
+    const result = await coordinator.handlers['connection.catalog.query'](
+      { kind: 'start' },
+      context,
+    );
+
+    assert.equal(result.ok, true);
+    if (!result.ok || result.result.kind !== 'page') return;
+    const decoded = RUNTIME_POLICY_OPERATION_SPECS['connection.catalog.query'].decodeOutput(
+      result.result,
+    );
+    if (decoded.kind !== 'page') return;
+    const overridden = decoded.items.find(
+      (item): item is Extract<ConnectionCatalogPageItem, { kind: 'catalog_entry' }> =>
+        item.kind === 'catalog_entry' && item.entry.id === 'custom-model',
+    );
+    assert.equal(overridden?.entry.contextWindow, 200_000);
+    assert.deepEqual(overridden?.modelOverride, { contextWindow: 200_000 });
+    assert.equal(
+      decoded.items.some((item) => item.kind === 'model' && item.model.id === 'custom-model'),
+      false,
+    );
   });
 });
 
@@ -892,7 +1157,8 @@ test('catalog protocol preserves an extra request body after a committed update'
       connection: {
         slug: 'custom-request',
         name: 'Custom request',
-        providerType: 'openai-compatible',
+        providerType: 'custom',
+        defaultApiProtocol: 'openai-chat',
         baseUrl: `https://example.test/${'a'.repeat(2_048 - 'https://example.test/'.length)}`,
         enabled: true,
         enabledModelIds: ['deepseek/deepseek-v4-flash-0731'],
@@ -990,6 +1256,27 @@ test('reconstructs a large catalog with revision-pinned pages and rejects stale 
       expectedCatalogItems(snapshot),
     );
 
+    const expectedItems = expectedCatalogItems(snapshot);
+    assertMaximalJsonPages(pages, expectedItems, {
+      maxBytes: CONNECTION_CATALOG_PAGE_MAX_BYTES,
+      maxItems: CONNECTION_CATALOG_PAGE_MAX_ITEMS,
+      items: (page) => page.items,
+      candidate: (page, items, end) => {
+        const next = expectedItems[end];
+        const nextCursor =
+          next === undefined
+            ? null
+            : next.kind === 'connection'
+              ? { connectionIndex: next.connectionIndex, part: 'connection' }
+              : {
+                  connectionIndex: next.connectionIndex,
+                  part: next.kind,
+                  itemIndex: next.itemIndex,
+                };
+        return { ...page, items, nextCursor };
+      },
+    });
+
     const staleCursor = first.result.nextCursor;
     assert.ok(staleCursor);
     if (!staleCursor) return;
@@ -1060,26 +1347,47 @@ function expectedCatalogItems(snapshot: ConnectionCatalogSnapshot): ConnectionCa
     // Mirror `projectCatalogItems`: profiles ride on their enabled_model_id
     // item, never in one header table (a header item is atomic to the
     // paginator — a long declaration list would make it unsplittable).
-    const { enabledModelIds, models, relayModelProfiles, ...header } = connection;
+    const { enabledModelIds, models, modelOverrides, ...header } = connection;
+    const catalogEntries = resolveConnectionModelCatalog({
+      slug: connection.slug,
+      providerType: connection.providerType,
+      defaultModel:
+        snapshot.defaultTarget?.connectionId === connection.connectionId
+          ? snapshot.defaultTarget.modelId
+          : '',
+      enabledModelIds: [...enabledModelIds],
+      models: [...models],
+      ...(connection.modelSource === undefined ? {} : { modelSource: connection.modelSource }),
+      ...(modelOverrides === undefined ? {} : { modelOverrides }),
+    });
     items.push({
       kind: 'connection',
       connectionIndex,
       ...header,
       enabledModelIdCount: enabledModelIds.length,
       modelCount: models.length,
+      catalogEntryCount: catalogEntries.length,
     });
     for (const [itemIndex, modelId] of enabledModelIds.entries()) {
-      const relayProfile = relayModelProfiles?.[modelId];
       items.push({
         kind: 'enabled_model_id',
         connectionIndex,
         itemIndex,
         modelId,
-        ...(relayProfile === undefined ? {} : { relayProfile }),
       });
     }
     for (const [itemIndex, model] of models.entries()) {
       items.push({ kind: 'model', connectionIndex, itemIndex, model });
+    }
+    for (const [itemIndex, entry] of catalogEntries.entries()) {
+      const modelOverride = modelOverrides?.[entry.id];
+      items.push({
+        kind: 'catalog_entry',
+        connectionIndex,
+        itemIndex,
+        entry,
+        ...(modelOverride === undefined ? {} : { modelOverride }),
+      });
     }
   }
   return items;
@@ -1131,20 +1439,5 @@ async function settlesWithin<T>(promise: Promise<T>, label: string): Promise<T> 
 }
 
 async function waitFor(predicate: () => boolean, label: string): Promise<void> {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    if (predicate()) return;
-    await new Promise<void>((resolve) => setTimeout(resolve, 10));
-  }
-  throw new Error(`${label} did not occur`);
-}
-
-function deferred<T>(): {
-  readonly promise: Promise<T>;
-  resolve(value: T): void;
-} {
-  let resolve!: (value: T) => void;
-  const promise = new Promise<T>((settle) => {
-    resolve = settle;
-  });
-  return { promise, resolve };
+  await pollFor(predicate, { attempts: 100, pollMs: 10, message: `${label} did not occur` });
 }

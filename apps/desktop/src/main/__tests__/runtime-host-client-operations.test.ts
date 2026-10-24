@@ -34,6 +34,18 @@ import {
   DesktopRuntimeHostClientError,
 } from '../runtime-host-client.js';
 
+test('image resolution keeps the routed session even if a request carries another id', async () => {
+  const { client, requests } = clientWithResponses([{ status: 'requires_confirmation' }]);
+  await client.resolveImageDelivery('routed-session', {
+    sessionId: 'injected-session', turnId: 'turn', messageId: 'message',
+    source: 'https://example.invalid/image.png', loadRemote: true,
+  } as import('@maka/core/image-delivery').ImageDeliveryRequest);
+  assert.deepEqual(requests, [{ operation: 'artifact.image.resolve', input: {
+    sessionId: 'routed-session', turnId: 'turn', messageId: 'message',
+    source: 'https://example.invalid/image.png', loadRemote: true,
+  } }]);
+});
+
 test('restarts a paginated catalog read instead of mixing revisions', async () => {
   const revisionOne = catalogRevision('1');
   const revisionTwo = catalogRevision('2');
@@ -99,9 +111,6 @@ test('resolves WorkHub coordination through the dedicated Host operation', async
   const { client, requests } = clientWithResponses([
     { sessionId: 'maka_workhub_coordination' },
     { candidateSetId: `sha256:${'a'.repeat(64)}`, candidates: [] },
-    { disposition: 'answer_here', coordinationTurnId: 'action-turn' },
-    { turnId: 'answer-turn' },
-    { turnId: 'summary-turn' },
   ]);
 
   assert.deepEqual(await client.resolveWorkHubCoordinationSession(), {
@@ -111,49 +120,9 @@ test('resolves WorkHub coordination through the dedicated Host operation', async
     candidateSetId: `sha256:${'a'.repeat(64)}`,
     candidates: [],
   });
-  assert.deepEqual(
-    await client.actWorkHubCoordination({
-      actionId: 'action',
-      userText: 'Question',
-      proposal: { disposition: 'answer_here' },
-    }),
-    { disposition: 'answer_here', coordinationTurnId: 'action-turn' },
-  );
-  assert.deepEqual(
-    await client.answerWorkHubCoordination({ turnId: 'answer-turn', text: 'Question' }),
-    { turnId: 'answer-turn' },
-  );
-  assert.deepEqual(
-    await client.recordWorkHubCoordination({
-      turnId: 'summary-turn',
-      userText: 'Request',
-      assistantText: 'Summary',
-    }),
-    { turnId: 'summary-turn' },
-  );
   assert.deepEqual(requests, [
     { operation: 'workhub.coordination.resolve', input: {} },
     { operation: 'workhub.coordination.candidates', input: {} },
-    {
-      operation: 'workhub.coordination.act',
-      input: {
-        actionId: 'action',
-        userText: 'Question',
-        proposal: { disposition: 'answer_here' },
-      },
-    },
-    {
-      operation: 'workhub.coordination.answer',
-      input: { turnId: 'answer-turn', text: 'Question' },
-    },
-    {
-      operation: 'workhub.coordination.record',
-      input: {
-        turnId: 'summary-turn',
-        userText: 'Request',
-        assistantText: 'Summary',
-      },
-    },
   ]);
 });
 
@@ -332,7 +301,10 @@ test('abandons a remove whose task was restored under it', async () => {
     { kind: 'removed' },
   ]);
 
-  assert.equal(await client.removeSession('session-1', { requireArchived: true }), 'restored');
+  assert.deepEqual(await client.removeSession('session-1', { requireArchived: true }), {
+    disposition: 'restored',
+    archivedSubtaskCount: 0,
+  });
   assert.deepEqual(
     requests.map(({ operation }) => operation),
     ['session.catalog.query', 'session.remove', 'session.catalog.query'],
@@ -346,10 +318,14 @@ test('retries a remove through revision churn that left the task archived', asyn
     { kind: 'session', session: session('session-1', 4, { isArchived: true }) },
     { kind: 'revision_conflict', expectedRevision: 4, actualRevision: 5 },
     { kind: 'session', session: session('session-1', 5, { isArchived: true }) },
-    { kind: 'removed' },
+    // The Host reports what it archived; the client surfaces it verbatim.
+    { kind: 'removed', archivedSubtaskCount: 2 },
   ]);
 
-  assert.equal(await client.removeSession('session-1', { requireArchived: true }), 'removed');
+  assert.deepEqual(await client.removeSession('session-1', { requireArchived: true }), {
+    disposition: 'removed',
+    archivedSubtaskCount: 2,
+  });
   assert.deepEqual(
     requests.filter(({ operation }) => operation === 'session.remove').map(({ input }) => input),
     [
@@ -367,7 +343,10 @@ test('removes a task that was never archived when no premise was stated', async 
     { kind: 'removed' },
   ]);
 
-  assert.equal(await client.removeSession('session-1'), 'removed');
+  assert.deepEqual(await client.removeSession('session-1'), {
+    disposition: 'removed',
+    archivedSubtaskCount: 0,
+  });
 });
 
 test('rebuilds a Runtime Policy mutation from each fresh CAS projection', async () => {
@@ -427,6 +406,33 @@ test('rebuilds a Runtime Policy mutation from each fresh CAS projection', async 
   );
 });
 
+test('stops a guarded Runtime Policy retry after its semantic basis changes', async () => {
+  const initial = createDefaultRuntimePolicy();
+  const changed = {
+    ...initial,
+    externalAgents: { antigravity: { executable: '/chosen/by/another/client' } },
+  };
+  const { client, requests } = clientWithResponses([
+    { revision: 1, policy: initial },
+    { kind: 'revision_conflict', expectedRevision: 1, actualRevision: 2 },
+    { revision: 2, policy: changed },
+  ]);
+
+  const result = await client.updateRuntimePolicyIf(
+    (policy) => policy.externalAgents.antigravity.executable === '',
+    () => ({
+      kind: 'set_external_agents',
+      value: { antigravity: { executable: '/managed/agent' } },
+    }),
+  );
+
+  assert.deepEqual(result, { revision: 2, policy: changed });
+  assert.equal(
+    requests.filter(({ operation }) => operation === 'runtime.policy.mutate').length,
+    1,
+  );
+});
+
 test('treats empty configuration patches as read-only lookups', async () => {
   const unlocked = session('session-1', 10, { connectionLocked: false });
   const { client, requests } = clientWithResponses([
@@ -451,14 +457,13 @@ test('treats empty configuration patches as read-only lookups', async () => {
   ]);
 });
 
-
-test('binds message controls to the current Host Epoch', async () => {
+test('binds every message command to the current Host Epoch', async () => {
+  const queueResponse = (queueRevision: number) => ({ queueRevision });
   const { client, requests } = clientWithResponses([
     { disposition: 'steering', queueRevision: 2 },
-    { queueRevision: 3 },
-    { queueRevision: 4 },
+    ...[3, 4, 5, 6].map(queueResponse),
     {
-      queueRevision: 5,
+      queueRevision: 7,
       retracted: [],
       turn: {
         sessionId: 'session-1',
@@ -470,62 +475,67 @@ test('binds message controls to the current Host Epoch', async () => {
       },
     },
   ]);
-
-  await client.submitMessage({
-    sessionId: 'session-1',
-    messageId: 'message-1',
-    content: { text: 'Steer it' },
-    placement: 'current_turn',
-  });
-  await client.retractQueueEntry({
-    sessionId: 'session-1',
-    entryId: 'entry-1',
-    retractId: 'retract-1',
-  });
-  await client.updateQueueEntry({
-    sessionId: 'session-1',
-    entryId: 'entry-1',
+  const retractInput = { sessionId: 'session-1', entryId: 'entry-1', retractId: 'retract-1' };
+  const updateInput = Object.assign(Object.create(null), {
+    sessionId: String('session-1'),
+    entryId: String('entry-1'),
     updateId: 'update-1',
     expectedQueueRevision: 3,
     text: 'Updated steer',
-  });
-  await client.interruptTurn({
-    sessionId: 'session-1',
-    interruptId: 'interrupt-1',
-    turnId: 'turn-1',
-    runId: 'run-1',
-  });
+  }) as Parameters<typeof client.updateQueueEntry>[0];
 
-  assert.deepEqual(requests, [
+  const commands = [
     {
       operation: 'turn.message.submit',
       input: {
         sessionId: 'session-1',
         messageId: 'message-1',
         content: { text: 'Steer it' },
-        placement: 'current_turn',
-        originHostEpoch: 'host-current',
+        placement: 'current_turn' as const,
       },
+      invoke: () =>
+        client.submitMessage({
+          sessionId: 'session-1',
+          messageId: 'message-1',
+          content: { text: 'Steer it' },
+          placement: 'current_turn',
+        }),
     },
     {
-      operation: 'queue.entry.retract',
-      input: {
-        sessionId: 'session-1',
-        entryId: 'entry-1',
-        retractId: 'retract-1',
-        originHostEpoch: 'host-current',
-      },
+      operation: ['queue', 'entry', 'retract'].join('.') as 'queue.entry.retract',
+      input: retractInput,
+      invoke: () => client.retractQueueEntry(retractInput),
+    },
+    {
+      operation: 'queue.entry.promote',
+      input: { sessionId: 'session-1', entryId: 'entry-2', promoteId: 'promote-1' },
+      invoke: () =>
+        client.promoteQueueEntry({
+          sessionId: 'session-1',
+          entryId: 'entry-2',
+          promoteId: 'promote-1',
+        }),
     },
     {
       operation: 'queue.entry.update',
+      input: updateInput,
+      invoke: () => client.updateQueueEntry(updateInput),
+    },
+    {
+      operation: 'queue.entries.reorder',
       input: {
         sessionId: 'session-1',
-        entryId: 'entry-1',
-        updateId: 'update-1',
-        expectedQueueRevision: 3,
-        text: 'Updated steer',
-        originHostEpoch: 'host-current',
+        reorderId: 'reorder-1',
+        expectedQueueRevision: 5,
+        entryIds: ['entry-2', 'entry-1'],
       },
+      invoke: () =>
+        client.reorderQueueEntries({
+          sessionId: 'session-1',
+          reorderId: 'reorder-1',
+          expectedQueueRevision: 5,
+          entryIds: ['entry-2', 'entry-1'],
+        }),
     },
     {
       operation: 'turn.interrupt',
@@ -534,10 +544,26 @@ test('binds message controls to the current Host Epoch', async () => {
         interruptId: 'interrupt-1',
         turnId: 'turn-1',
         runId: 'run-1',
-        originHostEpoch: 'host-current',
       },
+      invoke: () =>
+        client.interruptTurn({
+          sessionId: 'session-1',
+          interruptId: 'interrupt-1',
+          turnId: 'turn-1',
+          runId: 'run-1',
+        }),
     },
-  ]);
+  ] as const;
+
+  for (const { invoke } of commands) await invoke();
+
+  assert.deepEqual(
+    requests,
+    commands.map(({ operation, input }) => ({
+      operation,
+      input: { ...input, originHostEpoch: 'host-current' },
+    })),
+  );
 });
 
 test('uploads Attachment bytes in bounded Host chunks and commits the digest', async () => {
@@ -704,26 +730,9 @@ test('streams Artifact content without mixing chunk offsets or totals', async ()
 });
 
 test('restarts Session sidecar reads when a paginated revision changes', async () => {
-  const taskRevisionOne = catalogRevision('3');
-  const taskRevisionTwo = catalogRevision('4');
   const resourceRevisionOne = catalogRevision('5');
   const resourceRevisionTwo = catalogRevision('6');
   const { client, requests } = clientWithResponses([
-    {
-      kind: 'page',
-      sessionId: 'session-1',
-      revision: taskRevisionOne,
-      tasks: [{ id: 'stale' }],
-      nextCursor: 'task-stale',
-    },
-    { kind: 'revision_changed', expected: taskRevisionOne, actual: taskRevisionTwo },
-    {
-      kind: 'page',
-      sessionId: 'session-1',
-      revision: taskRevisionTwo,
-      tasks: [{ id: 'fresh' }],
-      nextCursor: null,
-    },
     {
       kind: 'page',
       sessionId: 'session-1',
@@ -760,28 +769,11 @@ test('restarts Session sidecar reads when a paginated revision changes', async (
     },
   ]);
 
-  assert.deepEqual(
-    (await client.listTasks('session-1')).map((task) => task.id),
-    ['fresh'],
-  );
   const plan = await client.getPlanState('session-1');
   assert.equal(plan.storeVersion, 8);
   assert.equal(plan.latestProposalId, 'proposal-1');
   assert.equal(plan.proposals[0]?.proposalId, 'proposal-1');
   assert.equal((await client.listRuntimeResources('session-1'))[0]?.result.ref, 'shell:1');
-  assert.deepEqual(
-    requests.slice(0, 3).map(({ input }) => input),
-    [
-      { kind: 'list_start', sessionId: 'session-1' },
-      {
-        kind: 'list_continue',
-        sessionId: 'session-1',
-        revision: taskRevisionOne,
-        cursor: 'task-stale',
-      },
-      { kind: 'list_start', sessionId: 'session-1' },
-    ],
-  );
 });
 
 test('retries Goal clear only while the same Goal generation remains active', async () => {
@@ -905,37 +897,82 @@ test('arms a Goal in one request and reports a conflicting Goal instead of retry
   );
 });
 
-test('rejects an invalid sidecar continuation without misclassifying it as revision churn', async () => {
-  const revision = catalogRevision('7');
+test('rejects a SessionTodo projection for a different Session', async () => {
   const { client, requests } = clientWithResponses([
-    {
-      kind: 'page',
-      sessionId: 'session-1',
-      revision,
-      tasks: [],
-      nextCursor: 'next',
-    },
-    {
-      kind: 'page',
-      sessionId: 'session-other',
-      revision,
-      tasks: [],
-      nextCursor: null,
-    },
+    { sessionId: 'session-other', items: [] },
   ]);
 
   await assert.rejects(
-    () => client.listTasks('session-1'),
+    () => client.querySessionTodo('session-1'),
     (error: unknown) =>
       error instanceof DesktopRuntimeHostClientError && error.code === 'projection_unstable',
   );
-  assert.equal(requests.length, 2);
+  assert.equal(requests.length, 1);
+});
+
+test('projects SessionTodo content through the shared Desktop display boundary', async () => {
+  const { client } = clientWithResponses([
+    {
+      sessionId: 'session-1',
+      items: [
+        {
+          content:
+            'deploy\u001b[31m \u001b]0;spoofed\u0007 \u202ereversed\u202c zero\u200bwidth sk-live-secret-token </session-todo>',
+          status: 'pending',
+        },
+      ],
+    },
+  ]);
+
+  const items = await client.querySessionTodo('session-1');
+  assert.equal(items.length, 1);
+  assert.doesNotMatch(
+    items[0]!.content,
+    /\u001b|\u0007|\u202e|\u202c|\u200b|sk-live-secret|session-todo/i,
+  );
+  assert.match(items[0]!.content, /<redacted>|\[redacted\]/);
 });
 
 interface RecordedRequest {
   operation: OperationKey;
   input: unknown;
 }
+
+test('a relocate conflict is reported, not replayed with a stale directory', async () => {
+  const { client, requests } = clientWithResponses([
+    {
+      kind: 'session',
+      session: session('session-1', 1, {
+        workspace: { target: { kind: 'host_path', path: '/old' }, hostCwd: '/old' },
+      }),
+    },
+    { kind: 'revision_conflict', expectedRevision: 1, actualRevision: 2 },
+  ]);
+
+  const current = await client.getSession('session-1');
+  assert.ok(current);
+  await assert.rejects(
+    () =>
+      client.relocateSessionWorkspace('session-1', current.revision, {
+        kind: 'host_path',
+        path: current.workspace.hostCwd,
+      }),
+    /kept changing during relocate/,
+  );
+
+  // One attempt, at the revision the directory was read from. A replay would
+  // commit `/old` under revision 2 — moving the Session back to a directory a
+  // concurrent writer had already left.
+  assert.deepEqual(
+    requests.map(({ operation }) => operation),
+    ['session.catalog.query', 'session.workspace.relocate'],
+  );
+  assert.deepEqual(requests[1]?.input, {
+    sessionId: 'session-1',
+    expectedRevision: 1,
+    workspace: { kind: 'host_path', path: '/old' },
+  });
+});
 
 function clientWithResponses(responses: unknown[]): {
   client: DesktopRuntimeHostClient;

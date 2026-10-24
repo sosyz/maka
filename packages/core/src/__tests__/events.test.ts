@@ -17,16 +17,36 @@
  * under the License.
  */
 
+import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { expect } from './test-helpers.js';
 import {
   aggregateMessageContents,
   decodeToolStepProgress,
   encodeToolStepProgress,
+  decodeMessageContent,
+  foldAssistantDelta,
+  isQuoteRef,
 } from '../events.js';
 
+test('folds assistant deltas idempotently by source offset', () => {
+  assert.deepStrictEqual(foldAssistantDelta(0, { startOffset: 0, text: 'Hello' }), {
+    tail: 'Hello',
+    endOffset: 5,
+  });
+  assert.deepStrictEqual(foldAssistantDelta(5, { startOffset: 0, text: 'Hello world' }), {
+    tail: ' world',
+    endOffset: 11,
+  });
+  assert.deepStrictEqual(foldAssistantDelta(11, { startOffset: 0, text: 'Hello' }), {
+    tail: '',
+    endOffset: 11,
+  });
+  assert.deepStrictEqual(foldAssistantDelta(3, { text: 'abc' }), { tail: 'abc', endOffset: 6 });
+  assert.strictEqual(foldAssistantDelta(3, { startOffset: 4, text: 'gap' }), undefined);
+});
+
 test('aggregates inline references against the combined display text', () => {
-  expect(
+  assert.deepStrictEqual(
     aggregateMessageContents([
       {
         text: '<skill>Alpha</skill>\n\nFirst',
@@ -39,39 +59,59 @@ test('aggregates inline references against the combined display text', () => {
         inlineReferences: [{ kind: 'skill', value: '/skill:beta', label: 'Beta', start: 0 }],
       },
     ]),
-  ).toEqual({
-    text: '<skill>Alpha</skill>\n\nFirst\n\n<skill>Beta</skill>\n\nSecond',
-    displayText: '/skill:alpha First\n\n/skill:beta Second',
-    inlineReferences: [
-      { kind: 'skill', value: '/skill:alpha', label: 'Alpha', start: 0 },
-      { kind: 'skill', value: '/skill:beta', label: 'Beta', start: 20 },
-    ],
-  });
+    {
+      text: '<skill>Alpha</skill>\n\nFirst\n\n<skill>Beta</skill>\n\nSecond',
+      displayText: '/skill:alpha First\n\n/skill:beta Second',
+      inlineReferences: [
+        { kind: 'skill', value: '/skill:alpha', label: 'Alpha', start: 0 },
+        { kind: 'skill', value: '/skill:beta', label: 'Beta', start: 20 },
+      ],
+    },
+  );
 });
 
 test('preserves an explicit empty inline-reference marker while aggregating', () => {
-  expect(aggregateMessageContents([{ text: 'plain', inlineReferences: [] }])).toEqual({
+  assert.deepStrictEqual(aggregateMessageContents([{ text: 'plain', inlineReferences: [] }]), {
     text: 'plain',
     inlineReferences: [],
   });
 });
 
+test('round-trips Session snapshot provenance and rejects partial provenance', () => {
+  const quote = {
+    text: 'bounded excerpt',
+    label: 'Session: Research',
+    sourceSessionId: 'session-source',
+    sourceSessionName: 'Research',
+    sourceCapturedAt: 1_735_000_000_000,
+    sourceTruncated: true,
+  } as const;
+  assert.equal(isQuoteRef(quote), true);
+  assert.deepEqual(decodeMessageContent({ text: 'continue', quotes: [quote] }).quotes, [quote]);
+  assert.equal(isQuoteRef({ ...quote, sourceTruncated: undefined }), false);
+  assert.equal(isQuoteRef({ ...quote, sourceCapturedAt: Number.NaN }), false);
+  assert.equal(isQuoteRef({ ...quote, sourceCapturedAt: Number.MAX_VALUE }), false);
+  assert.equal(isQuoteRef({ ...quote, sourceCapturedAt: 8.64e15 + 1 }), false);
+  assert.equal(isQuoteRef({ ...quote, sourceCapturedAt: 8.64e15 }), true);
+});
+
 test('round-trips bounded tool step progress through the shared wire codec', () => {
   const encoded = encodeToolStepProgress({ current: 1, total: 2 });
 
-  expect(encoded).toBe('steps:1/2');
-  expect(decodeToolStepProgress(encoded!)).toEqual({ current: 1, total: 2 });
-  expect(
+  assert.strictEqual(encoded, 'steps:1/2');
+  assert.deepStrictEqual(decodeToolStepProgress(encoded!), { current: 1, total: 2 });
+  assert.deepStrictEqual(
     decodeToolStepProgress(
       encodeToolStepProgress({
         current: Number.MAX_SAFE_INTEGER,
         total: Number.MAX_SAFE_INTEGER,
       })!,
     ),
-  ).toEqual({
-    current: Number.MAX_SAFE_INTEGER,
-    total: Number.MAX_SAFE_INTEGER,
-  });
+    {
+      current: Number.MAX_SAFE_INTEGER,
+      total: Number.MAX_SAFE_INTEGER,
+    },
+  );
 });
 
 test('rejects invalid tool step progress at both codec boundaries', () => {
@@ -82,7 +122,7 @@ test('rejects invalid tool step progress at both codec boundaries', () => {
     { current: 0.5, total: 2 },
     { current: Number.MAX_SAFE_INTEGER + 1, total: Number.MAX_SAFE_INTEGER + 1 },
   ]) {
-    expect(encodeToolStepProgress(progress)).toBe(undefined);
+    assert.strictEqual(encodeToolStepProgress(progress), undefined);
   }
 
   for (const chunk of [
@@ -93,7 +133,7 @@ test('rejects invalid tool step progress at both codec boundaries', () => {
     'steps:0.5/2',
     'steps:9007199254740992/9007199254740992',
   ]) {
-    expect(decodeToolStepProgress(chunk)).toBe(undefined);
+    assert.strictEqual(decodeToolStepProgress(chunk), undefined);
   }
-  expect(decodeToolStepProgress({ kind: 'stdout', text: 'steps:1/2' })).toBe(undefined);
+  assert.strictEqual(decodeToolStepProgress({ kind: 'stdout', text: 'steps:1/2' }), undefined);
 });

@@ -23,14 +23,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, describe, test } from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
-import { createSqliteDeepResearchStore } from '../deep-research-store.js';
 import {
   createOperationalStateBackup,
   restoreOperationalStateBackup,
 } from '../operational-state-backup.js';
 import { openInteractiveScheduledTaskStoreForWrite } from '../scheduled-task-store.js';
 import { createSqlitePlanStore } from '../plan-store.js';
-import { createSqliteTaskLedgerStore } from '../task-ledger-store.js';
+import { createSqliteSessionTodoStore } from '../session-todo-store.js';
 import { SQLITE_WORKFLOW_SCHEMA_VERSION } from '../sqlite-workflow-schema.js';
 import { resolveStorageRoot, tryAcquireInteractiveRootOwner } from '../root-authority.js';
 import {
@@ -45,26 +44,57 @@ after(removeTrackedControlDirectories);
 const SESSION_ID = 'session-workflow';
 
 describe('SQLite workflow stores', () => {
-  test('persists Task Ledger exclusively through events', async () => {
+  test('lists only Sessions whose latest Plan lifecycle is active', async () => {
     await withRoot(async (root) => {
-      const store = createSqliteTaskLedgerStore(root);
-      const { created } = await store.create(SESSION_ID, [{ subject: 'Implement SQLite' }]);
-      assert.equal(created[0]?.status, 'pending');
-      store.close();
-
-      const reopened = createSqliteTaskLedgerStore(root);
+      const store = createSqlitePlanStore(root);
       try {
-        assert.equal((await reopened.list(SESSION_ID))[0]?.subject, 'Implement SQLite');
-      } finally {
-        reopened.close();
-      }
+        const approve = async (sessionId: string, suffix: string) => {
+          const submitted = await store.submitProposal({
+            operationId: `submit-${suffix}`,
+            sessionId,
+            turnId: `turn-${suffix}`,
+            title: `Plan ${suffix}`,
+            steps: [{ id: 'one', title: 'Recover', description: 'Verify active lifecycle' }],
+          });
+          assert.equal(submitted.event.type, 'plan_submitted');
+          if (submitted.event.type !== 'plan_submitted') throw new Error('Expected proposal');
+          const approved = await store.approveProposal({
+            operationId: `approve-${suffix}`,
+            sessionId,
+            proposalId: submitted.event.proposal.proposalId,
+            expectedRevision: submitted.event.proposal.revision,
+            expectedStoreVersion: submitted.state.storeVersion,
+          });
+          assert.equal(approved.event.type, 'plan_approved');
+          if (approved.event.type !== 'plan_approved') throw new Error('Expected approval');
+          return approved.event.execution.executionId;
+        };
 
-      const database = new DatabaseSync(join(root, 'runtime.sqlite'), { readOnly: true });
-      try {
-        assert.equal(rowCount(database, 'workflow_task_ledger_events'), 1);
-        assert.equal(tableExists(database, 'workflow_task_ledger_projections'), false);
+        await approve('active-session', 'active');
+        await store.submitProposal({
+          operationId: 'submit-only',
+          sessionId: 'submitted-session',
+          turnId: 'turn-submitted',
+          title: 'Not approved',
+          steps: [{ id: 'one', title: 'Wait', description: 'Remain a proposal' }],
+        });
+        await approve('interrupted-session', 'interrupted');
+        await store.interruptActiveExecution(
+          'interrupted-session',
+          'host restarted',
+          'interrupt-test',
+        );
+        const cancelledExecutionId = await approve('cancelled-session', 'cancelled');
+        await store.cancelExecution({
+          operationId: 'cancel-test',
+          sessionId: 'cancelled-session',
+          executionId: cancelledExecutionId,
+          reason: 'cancelled',
+        });
+
+        assert.deepEqual(await store.listPlanRecoverySessionIds(), ['active-session']);
       } finally {
-        database.close();
+        store.close();
       }
     });
   });
@@ -106,12 +136,8 @@ describe('SQLite workflow stores', () => {
     });
   });
 
-  test('migrates released workflow schema 9 projections to event-only schema 10', async () => {
+  test('migrates released workflow schema 9 projections to the current workflow schema', async () => {
     await withRoot(async (root) => {
-      const taskStore = createSqliteTaskLedgerStore(root);
-      await taskStore.create(SESSION_ID, [{ subject: 'Preserve event authority' }]);
-      taskStore.close();
-
       const planStore = createSqlitePlanStore(root, { newId: () => 'proposal-1', now: () => 100 });
       const submitted = await planStore.submitProposal({
         sessionId: SESSION_ID,
@@ -139,15 +165,6 @@ describe('SQLite workflow stores', () => {
         released.close();
       }
 
-      const migratedTasks = createSqliteTaskLedgerStore(root);
-      try {
-        assert.equal(
-          (await migratedTasks.list(SESSION_ID))[0]?.subject,
-          'Preserve event authority',
-        );
-      } finally {
-        migratedTasks.close();
-      }
       const migratedPlan = createSqlitePlanStore(root);
       try {
         assert.equal(
@@ -163,8 +180,55 @@ describe('SQLite workflow stores', () => {
         assert.equal(workflowSchemaVersion(verified), SQLITE_WORKFLOW_SCHEMA_VERSION);
         assert.equal(tableExists(verified, 'workflow_task_ledger_projections'), false);
         assert.equal(tableExists(verified, 'workflow_plan_projections'), false);
-        assert.equal(rowCount(verified, 'workflow_task_ledger_events'), 1);
         assert.equal(rowCount(verified, 'workflow_plan_events'), 1);
+      } finally {
+        verified.close();
+      }
+    });
+  });
+
+  test('restores SessionTodo storage and drops Task Ledger events from workflow schema 10', async () => {
+    await withRoot(async (root) => {
+      createSqliteSessionTodoStore(root).close();
+
+      // Recreate the schema-10 shape: SessionTodo storage did not exist yet and
+      // Task Ledger events did, so the migration has to add one and drop the other.
+      const released = new DatabaseSync(join(root, 'runtime.sqlite'));
+      try {
+        released.exec(`
+          CREATE TABLE workflow_task_ledger_events (
+            session_id TEXT NOT NULL,
+            sequence INTEGER NOT NULL CHECK (sequence >= 0),
+            event_id TEXT NOT NULL,
+            record_json TEXT NOT NULL,
+            PRIMARY KEY (session_id, sequence),
+            UNIQUE (session_id, event_id)
+          );
+        `);
+        released
+          .prepare(`
+            INSERT INTO workflow_task_ledger_events(session_id, sequence, event_id, record_json)
+            VALUES (?, 0, 'retired-event', '{}')
+          `)
+          .run(SESSION_ID);
+        released.exec('DROP TABLE workflow_session_todo_documents');
+        setWorkflowSchemaVersion(released, 10);
+      } finally {
+        released.close();
+      }
+
+      const migrated = createSqliteSessionTodoStore(root);
+      try {
+        assert.deepEqual(await migrated.readOrBootstrap(SESSION_ID), { items: [] });
+      } finally {
+        migrated.close();
+      }
+
+      const verified = new DatabaseSync(join(root, 'runtime.sqlite'), { readOnly: true });
+      try {
+        assert.equal(workflowSchemaVersion(verified), SQLITE_WORKFLOW_SCHEMA_VERSION);
+        assert.equal(tableExists(verified, 'workflow_task_ledger_events'), false);
+        assert.equal(rowCount(verified, 'workflow_session_todo_documents'), 1);
       } finally {
         verified.close();
       }
@@ -173,7 +237,7 @@ describe('SQLite workflow stores', () => {
 
   test('preserves every released projection when one table has unfamiliar DDL', async () => {
     await withRoot(async (root) => {
-      createSqliteTaskLedgerStore(root).close();
+      createSqlitePlanStore(root).close();
       const released = new DatabaseSync(join(root, 'runtime.sqlite'));
       try {
         installReleasedProjectionTables(released, { planVersionFloor: -1 });
@@ -193,7 +257,7 @@ describe('SQLite workflow stores', () => {
       }
 
       assert.throws(
-        () => createSqliteTaskLedgerStore(root),
+        () => createSqlitePlanStore(root),
         (error: unknown) =>
           error instanceof Error &&
           (error as { code?: unknown }).code === 'operational_state_migration_blocked' &&
@@ -206,7 +270,7 @@ describe('SQLite workflow stores', () => {
 
   test('preserves every released projection when one table carries an extra trigger', async () => {
     await withRoot(async (root) => {
-      createSqliteTaskLedgerStore(root).close();
+      createSqlitePlanStore(root).close();
       const released = new DatabaseSync(join(root, 'runtime.sqlite'));
       try {
         installReleasedProjectionTables(released);
@@ -233,7 +297,7 @@ describe('SQLite workflow stores', () => {
       }
 
       assert.throws(
-        () => createSqliteTaskLedgerStore(root),
+        () => createSqlitePlanStore(root),
         (error: unknown) =>
           error instanceof Error &&
           (error as { code?: unknown }).code === 'operational_state_migration_blocked' &&
@@ -246,7 +310,7 @@ describe('SQLite workflow stores', () => {
 
   test('preserves an unfamiliar projection whose table name differs only by case', async () => {
     await withRoot(async (root) => {
-      createSqliteTaskLedgerStore(root).close();
+      createSqlitePlanStore(root).close();
       const released = new DatabaseSync(join(root, 'runtime.sqlite'));
       try {
         installReleasedProjectionTables(released, {
@@ -268,7 +332,7 @@ describe('SQLite workflow stores', () => {
       }
 
       assert.throws(
-        () => createSqliteTaskLedgerStore(root),
+        () => createSqlitePlanStore(root),
         (error: unknown) =>
           error instanceof Error &&
           (error as { code?: unknown }).code === 'operational_state_migration_blocked' &&
@@ -281,7 +345,7 @@ describe('SQLite workflow stores', () => {
 
   test('preserves released projections with a sqliteX-prefixed trigger', async () => {
     await withRoot(async (root) => {
-      createSqliteTaskLedgerStore(root).close();
+      createSqlitePlanStore(root).close();
       const released = new DatabaseSync(join(root, 'runtime.sqlite'));
       try {
         installReleasedProjectionTables(released);
@@ -308,7 +372,7 @@ describe('SQLite workflow stores', () => {
       }
 
       assert.throws(
-        () => createSqliteTaskLedgerStore(root),
+        () => createSqlitePlanStore(root),
         (error: unknown) =>
           error instanceof Error &&
           (error as { code?: unknown }).code === 'operational_state_migration_blocked' &&
@@ -321,7 +385,7 @@ describe('SQLite workflow stores', () => {
 
   test('preserves released projections with a sqliteX-prefixed dependent view', async () => {
     await withRoot(async (root) => {
-      createSqliteTaskLedgerStore(root).close();
+      createSqlitePlanStore(root).close();
       const released = new DatabaseSync(join(root, 'runtime.sqlite'));
       try {
         installReleasedProjectionTables(released);
@@ -346,7 +410,7 @@ describe('SQLite workflow stores', () => {
       }
 
       assert.throws(
-        () => createSqliteTaskLedgerStore(root),
+        () => createSqlitePlanStore(root),
         (error: unknown) =>
           error instanceof Error &&
           (error as { code?: unknown }).code === 'operational_state_migration_blocked' &&
@@ -365,8 +429,13 @@ describe('SQLite workflow stores', () => {
 
   test('an older workflow reader rejects the newer schema without changing it', async () => {
     await withRoot(async (root) => {
-      const store = createSqliteTaskLedgerStore(root);
-      await store.create(SESSION_ID, [{ subject: 'Preserve newer workflow state' }]);
+      const store = createSqlitePlanStore(root, { newId: () => 'proposal-1', now: () => 100 });
+      await store.submitProposal({
+        sessionId: SESSION_ID,
+        turnId: 'turn-1',
+        title: 'Preserve newer workflow state',
+        steps: [{ id: 'one', title: 'Persist', description: 'Write one event' }],
+      });
       store.close();
 
       const newer = new DatabaseSync(join(root, 'runtime.sqlite'));
@@ -381,14 +450,14 @@ describe('SQLite workflow stores', () => {
       }
 
       assert.throws(
-        () => createSqliteTaskLedgerStore(root),
+        () => createSqlitePlanStore(root),
         /Operational schema workflow is newer than supported/u,
       );
 
       const preserved = new DatabaseSync(join(root, 'runtime.sqlite'), { readOnly: true });
       try {
         assert.equal(workflowSchemaVersion(preserved), SQLITE_WORKFLOW_SCHEMA_VERSION + 1);
-        assert.equal(rowCount(preserved, 'workflow_task_ledger_events'), 1);
+        assert.equal(rowCount(preserved, 'workflow_plan_events'), 1);
         assert.equal(
           (
             preserved.prepare('SELECT value FROM workflow_future_sentinel').get() as {
@@ -403,17 +472,13 @@ describe('SQLite workflow stores', () => {
     });
   });
 
-  test('backs up and restores event-only Task Ledger and Plan state', async () => {
+  test('backs up and restores Plan and initialized SessionTodo state', async () => {
     const base = await mkdtemp(join(tmpdir(), 'maka-workflow-backup-'));
     const stateRoot = join(base, 'state');
     const backupRoot = join(base, 'backup');
     const restoreRoot = join(base, 'restore');
     await mkdir(stateRoot);
     try {
-      const taskStore = createSqliteTaskLedgerStore(stateRoot);
-      await taskStore.create(SESSION_ID, [{ subject: 'Restore Task event' }]);
-      taskStore.close();
-
       const planStore = createSqlitePlanStore(stateRoot, {
         newId: () => 'backup-proposal',
         now: () => 100,
@@ -426,15 +491,16 @@ describe('SQLite workflow stores', () => {
       });
       planStore.close();
 
+      const todoStore = createSqliteSessionTodoStore(stateRoot);
+      await todoStore.replaceAll('todo-non-empty', [
+        { content: 'Restore current Todo', status: 'in_progress' },
+      ]);
+      await todoStore.replaceAll('todo-empty', []);
+      todoStore.close();
+
       await createOperationalStateBackup({ stateRoot, destinationRoot: backupRoot, now: () => 10 });
       await restoreOperationalStateBackup({ backupRoot, destinationRoot: restoreRoot });
 
-      const restoredTasks = createSqliteTaskLedgerStore(restoreRoot);
-      try {
-        assert.equal((await restoredTasks.list(SESSION_ID))[0]?.subject, 'Restore Task event');
-      } finally {
-        restoredTasks.close();
-      }
       const restoredPlan = createSqlitePlanStore(restoreRoot);
       try {
         assert.equal(
@@ -444,13 +510,22 @@ describe('SQLite workflow stores', () => {
       } finally {
         restoredPlan.close();
       }
+      const restoredTodos = createSqliteSessionTodoStore(restoreRoot);
+      try {
+        assert.deepEqual(await restoredTodos.readOrBootstrap('todo-non-empty'), {
+          items: [{ content: 'Restore current Todo', status: 'in_progress' }],
+        });
+        assert.deepEqual(await restoredTodos.readOrBootstrap('todo-empty'), { items: [] });
+      } finally {
+        restoredTodos.close();
+      }
 
       const restored = new DatabaseSync(join(restoreRoot, 'runtime.sqlite'), { readOnly: true });
       try {
         assert.equal(tableExists(restored, 'workflow_task_ledger_projections'), false);
         assert.equal(tableExists(restored, 'workflow_plan_projections'), false);
-        assert.equal(rowCount(restored, 'workflow_task_ledger_events'), 1);
         assert.equal(rowCount(restored, 'workflow_plan_events'), 1);
+        assert.equal(rowCount(restored, 'workflow_session_todo_documents'), 2);
       } finally {
         restored.close();
       }
@@ -630,26 +705,6 @@ describe('SQLite workflow stores', () => {
     });
   });
 
-  test('purges Task Ledger events for retired Sessions', async () => {
-    await withRoot(async (root) => {
-      const store = createSqliteTaskLedgerStore(root);
-      try {
-        await store.create(SESSION_ID, [{ subject: 'Disposable task' }]);
-        await store.purgeConversationTaskLedger(SESSION_ID);
-        assert.deepEqual(await store.list(SESSION_ID), []);
-      } finally {
-        store.close();
-      }
-
-      const database = new DatabaseSync(join(root, 'runtime.sqlite'), { readOnly: true });
-      try {
-        assert.equal(rowCount(database, 'workflow_task_ledger_events'), 0);
-      } finally {
-        database.close();
-      }
-    });
-  });
-
   test('purges Plan events for retired Sessions', async () => {
     await withRoot(async (root) => {
       const store = createSqlitePlanStore(root);
@@ -668,38 +723,6 @@ describe('SQLite workflow stores', () => {
           proposals: [],
           executions: [],
         });
-      } finally {
-        store.close();
-      }
-    });
-  });
-
-  test('persists Deep Research events', async () => {
-    await withRoot(async (root) => {
-      const store = createSqliteDeepResearchStore(root, {
-        newId: () => 'research-1',
-        now: () => 200,
-      });
-      await store.start(SESSION_ID, 'Map the SQLite authority', 'deep');
-      store.close();
-
-      const reopened = createSqliteDeepResearchStore(root);
-      try {
-        assert.equal((await reopened.read(SESSION_ID))?.objective, 'Map the SQLite authority');
-      } finally {
-        reopened.close();
-      }
-    });
-  });
-
-  test('purges Deep Research events for retired Sessions', async () => {
-    await withRoot(async (root) => {
-      const store = createSqliteDeepResearchStore(root);
-      try {
-        await store.start(SESSION_ID, 'Remove the retired research workspace', 'standard');
-        await store.purgeSessionState(SESSION_ID);
-        assert.equal(await store.read(SESSION_ID), undefined);
-        assert.deepEqual(await store.readEvents(SESSION_ID), []);
       } finally {
         store.close();
       }
@@ -764,6 +787,7 @@ describe('SQLite workflow stores', () => {
             execution: {
               cwd: '/workspace',
               backend: 'ai-sdk',
+              llmConnectionId: 'connection-default',
               llmConnectionSlug: 'default',
               model: 'test-model',
               permissionMode: 'ask',
@@ -774,6 +798,10 @@ describe('SQLite workflow stores', () => {
           createdBy: { kind: 'user' },
         },
         now,
+      );
+      assert.equal(
+        task.effect.kind === 'agent_run' ? task.effect.execution.llmConnectionId : undefined,
+        'connection-default',
       );
       const claim = await store.claimNow(task.id, now);
       await store.bindFireExecution(claim.id, {
@@ -815,6 +843,7 @@ describe('SQLite workflow stores', () => {
                 kind: 'agent_run',
                 execution: {
                   cwd: '/workspace',
+                  llmConnectionId: 'connection-default',
                   llmConnectionSlug: 'default',
                   model: 'test-model',
                   permissionMode: 'execute',
@@ -837,6 +866,7 @@ describe('SQLite workflow stores', () => {
             kind: 'agent_run',
             execution: {
               cwd: '/workspace',
+              llmConnectionId: 'connection-default',
               llmConnectionSlug: 'default',
               model: 'test-model',
               permissionMode: 'ask',

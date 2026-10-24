@@ -18,24 +18,31 @@
  */
 
 import type { InteractiveArtifactStoreWriter } from '@maka/storage/artifact-stores';
-import type { InteractiveTaskLedgerWriter } from '@maka/storage/task-ledger-authority';
+import type { InteractiveSessionTodoWriter } from '@maka/storage/session-todo-authority';
+import type { InteractiveContextOffloadWriter } from '@maka/storage/context-offload-store';
 
 export interface SessionSidecarPurgeAuthority {
   readonly artifacts: Pick<InteractiveArtifactStoreWriter, 'purgeSessionArtifacts'>;
-  readonly taskLedger: Pick<InteractiveTaskLedgerWriter, 'purgeConversationTaskLedger'>;
+  readonly sessionTodo: Pick<InteractiveSessionTodoWriter, 'purgeSessionState'>;
+  readonly contextOffload?: Pick<InteractiveContextOffloadWriter, 'retireSession'>;
   readonly purgeOperationalState: (sessionId: string) => Promise<void>;
+  readonly onArtifactsPurged?: (sessionId: string) => void;
 }
 
 export async function purgeSessionSidecars(
   authority: SessionSidecarPurgeAuthority,
   sessionId: string,
 ): Promise<void> {
-  const outcomes = await Promise.allSettled([
+  const [artifactPurge, ...sidecarPurges] = await Promise.allSettled([
     authority.artifacts.purgeSessionArtifacts(sessionId),
-    authority.taskLedger.purgeConversationTaskLedger(sessionId),
+    authority.sessionTodo.purgeSessionState(sessionId),
+    ...(authority.contextOffload ? [authority.contextOffload.retireSession(sessionId)] : []),
     authority.purgeOperationalState(sessionId),
   ]);
-  const failures = outcomes.flatMap((outcome) =>
+  // Invalidation is idempotent and must happen even when the Artifact purge
+  // rejects: a failed purge may have removed only part of the Session's data.
+  authority.onArtifactsPurged?.(sessionId);
+  const failures = [artifactPurge, ...sidecarPurges].flatMap((outcome) =>
     outcome.status === 'rejected' ? [outcome.reason] : [],
   );
   if (failures.length > 0) {

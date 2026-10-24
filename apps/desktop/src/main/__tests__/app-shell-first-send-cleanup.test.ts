@@ -32,16 +32,24 @@
  * no E2E can reach deterministically.
  */
 
+import { deferred } from '@maka/core/test-only/async-primitives';
 import { strict as assert } from 'node:assert';
 import { describe, it } from 'node:test';
+import { act, createElement } from 'react';
+import type { StoredMessage } from '@maka/core/session';
+import { cleanupFakeDom, installReactRenderer } from './fake-dom.js';
+import {
+  ConversationServicesProvider,
+} from '../../renderer/features/conversation/index.js';
+import { createSessionCatalogController } from '../../renderer/application/contracts/session-catalog/session-catalog-state.js';
 
-import type { LiveTurnProjection } from '@maka/ui';
-import type { DesktopTranscriptRangeController } from '../../renderer/desktop-transcript-range-store.js';
-import { createAppShellChatActions } from '../../renderer/app-shell-chat-actions.js';
+import { LocaleProvider, ToastProvider, type LiveTurnProjection } from '@maka/ui';
+import type { DesktopTranscriptRangeController } from '../../renderer/platform/desktop/desktop-transcript-range-store.js';
+import { createChatActions } from '../../renderer/features/conversation/testing.js';
+import { prepareTranscriptForSend, stubConversationServices, createConversationWorkspace, createTranscriptCommands } from '../../renderer/features/conversation/testing.js';
 
 import {
   createActionsDeps,
-  createTurnState,
   installWindow,
 } from './app-shell-chat-actions-fixture.js';
 
@@ -60,7 +68,7 @@ describe('composer first-send cleanup', () => {
     });
 
     try {
-      const actions = createAppShellChatActions({
+      const actions = createChatActions({
         ...createActionsDeps(),
         activeIdRef,
         captureComposerImportOwner: () => ({
@@ -76,6 +84,86 @@ describe('composer first-send cleanup', () => {
 
       assert.equal(await sending, false);
       assert.equal(sends, 0, 'readiness for session A must never authorize a send to session B');
+    } finally {
+      restoreWindow();
+    }
+  });
+
+  it('rejects a same-target New Task reopen while readiness is pending', async () => {
+    const readiness = deferred<boolean>();
+    let revision = 1;
+    let creates = 0;
+    let resolved = 0;
+    const restoreWindow = installWindow({
+      newTasks: { create: async () => { creates += 1; return { id: 'stale-session' }; } },
+    });
+    try {
+      const actions = createChatActions({
+        ...createActionsDeps(),
+        captureComposerImportOwner: () => ({
+          sessionId: undefined,
+          navSection: 'sessions',
+          newTaskDraftKey: 'same-project',
+        }),
+        captureSelection: () => {
+          const captured = revision;
+          return () => captured === revision;
+        },
+        checkTaskSubmissionReadiness: () => readiness.promise,
+      });
+      const sending = actions.send('old draft', undefined, {
+        onSessionResolved: () => { resolved += 1; },
+      });
+      revision += 1;
+      readiness.resolve(true);
+      assert.equal(await sending, false);
+      assert.equal(creates, 0);
+      assert.equal(resolved, 0);
+    } finally {
+      restoreWindow();
+    }
+  });
+
+  it('retires an unsent Session if its New Task surface reopens during creation', async () => {
+    const created = deferred<{ id: string }>();
+    const enteredCreate = deferred<void>();
+    let revision = 1;
+    let activated = 0;
+    let submitted = 0;
+    let resolved = 0;
+    const removed: string[] = [];
+    const restoreWindow = installWindow({
+      newTasks: { create: () => { enteredCreate.resolve(); return created.promise; } },
+      sessions: {
+        remove: async (id: string) => { removed.push(id); },
+        submitMessage: async () => { submitted += 1; },
+      },
+    });
+    try {
+      const actions = createChatActions({
+        ...createActionsDeps(),
+        captureComposerImportOwner: () => ({
+          sessionId: undefined,
+          navSection: 'sessions',
+          newTaskDraftKey: 'same-project',
+        }),
+        captureSelection: () => {
+          const captured = revision;
+          return () => captured === revision;
+        },
+        activateSessionForFirstSend: async () => { activated += 1; },
+      });
+      const sending = actions.send('old draft', undefined, {
+        onSessionResolved: () => { resolved += 1; },
+      });
+      await enteredCreate.promise;
+      revision += 1;
+      created.resolve({ id: 'stale-session' });
+      assert.equal(await sending, false);
+      assert.deepEqual(removed, ['stale-session']);
+      assert.equal(activated, 0);
+      assert.equal(submitted, 0);
+      assert.equal(resolved, 0);
     } finally {
       restoreWindow();
     }
@@ -108,7 +196,7 @@ describe('composer first-send cleanup', () => {
           model: 'mimo-v2.5-free',
         },
       };
-      assert.equal(await createAppShellChatActions(deps).send('hello'), true);
+      assert.equal(await createChatActions(deps).send('hello'), true);
     } finally {
       restoreWindow();
     }
@@ -155,7 +243,7 @@ describe('composer first-send cleanup', () => {
         ...createActionsDeps(),
         newChatPermissionChoice: 'bypass' as const,
       };
-      assert.equal(await createAppShellChatActions(deps).send('hello'), true);
+      assert.equal(await createChatActions(deps).send('hello'), true);
     } finally {
       restoreWindow();
     }
@@ -167,9 +255,10 @@ describe('composer first-send cleanup', () => {
     assert.equal(settingsUpdates, 0);
   });
 
-  it('does not re-send a consumed permission choice on the next task', async () => {
+  it('retains the permission choice across refused and throwing first sends, then consumes it on success', async () => {
     const createInputs: unknown[] = [];
     let cleared = 0;
+    const removed: string[] = [];
     const restoreWindow = installWindow({
       newTasks: {
         create: async (_target: unknown, input: unknown) => {
@@ -178,20 +267,19 @@ describe('composer first-send cleanup', () => {
         },
       },
       sessions: {
-        submitMessage: async () => ({
-          ok: true,
-          attachments: [],
-          skillInvocation: { loaded: [], failed: [] },
-        }),
+        remove: async (id: string) => { removed.push(id); },
+        submitMessage: async () => {
+          if (createInputs.length === 1) {
+            return { ok: false, reason: 'skill_invocation_failed', skillInvocation: { loaded: [], failed: [] } };
+          }
+          if (createInputs.length === 2) throw new Error('First submission failed');
+          return { ok: true, attachments: [], skillInvocation: { loaded: [], failed: [] } };
+        },
       },
     });
 
     try {
-      // The choice is keyed by Host/project target, not by draft, so task B on
-      // the same target sees whatever task A left behind. Consuming it on a
-      // successful create is what keeps a one-task elevation from becoming a
-      // standing one.
-      let choice: 'bypass' | undefined = 'bypass';
+      let choice: 'ask' | undefined = 'ask';
       const deps = () => ({
         ...createActionsDeps(),
         newChatPermissionChoice: choice,
@@ -200,15 +288,24 @@ describe('composer first-send cleanup', () => {
           choice = undefined;
         },
       });
-      assert.equal(await createAppShellChatActions(deps()).send('task A'), true);
-      assert.equal(await createAppShellChatActions(deps()).send('task B'), true);
+      assert.equal(await createChatActions(deps()).send('task A'), false);
+      assert.equal(choice, 'ask');
+      assert.deepEqual(removed, ['session-1']);
+      assert.equal(await createChatActions(deps()).send('retry task A'), false);
+      assert.equal(choice, 'ask');
+      assert.deepEqual(removed, ['session-1', 'session-2']);
+      assert.equal(await createChatActions(deps()).send('retry task A again'), true);
+      assert.equal(choice, undefined);
+      assert.equal(await createChatActions(deps()).send('task B'), true);
     } finally {
       restoreWindow();
     }
 
     assert.equal(cleared, 1);
-    assert.equal((createInputs[0] as { permissionMode?: unknown }).permissionMode, 'bypass');
-    assert.ok(!('permissionMode' in (createInputs[1] as Record<string, unknown>)));
+    assert.equal((createInputs[0] as { permissionMode?: unknown }).permissionMode, 'ask');
+    assert.equal((createInputs[1] as { permissionMode?: unknown }).permissionMode, 'ask');
+    assert.equal((createInputs[2] as { permissionMode?: unknown }).permissionMode, 'ask');
+    assert.ok(!('permissionMode' in (createInputs[3] as Record<string, unknown>)));
   });
 
   it('creates the first session on the selected Runtime Host and project', async () => {
@@ -240,7 +337,7 @@ describe('composer first-send cleanup', () => {
           projectId: 'project-docs',
         },
       };
-      assert.equal(await createAppShellChatActions(deps).send('hello'), true);
+      assert.equal(await createChatActions(deps).send('hello'), true);
     } finally {
       restoreWindow();
     }
@@ -267,7 +364,7 @@ describe('composer first-send cleanup', () => {
     });
 
     try {
-      assert.equal(await createAppShellChatActions(createActionsDeps()).send('hello'), false);
+      assert.equal(await createChatActions(createActionsDeps()).send('hello'), false);
     } finally {
       restoreWindow();
     }
@@ -277,6 +374,7 @@ describe('composer first-send cleanup', () => {
 
   it('keeps the session once the first send lands', async () => {
     const removed: string[] = [];
+    let currentDraftKey = 'draft:project-A';
     const restoreWindow = installWindow({
       newTasks: { create: async () => ({ id: 'session-1' }) },
       sessions: {
@@ -294,7 +392,28 @@ describe('composer first-send cleanup', () => {
     });
 
     try {
-      assert.equal(await createAppShellChatActions(createActionsDeps()).send('hello'), true);
+      const actions = createChatActions({
+        ...createActionsDeps(),
+        captureComposerImportOwner: () => ({
+          sessionId: undefined,
+          navSection: 'sessions',
+          newTaskDraftKey: currentDraftKey,
+        }),
+        checkTaskSubmissionReadiness: async () => {
+          currentDraftKey = 'draft:project-B';
+          return true;
+        },
+      });
+      let resolved: [string, string?] | undefined;
+      assert.equal(
+        await actions.send('hello', undefined, {
+          onSessionResolved: (...args) => {
+            resolved = args;
+          },
+        }),
+        true,
+      );
+      assert.deepEqual(resolved, ['session-1', 'draft:project-A']);
     } finally {
       restoreWindow();
     }
@@ -302,7 +421,35 @@ describe('composer first-send cleanup', () => {
     assert.deepEqual(removed, []);
   });
 
-  it('waits for the new session observation before submitting its first message', async () => {
+  it('does not report a resolved session when the first send outcome is unknown', async () => {
+    let resolved = 0;
+    const restoreWindow = installWindow({
+      newTasks: { create: async () => ({ id: 'session-1' }) },
+      sessions: {
+        // `outcome_unknown`: the Host may have admitted the Message, so the
+        // Session is kept and the send counts as landed — but nothing proves
+        // the outcome, so it must not look like a resolved Session. The Work
+        // Board only links a task to a Session whose first send projected.
+        submitMessage: async () => ({ ok: false as const, reason: 'outcome_unknown' as const }),
+      },
+    });
+
+    try {
+      const actions = createChatActions(createActionsDeps());
+      const result = await actions.send('hello', undefined, {
+        onSessionResolved: () => {
+          resolved += 1;
+        },
+      });
+      assert.equal(result, true);
+    } finally {
+      restoreWindow();
+    }
+
+    assert.equal(resolved, 0);
+  });
+
+  it('projects the first message before activation while waiting to submit until observation', async () => {
     const observation = deferred<void>();
     const order: string[] = [];
     const activeIdRef = { current: undefined as string | undefined };
@@ -322,22 +469,25 @@ describe('composer first-send cleanup', () => {
     });
 
     try {
-      const sending = createAppShellChatActions({
+      const sending = createChatActions({
         ...createActionsDeps(),
         activeIdRef,
-        activateSessionForFirstSend: async (sessionId) => {
+        addTransientMessage: () => {
+          order.push('optimistic');
+        },
+        activateSessionForFirstSend: async (session) => {
           order.push('observe');
-          activeIdRef.current = sessionId;
+          activeIdRef.current = session.id;
           await observation.promise;
           order.push('seeded');
         },
       }).send('hello');
       await new Promise((resolve) => setImmediate(resolve));
-      assert.deepEqual(order, ['create', 'observe']);
+      assert.deepEqual(order, ['create', 'optimistic', 'observe']);
 
       observation.resolve();
       assert.equal(await sending, true);
-      assert.deepEqual(order, ['create', 'observe', 'seeded', 'submit']);
+      assert.deepEqual(order, ['create', 'optimistic', 'observe', 'seeded', 'submit']);
     } finally {
       restoreWindow();
     }
@@ -362,15 +512,15 @@ describe('composer first-send cleanup', () => {
     });
 
     try {
-      const actions = createAppShellChatActions({
+      const actions = createChatActions({
         ...createActionsDeps(),
         activeIdRef,
-        activateSessionForFirstSend: async (sessionId) => {
-          activeIdRef.current = sessionId;
+        activateSessionForFirstSend: async (session) => {
+          activeIdRef.current = session.id;
           throw new Error('Timed out while preparing the new Session event stream');
         },
-        setActiveId: (sessionId) => {
-          activeIdRef.current = sessionId;
+        retireSession: (sessionId) => {
+          if (activeIdRef.current === sessionId) activeIdRef.current = undefined;
         },
         isNewChatSendSurfaceActive: () => activeIdRef.current === undefined,
         isShellSurfaceOwnerActive: (owner) =>
@@ -407,7 +557,7 @@ describe('composer first-send cleanup', () => {
     });
 
     try {
-      const actions = createAppShellChatActions({
+      const actions = createChatActions({
         ...createActionsDeps(),
         activeIdRef: { current: 'existing-session' },
       });
@@ -419,21 +569,84 @@ describe('composer first-send cleanup', () => {
     assert.deepEqual(removed, []);
   });
 
-  it('returns a sparse existing session to latest before sending', async () => {
-    const latest = deferred<void>();
+  it('does not report a resolved Session from an existing-Session send', async () => {
+    // `onSessionResolved` is the contract for a Session this send created and
+    // whose first message projected (the new-Session branch). An existing-
+    // Session send must never fire it, or a consumer binding follow-up state
+    // to a newly resolved Session (e.g. a Work Board start claim) would bind
+    // it to an unrelated pre-existing conversation.
+    let resolved = 0;
+    const restoreWindow = installWindow({
+      sessions: {
+        submitMessage: async () => ({
+          ok: true,
+          attachments: [],
+          skillInvocation: { loaded: [], failed: [] },
+        }),
+      },
+    });
+
+    try {
+      const actions = createChatActions({
+        ...createActionsDeps(),
+        activeIdRef: { current: 'existing-session' },
+      });
+      const result = await actions.send('hello', undefined, {
+        onSessionResolved: () => {
+          resolved += 1;
+        },
+      });
+      assert.equal(result, true);
+    } finally {
+      restoreWindow();
+    }
+
+    assert.equal(resolved, 0);
+  });
+
+  it('does not report a resolved Session when the first send is outcome_unknown', async () => {
+    // `onSessionResolved` is the contract for a Session this send created AND
+    // whose first message projected. `outcome_unknown` maps to `unreconciled`:
+    // `send()` intentionally returns `true` (the Message may well have been
+    // admitted), but the callback must not fire — a consumer binding follow-up
+    // state to a newly resolved Session (e.g. a Work Board start claim) would
+    // otherwise bind to a Session whose first message was never confirmed.
+    let resolved = 0;
+    const removed: string[] = [];
+    const restoreWindow = installWindow({
+      newTasks: { create: async () => ({ id: 'session-1' }) },
+      sessions: {
+        submitMessage: async () => ({
+          ok: false,
+          reason: 'outcome_unknown' as const,
+        }),
+        remove: async (sessionId: string) => {
+          removed.push(sessionId);
+        },
+      },
+    });
+
+    try {
+      const actions = createChatActions(createActionsDeps());
+      const result = await actions.send('hello', undefined, {
+        onSessionResolved: () => {
+          resolved += 1;
+        },
+      });
+      // The row stays for canonical transcript to settle, so the session is
+      // kept and the send reports success — only the callback is silenced.
+      assert.equal(result, true);
+      assert.deepEqual(removed, []);
+    } finally {
+      restoreWindow();
+    }
+
+    assert.equal(resolved, 0);
+  });
+
+  it('cancels restoration and follows latest before accepting a message', async () => {
     const order: string[] = [];
     const activeIdRef = { current: 'existing-session' as string | undefined };
-    const transcript = {
-      store: {
-        range: () => ({ sessionId: 'existing-session', hasNewer: true }),
-        snapshot: () => ({ messages: [] }),
-      },
-      async loadLatest() {
-        order.push('latest');
-        await latest.promise;
-      },
-    } as unknown as DesktopTranscriptRangeController;
-    const transcriptRangeRef = { current: transcript as DesktopTranscriptRangeController | undefined };
     const restoreWindow = installWindow({
       sessions: {
         submitMessage: async () => {
@@ -444,30 +657,92 @@ describe('composer first-send cleanup', () => {
     });
 
     try {
-      const sending = createAppShellChatActions({
+      const sending = createChatActions({
         ...createActionsDeps(),
         activeIdRef,
-        transcriptRangeRef,
+        onFollowLatest: (sessionId) => prepareTranscriptForSend({
+          sessionId, currentSessionId: activeIdRef,
+          cancel: () => { order.push('cancel-restore'); },
+          followLatest: () => { order.push('follow-latest'); },
+        }),
       }).send('hello');
-      await new Promise((resolve) => setImmediate(resolve));
-      assert.deepEqual(order, ['latest']);
-      latest.resolve();
       assert.equal(await sending, true);
-      assert.deepEqual(order, ['latest', 'send']);
+      assert.deepEqual(order, ['cancel-restore', 'follow-latest', 'send']);
     } finally {
       restoreWindow();
     }
   });
-});
 
-function deferred<T>() {
-  let resolve!: (value: T | PromiseLike<T>) => void;
-  const promise = new Promise<T>((settle) => {
-    resolve = settle;
+  it('refresh waits for durable messages without bypassing range publication', async () => {
+    const catalog = createSessionCatalogController();
+    const workspace = createConversationWorkspace(catalog, stubConversationServices().observation);
+    workspace.commands.setActiveId('session');
+    let durable = false;
+    const answer = { type: 'assistant', id: 'answer', text: 'done', ts: 1 } as StoredMessage;
+    const ready = deferred<void>();
+    const controller = {
+      ready: () => ready.promise,
+      waitForDurableMessage: async () => { durable = true; return true; },
+      store: {
+        range: () => ({ sessionId: 'session', ready: true, hasOlder: false }),
+        snapshot: () => ({ sessionId: 'session', messages: [answer] }),
+        hasDurableMessage: () => durable,
+      },
+    } as unknown as DesktopTranscriptRangeController;
+    workspace.transcriptRangeRef.current = controller;
+    const actions = createTranscriptCommands(workspace, { current: { locale: 'en', toast: { error: () => '' } } });
+    const refresh = actions.refreshMessages('session', { requiredAssistantMessageId: 'answer' });
+    assert.equal(durable, false);
+    ready.resolve();
+    assert.equal(await refresh, false, 'durability cannot retire the live answer before publication');
+    workspace.commitTranscript('session', [answer], controller);
+    assert.equal(await actions.refreshMessages('session', { requiredAssistantMessageId: 'answer' }), true);
   });
-  return { promise, resolve };
-}
 
+  it('a parked reader settles only after durable proof without publishing the unseen tail', async () => {
+    const catalog = createSessionCatalogController();
+    const workspace = createConversationWorkspace(catalog, stubConversationServices().observation);
+    workspace.commands.setActiveId('session');
+    let durable = false;
+    const controller = {
+      ready: async () => {},
+      waitForDurableMessage: async () => durable,
+      store: {
+        snapshot: () => ({ sessionId: 'session', messages: [], hasNewer: true }),
+        hasDurableMessage: () => false,
+      },
+    } as unknown as DesktopTranscriptRangeController;
+    workspace.transcriptRangeRef.current = controller;
+    const actions = createTranscriptCommands(workspace, { current: { locale: 'en', toast: { error: () => '' } } });
+    assert.equal(await actions.refreshMessages('session', { requiredAssistantMessageId: 'answer' }), false);
+    durable = true;
+    assert.equal(await actions.refreshMessages('session', { requiredAssistantMessageId: 'answer' }), true);
+  });
+
+  it('an in-flight refresh reads publication that commits after the call began', async () => {
+    const catalog = createSessionCatalogController();
+    const workspace = createConversationWorkspace(catalog, stubConversationServices().observation);
+    workspace.commands.setActiveId('session');
+    const answer = { type: 'assistant', id: 'answer', text: 'done', ts: 1 } as StoredMessage;
+    const ready = deferred<void>();
+    const controller = {
+      ready: () => ready.promise,
+      store: {
+        range: () => ({ sessionId: 'session', ready: true, hasOlder: false }),
+        snapshot: () => ({ sessionId: 'session', messages: [answer] }),
+        hasDurableMessage: () => true,
+      },
+    } as unknown as DesktopTranscriptRangeController;
+    workspace.transcriptRangeRef.current = controller;
+    const actions = createTranscriptCommands(workspace, { current: { locale: 'en', toast: { error: () => '' } } });
+    const refresh = actions.refreshMessages('session', { requiredAssistantMessageId: 'answer' });
+    workspace.commitTranscript('session', [answer], controller);
+    ready.resolve();
+    assert.equal(await refresh, true, 'the original invocation must see the new publication');
+    assert.equal(workspace.isMessagePublished({ ...answer }), false, 'same id is not the published version');
+  });
+
+});
 /**
  * #1433 round 5: the failure feedback for a send is addressed to the surface
  * that sent, and `showModelSetupToast` is not just a toast — it ends in
@@ -494,7 +769,7 @@ describe('composer send failure feedback', () => {
     const restoreWindow = installWindow(readinessFailure());
 
     try {
-      const actions = createAppShellChatActions({
+      const actions = createChatActions({
         ...createActionsDeps(),
         activeIdRef: { current: 'session-a' },
         // The user is on 技能 now. `activeId` is still 'session-a' — that is
@@ -511,30 +786,12 @@ describe('composer send failure feedback', () => {
     assert.deepEqual(setupToasts, [], 'a stale surface must not be navigated to 设置 · 模型');
   });
 
-  it('does not invent a live turn when the send never lands', async () => {
-    const turnState = createTurnState();
-    const restoreWindow = installWindow(readinessFailure());
-
-    try {
-      const actions = createAppShellChatActions({
-        ...createActionsDeps(),
-        activeIdRef: { current: 'session-a' },
-        setLiveTurnBySession: turnState.setLiveTurnBySession,
-      });
-      assert.equal(await actions.send('hello'), false);
-    } finally {
-      restoreWindow();
-    }
-
-    assert.deepEqual(turnState.liveTurnBySession, {}, 'the arm must be disarmed');
-  });
-
   it('still answers the surface that is actually waiting', async () => {
     const setupToasts: string[] = [];
     const restoreWindow = installWindow(readinessFailure());
 
     try {
-      const actions = createAppShellChatActions({
+      const actions = createChatActions({
         ...createActionsDeps(),
         activeIdRef: { current: 'session-a' },
         isShellSurfaceOwnerActive: () => true,

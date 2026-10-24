@@ -61,6 +61,9 @@ export function projectSharedSessionTranscriptMessage(
           ? {}
           : { steeringEventId: message.steeringEventId }),
         ...(message.origin === undefined ? {} : { origin: message.origin }),
+        ...(message.coordinationActionId === undefined
+          ? {}
+          : { coordinationActionId: message.coordinationActionId }),
       };
     }
     case 'assistant':
@@ -105,6 +108,7 @@ export function projectSharedSessionTranscriptMessage(
         ts: message.ts,
         toolUseId: message.toolUseId,
         isError: message.isError,
+        ...(message.outcome === undefined ? {} : { outcome: message.outcome }),
         content: message.content,
         ...(message.durationMs === undefined ? {} : { durationMs: message.durationMs }),
         ...(message.origin === undefined ? {} : { origin: message.origin }),
@@ -136,7 +140,7 @@ export function projectSharedSessionTranscriptMessage(
         ...(message.abortedAt === undefined ? {} : { abortedAt: message.abortedAt }),
         ...(message.abortSource === undefined ? {} : { abortSource: message.abortSource }),
         ...(message.errorClass === undefined ? {} : { errorClass: message.errorClass }),
-        partialOutputRetained: message.partialOutputRetained,
+        ...(message.retry === undefined ? {} : { retry: message.retry }),
       };
     case 'token_usage':
       return {

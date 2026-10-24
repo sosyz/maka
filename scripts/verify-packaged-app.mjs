@@ -23,7 +23,7 @@ import { createReadStream, readFileSync } from 'node:fs';
 import { access, mkdir, readFile, readdir } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { createServer } from 'node:net';
-import { join, resolve, sep } from 'node:path';
+import { join, posix, resolve, sep } from 'node:path';
 import {
   ASSET_LICENSED_RENDERER_PACKAGES,
   collectProductionClosure,
@@ -173,9 +173,18 @@ export async function findRendererTarget(port, child, { timeoutMs = 90_000 } = {
       });
       if (response.ok) {
         const targets = await response.json();
-        const page = targets.find(
-          (target) => target.type === 'page' && target.webSocketDebuggerUrl,
-        );
+        // Startup and recovery windows can appear before the application.
+        // Only the packaged main entry owns the bridge and app-shell contract;
+        // selecting the first page pins subsequent probes to a temporary window.
+        const page = targets.find((target) => {
+          if (target.type !== 'page' || !target.webSocketDebuggerUrl) return false;
+          try {
+            const url = new URL(target.url);
+            return url.protocol === 'file:' && url.pathname.endsWith('/dist-renderer/index.html');
+          } catch {
+            return false;
+          }
+        });
         if (page) return page;
       }
     } catch (error) {
@@ -616,14 +625,38 @@ export async function exercisePackagedRendererMaximizeRestore(rendererTarget, ch
 }
 
 export async function stopChild(child) {
-  if (child.exitCode !== null) return;
-  child.kill('SIGTERM');
-  const exited = await Promise.race([
-    new Promise((resolvePromise) => child.once('exit', () => resolvePromise(true))),
-    delay(5_000).then(() => false),
-  ]);
-  if (!exited && child.exitCode === null) {
-    child.kill('SIGKILL');
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  let onExit;
+  const exited = new Promise((resolvePromise) => {
+    onExit = resolvePromise;
+    child.once('exit', onExit);
+  });
+  let timeout;
+  try {
+    child.kill('SIGTERM');
+    await Promise.race([
+      exited,
+      new Promise((resolvePromise) => {
+        timeout = setTimeout(resolvePromise, 5_000);
+      }),
+    ]);
+    clearTimeout(timeout);
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill('SIGKILL');
+      // Sending a signal does not mean the process has stopped writing to its
+      // profile. Reap it before callers remove the temporary verification tree.
+      await Promise.race([
+        exited,
+        new Promise((_, reject) => {
+          timeout = setTimeout(() => {
+            reject(new Error(`Process ${child.pid} did not exit within 10000ms after SIGKILL`));
+          }, 10_000);
+        }),
+      ]);
+    }
+  } finally {
+    clearTimeout(timeout);
+    child.removeListener('exit', onExit);
   }
 }
 
@@ -715,8 +748,12 @@ export async function smokePackagedRenderer(
     },
   );
   let stderr = '';
+  let startupStderr = '';
+  let stderrLength = 0;
   child.stderr.setEncoding('utf8');
   child.stderr.on('data', (chunk) => {
+    startupStderr = `${startupStderr}${chunk}`.slice(0, 16_384);
+    stderrLength += chunk.length;
     stderr = `${stderr}${chunk}`.slice(-16_384);
   });
 
@@ -728,7 +765,11 @@ export async function smokePackagedRenderer(
       await exercisePackagedRendererMaximizeRestore(target, child);
     }
   } catch (error) {
-    throw new Error(`${error.message}${stderr.trim() ? `\n${stderr.trim()}` : ''}`);
+    const diagnostics =
+      stderrLength > 16_384
+        ? `${startupStderr}\n[packaged-renderer] last stderr output:\n${stderr}`
+        : stderr;
+    throw new Error(`${error.message}${diagnostics.trim() ? `\n${diagnostics.trim()}` : ''}`);
   } finally {
     await stopChild(child);
   }
@@ -766,23 +807,20 @@ function asarFilesUnder(header, prefix) {
 // Line-bounded on purpose: a lazy cross-line match reads the word `from`
 // inside a comment as an import and reports the prose that follows it. A
 // multi-line `import {` list is covered by its closing line.
-const BARE_IMPORT_PATTERNS = [
+const IMPORT_PATTERNS = [
   /^[ \t]*(?:import|export)[ \t]+(?:[^'"\n]*?[ \t]+from[ \t]+)?['"]([^'"\n]+)['"]/gm,
   /^[ \t]*\}[ \t]+from[ \t]+['"]([^'"\n]+)['"]/gm,
   /\b(?:import|require)\([ \t]*['"]([^'"\n]+)['"][ \t]*\)/g,
 ];
 
-/** Package names the given module text imports by name, ignoring builtins. */
-export function bareImportedPackages(source) {
-  const names = new Set();
-  for (const pattern of BARE_IMPORT_PATTERNS) {
+function importedSpecifiers(source) {
+  const specifiers = new Set();
+  for (const pattern of IMPORT_PATTERNS) {
     for (const [, specifier] of source.matchAll(pattern)) {
-      if (/^[./]|^node:/.test(specifier)) continue;
-      const segments = specifier.split('/');
-      names.add(specifier.startsWith('@') ? segments.slice(0, 2).join('/') : segments[0]);
+      specifiers.add(specifier);
     }
   }
-  return names;
+  return specifiers;
 }
 
 // Provided by the Electron runtime rather than the archive's node_modules, so
@@ -947,9 +985,20 @@ export async function assertPackagedDependencyClosure(
   const unresolvable = new Map();
   for (const path of asarFilesUnder(asar().getRawHeader(asarPath).header, 'dist')) {
     if (!/\.(?:js|cjs|mjs)$/.test(path)) continue;
-    for (const name of bareImportedPackages(
-      asar().extractFile(asarPath, asarLookupPath(path)).toString('utf8'),
-    )) {
+    const source = asar().extractFile(asarPath, asarLookupPath(path)).toString('utf8');
+    for (const specifier of importedSpecifiers(source)) {
+      if (specifier.startsWith('.')) {
+        const target = posix.normalize(posix.join(posix.dirname(path), specifier));
+        try {
+          asar().statFile(asarPath, asarLookupPath(target));
+        } catch {
+          throw new Error(`app.asar ships ${path} importing missing file ${target}`);
+        }
+        continue;
+      }
+      if (/^\/|^node:/.test(specifier)) continue;
+      const segments = specifier.split('/');
+      const name = specifier.startsWith('@') ? segments.slice(0, 2).join('/') : segments[0];
       // Being in the closure is not enough — the code has to resolve at
       // runtime, and only the archive can answer that. A package that is
       // allowed but absent is exactly the ERR_MODULE_NOT_FOUND this check
@@ -1002,11 +1051,6 @@ export async function assertPackagedResources(
     requirePath,
     forbidPath = assertMissing,
     requireWindowsSandbox = process.platform === 'win32',
-    // Current ASF artifacts must not carry Git. The Windows upgrade lane also
-    // verifies a previously released installer, whose historical contract did
-    // require the bundled distribution and its compliance files; keep that
-    // baseline explicit instead of judging old bytes by today's absence rule.
-    bundledGitContract = 'forbidden',
     // The upgrade-lifecycle check runs this against a previously released
     // build, which predates the disclaimer being packaged. Requiring it there
     // would fail a release that was correct when it shipped.
@@ -1025,26 +1069,15 @@ export async function assertPackagedResources(
     // Current Desktop builds ship the direct-peer Client addon beside its Rust
     // notices. Upgrade baselines may predate both resources.
     requireDirectPeerArtifact = true,
+    // Upgrade baselines may still ship the worker as `filesystem-worker.js`.
+    requireMjsFilesystemWorker = true,
   } = {},
 ) {
-  if (bundledGitContract !== 'forbidden' && bundledGitContract !== 'legacy-required') {
-    throw new Error(`Unknown bundled Git artifact contract: ${bundledGitContract}`);
-  }
-  const requiresLegacyBundledGit = bundledGitContract === 'legacy-required';
   const required = [
     'app.asar',
     'bundled-tools.json',
-    ...(requiresLegacyBundledGit
-      ? [
-          'bundled-git.json',
-          join('licenses', 'git', 'LICENSE.txt'),
-          join('licenses', 'git', 'SOURCE_OFFER.txt'),
-          join('licenses', 'dugite', 'LICENSE'),
-          join('licenses', 'git', 'NOTICE.txt'),
-        ]
-      : []),
     ...(requireCanonicalIcon ? [join('assets', 'icon.png')] : []),
-    join('workers', 'filesystem-worker.js'),
+    ...(requireMjsFilesystemWorker ? [join('workers', 'filesystem-worker.mjs')] : []),
     ...(requireDirectPeerArtifact
       ? [
           join('runtime-host-peer', 'maka_runtime_host_peer.node'),
@@ -1070,11 +1103,9 @@ export async function assertPackagedResources(
     join('licenses', 'renderer', 'THIRD_PARTY_LICENSES.txt'),
     join('licenses', 'renderer', 'GEIST_LICENSE.txt'),
     join('licenses', 'renderer', 'GEIST_MONO_LICENSE.txt'),
-    join('licenses', 'renderer', 'ANT_DESIGN_ICONS_LICENSE.txt'),
     join('licenses', 'renderer', 'SIMPLE_ICONS_LICENSE.md'),
     join('licenses', 'renderer', 'TDESIGN_ICONS_LICENSE.txt'),
     join('licenses', 'renderer', 'ALLOGO_LICENSE.txt'),
-    join('licenses', 'renderer', 'SEMI_ICONS_LICENSE.txt'),
     join('licenses', 'renderer', 'MINGCUTE_APACHE_LICENSE.txt'),
     ...(requireWindowsSandbox
       ? [
@@ -1087,9 +1118,13 @@ export async function assertPackagedResources(
     await requirePath(join(resourcesPath, path));
   }
   const forbidden = [
-    ...(requiresLegacyBundledGit
-      ? []
-      : ['git', 'bundled-git.json', join('licenses', 'dugite'), join('licenses', 'git')]),
+    // No packaged artifact carries Git any more, and no baseline that did is
+    // still published, so the absence rule applies to every build this
+    // verifier can be pointed at.
+    'git',
+    'bundled-git.json',
+    join('licenses', 'dugite'),
+    join('licenses', 'git'),
     join('tools', 'officecli'),
     join('licenses', 'officecli'),
     // cua-driver is gone from this repository, and these two forbids stay for the

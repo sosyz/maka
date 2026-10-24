@@ -24,10 +24,18 @@ import {
   type MessageContent,
 } from '@maka/core/events';
 import {
+  decodeSkillInvocationResult,
+  type SkillInvocationResult,
+} from '@maka/core/skill-invocation';
+import {
   normalizeSubmittedTurnIntent,
   submittedTurnIntentsEqual,
   type SubmittedTurnIntent,
 } from './submitted-turn-intent.js';
+import {
+  normalizeRootTurnSourceMessages,
+  type RootTurnSourceMessage,
+} from './agent-run-store-contract.js';
 
 const SAFE_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 
@@ -50,12 +58,12 @@ export interface PendingMessageAdmission {
    * same submit reads as a different one.
    */
   readonly submittedIntent?: SubmittedTurnIntent;
+  /** The Skill resolution answer returned for this admitted Message. */
+  readonly skillInvocation: SkillInvocationResult;
   readonly admittedAt: number;
 }
 
-export interface ProvenRootMessageHandoff {
-  readonly messageId: string;
-  readonly content: MessageContent;
+export interface ProvenRootMessageHandoff extends RootTurnSourceMessage {
   readonly admittedAt: number;
 }
 
@@ -79,6 +87,11 @@ export interface MarkMessagesHandedOffInput {
   readonly provenSteeringMessages?: readonly ProvenSteeringMessageHandoff[];
 }
 
+export type MessageAdmissionCancellationClaimOutcome =
+  | 'cancelled_by_claim'
+  | 'same_claim'
+  | 'already_cancelled';
+
 export interface MessageAdmissionStore {
   commitMessageAdmission(admission: PendingMessageAdmission): Promise<PendingMessageAdmission>;
   readMessageAdmission(
@@ -91,10 +104,19 @@ export interface MessageAdmissionStore {
    * own columns never leave this layer.
    */
   hasCancelledMessageAdmission(sessionId: string, messageId: string): Promise<boolean>;
+  claimMessageAdmissionCancellation(
+    sessionId: string,
+    messageId: string,
+    claimId: string,
+  ): Promise<MessageAdmissionCancellationClaimOutcome>;
   listMessageAdmissions(sessionId: string): Promise<readonly PendingMessageAdmission[]>;
   markMessagesHandedOff(input: MarkMessagesHandedOffInput): Promise<void>;
   updateMessageAdmission(admission: PendingMessageAdmission): Promise<void>;
-  reorderMessageAdmissions(sessionId: string, messageIds: readonly string[]): Promise<void>;
+  reorderMessageAdmissions(
+    sessionId: string,
+    messageIds: readonly string[],
+    disposition?: 'steering' | 'followup',
+  ): Promise<void>;
   cancelMessageAdmissions(sessionId: string, messageIds: readonly string[]): Promise<void>;
 }
 
@@ -127,6 +149,7 @@ export function normalizePendingMessageAdmission(
     ...(admission.submittedIntent
       ? { submittedIntent: normalizeSubmittedTurnIntent(admission.submittedIntent) }
       : {}),
+    skillInvocation: decodeSkillInvocationResult(admission.skillInvocation),
   });
   if (!/^sha256:[a-f0-9]{64}$/u.test(normalized.submittedContentDigest)) {
     throw new Error('Invalid pending Message submitted content digest');
@@ -137,13 +160,14 @@ export function normalizePendingMessageAdmission(
 export function normalizeProvenRootMessageHandoff(
   handoff: ProvenRootMessageHandoff,
 ): ProvenRootMessageHandoff {
-  assertSafeId(handoff.messageId, 'Invalid proven Root Message identity');
   if (!Number.isSafeInteger(handoff.admittedAt) || handoff.admittedAt < 0) {
     throw new Error('Invalid proven Root Message timestamp');
   }
+  const { admittedAt, ...source } = handoff;
+  const normalized = normalizeRootTurnSourceMessages([source])[0]!;
   return Object.freeze({
-    ...handoff,
-    content: decodeMessageContent(handoff.content),
+    ...normalized,
+    admittedAt,
   });
 }
 
@@ -181,6 +205,7 @@ export function samePendingMessageAdmission(
     a.disposition === b.disposition &&
     a.admittedAt === b.admittedAt &&
     submittedTurnIntentsEqual(a.submittedIntent, b.submittedIntent) &&
+    isDeepStrictEqual(a.skillInvocation, b.skillInvocation) &&
     isDeepStrictEqual(a.content, b.content)
   );
 }

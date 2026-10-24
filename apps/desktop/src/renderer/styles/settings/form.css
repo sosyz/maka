@@ -106,22 +106,6 @@
    explanatory wash). */
 .settingsQuietStatus {
   margin: 0;
-  color: var(--foreground-secondary);
-  font: var(--maka-text-body);
-}
-
-.settingsQuietCallout {
-  display: grid;
-  gap: var(--space-1);
-}
-
-.settingsQuietCallout strong {
-  color: var(--foreground);
-  font: var(--maka-text-label);
-}
-
-.settingsQuietCallout p {
-  margin: 0;
-  color: var(--foreground-secondary);
+  color: var(--muted-foreground);
   font: var(--maka-text-body);
 }

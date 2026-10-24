@@ -22,11 +22,12 @@ import { createHash } from 'node:crypto';
 import { createReadStream, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { copyFile, mkdtemp, realpath, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { isAbsolute, join, relative, resolve } from 'node:path';
+import { basename, isAbsolute, join, relative, resolve } from 'node:path';
 import {
   DEFAULT_PROCESS_TERMINATION_GRACE_MS,
   terminateChildProcessTree,
 } from '@maka/runtime/process-tree-terminator';
+import { isProductReleaseVersion } from '@maka/runtime-host/operator';
 const DEVELOPMENT_ARCHIVE_ENV = 'MAKA_RUNTIME_HOST_SETUP_ARCHIVE';
 
 export type DesktopRuntimeHostSetupPackage =
@@ -35,6 +36,8 @@ export type DesktopRuntimeHostSetupPackage =
       readonly kind: 'development_archive';
       readonly path: string;
       readonly integrity: string;
+      /** Presentation only. Package validation remains authoritative during staging. */
+      readonly displayVersion?: string;
     };
 
 function isExactRuntimeHostSetupPackageSpecifier(value: unknown): value is string {
@@ -51,6 +54,14 @@ export function runtimeHostSetupPackageVersion(
     throw new Error('Runtime Host setup package must use an exact Maka version');
   }
   return setupPackage.specifier.slice('maka-agent@'.length);
+}
+
+export function runtimeHostSetupPackageDisplayVersion(
+  setupPackage: DesktopRuntimeHostSetupPackage,
+): string | undefined {
+  return setupPackage.kind === 'development_archive'
+    ? setupPackage.displayVersion
+    : runtimeHostSetupPackageVersion(setupPackage);
 }
 
 interface DevelopmentArchiveBuild {
@@ -75,14 +86,22 @@ export type DesktopRuntimeHostDevelopmentPeerTarget =
 
 export interface RuntimeHostSetupPackageResolver {
   readonly mode: 'published' | 'development';
+  /** Resolve for a peer target the caller chose, such as a probed SSH host. */
   resolve(
     peerTarget: DesktopRuntimeHostDevelopmentPeerTarget,
     signal?: AbortSignal,
   ): Promise<DesktopRuntimeHostSetupPackage>;
+  /**
+   * Resolve for the desktop's own machine. The development peer target is read
+   * only where a development build needs it to pick an npm prebuild, so a
+   * packaged build on a tuple that has no prebuild — macOS x64 — still resolves
+   * the setup package it ships with.
+   */
+  resolveForThisDesktop(signal?: AbortSignal): Promise<DesktopRuntimeHostSetupPackage>;
   close(): Promise<void>;
 }
 
-export function desktopRuntimeHostDevelopmentPeerTarget(
+function desktopRuntimeHostDevelopmentPeerTarget(
   platform: NodeJS.Platform = process.platform,
   arch: string = process.arch,
 ): Exclude<DesktopRuntimeHostDevelopmentPeerTarget, 'none'> {
@@ -174,29 +193,37 @@ export function createRuntimeHostSetupPackageResolver(input: {
     }
   };
 
+  const resolveSetupPackage = async (
+    readPeerTarget: () => DesktopRuntimeHostDevelopmentPeerTarget,
+    signal?: AbortSignal,
+  ): Promise<DesktopRuntimeHostSetupPackage> => {
+    if (closed) throw new Error('Runtime Host setup package resolver is closed');
+    if (input.isPackaged) return packagedSetupPackage(input.appPath);
+
+    const override = input.environment[DEVELOPMENT_ARCHIVE_ENV];
+    if (override) {
+      const snapshot = await waitForPackage(resolveOverrideSnapshot(override), signal);
+      return snapshot.setupPackage;
+    }
+
+    const peerTarget = readPeerTarget();
+    const build = await acquireBuild(peerTarget, signal);
+    build.waiters += 1;
+    try {
+      return await waitForPackage(build.result, signal);
+    } finally {
+      build.waiters -= 1;
+      if (signal?.aborted && build.waiters === 0 && !build.settled) {
+        await stopBuild(peerTarget, build);
+      }
+    }
+  };
+
   return {
     mode: input.isPackaged ? 'published' : 'development',
-    async resolve(peerTarget, signal) {
-      if (closed) throw new Error('Runtime Host setup package resolver is closed');
-      if (input.isPackaged) return packagedSetupPackage(input.appPath);
-
-      const override = input.environment[DEVELOPMENT_ARCHIVE_ENV];
-      if (override) {
-        const snapshot = await waitForPackage(resolveOverrideSnapshot(override), signal);
-        return snapshot.setupPackage;
-      }
-
-      const build = await acquireBuild(peerTarget, signal);
-      build.waiters += 1;
-      try {
-        return await waitForPackage(build.result, signal);
-      } finally {
-        build.waiters -= 1;
-        if (signal?.aborted && build.waiters === 0 && !build.settled) {
-          await stopBuild(peerTarget, build);
-        }
-      }
-    },
+    resolve: (peerTarget, signal) => resolveSetupPackage(() => peerTarget, signal),
+    resolveForThisDesktop: (signal) =>
+      resolveSetupPackage(desktopRuntimeHostDevelopmentPeerTarget, signal),
     async close() {
       if (closed) return;
       closed = true;
@@ -308,15 +335,19 @@ function startDevelopmentArchiveBuild(
   };
 }
 
-async function developmentSetupPackage(path: string): Promise<DesktopRuntimeHostSetupPackage> {
+async function developmentSetupPackage(
+  path: string,
+): Promise<Extract<DesktopRuntimeHostSetupPackage, { readonly kind: 'development_archive' }>> {
   const archive = await realpath(path);
   if (!(await stat(archive)).isFile() || !archive.endsWith('.tgz')) {
     throw new Error('Runtime Host development package must be a .tgz file');
   }
+  const displayVersion = developmentArchiveDisplayVersion(archive);
   return {
     kind: 'development_archive',
     path: archive,
     integrity: await sha512Integrity(archive),
+    ...(displayVersion ? { displayVersion } : {}),
   };
 }
 
@@ -332,11 +363,21 @@ async function snapshotDevelopmentSetupPackage(path: string): Promise<{
   const snapshot = join(root, 'package.tgz');
   try {
     await copyFile(source, snapshot);
-    return { root, setupPackage: await developmentSetupPackage(snapshot) };
+    const setupPackage = await developmentSetupPackage(snapshot);
+    const displayVersion = developmentArchiveDisplayVersion(source);
+    return {
+      root,
+      setupPackage: displayVersion ? { ...setupPackage, displayVersion } : setupPackage,
+    };
   } catch (error) {
     await rm(root, { recursive: true, force: true });
     throw error;
   }
+}
+
+function developmentArchiveDisplayVersion(path: string): string | undefined {
+  const match = /^maka-agent-(.+)\.tgz$/u.exec(basename(path));
+  return match?.[1] && isProductReleaseVersion(match[1]) ? match[1] : undefined;
 }
 
 function sha512Integrity(path: string): Promise<string> {

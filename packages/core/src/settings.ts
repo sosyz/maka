@@ -40,6 +40,7 @@ import type { UsageProvenance } from './usage-ledger-merge.js';
 import {
   UI_LOCALE_PREFERENCES,
   isUiLocalePreference,
+  normalizeUiLocalePreference,
   type UiLocalePreference,
 } from './ui-locale.js';
 import { normalizeSubagentSettings, type SubagentSettings } from './subagent-settings.js';
@@ -67,6 +68,30 @@ export {
   parseAllowedUserIdsFromText,
 } from './bot-chat-settings.js';
 
+export const USAGE_SCREEN_SEARCH_MAX_BYTES = 1024;
+const USAGE_SCREEN_UTF8 = new TextEncoder();
+
+/** Shared domain for the Usage screen's free-text query at every boundary. */
+export function isUsageScreenSearch(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    USAGE_SCREEN_UTF8.encode(value).byteLength <= USAGE_SCREEN_SEARCH_MAX_BYTES
+  );
+}
+
+/**
+ * Persisted Usage timestamps may retain sub-millisecond precision. Keep them
+ * JSON/SQLite round-trip safe so a stored value can also name a continuation.
+ */
+export function isUsageTimestamp(value: unknown): value is number {
+  return (
+    typeof value === 'number' &&
+    Number.isFinite(value) &&
+    value >= 0 &&
+    value <= Number.MAX_SAFE_INTEGER
+  );
+}
+
 export const SETTINGS_SECTIONS = [
   'general',
   'appearance',
@@ -75,6 +100,7 @@ export const SETTINGS_SECTIONS = [
   'daily-review',
   'models',
   'subagents',
+  'external-agents',
   'usage',
   // `maka://settings/<section>` is a public deep link, so the id names what
   // the page is rather than the noun it lives under.
@@ -99,9 +125,44 @@ export interface NetworkProxySettings {
   port: number;
   authEnabled: boolean;
   username: string;
-  password: string;
   bypassList: string[];
   autoBypassDomains: string[];
+}
+
+export interface NetworkProxyCredentialTarget {
+  readonly protocol: ProxyProtocol;
+  readonly host: string;
+  readonly port: number;
+  readonly username: string;
+}
+
+export function networkProxyCredentialTarget(
+  proxy: Pick<NetworkProxySettings, 'protocol' | 'host' | 'port' | 'username'>,
+): NetworkProxyCredentialTarget {
+  return {
+    protocol: proxy.protocol,
+    host: proxy.host.trim().toLowerCase(),
+    port: proxy.port,
+    username: proxy.username,
+  };
+}
+
+export type NetworkProxyCredentialOperation =
+  | {
+      kind: 'replace';
+      secret: string;
+      expectedTarget?: NetworkProxyCredentialTarget;
+    }
+  | { kind: 'delete' };
+
+/** A write-only proxy patch. Credential operations are never persisted. */
+export type NetworkProxySettingsPatch = Partial<NetworkProxySettings> & {
+  credential?: NetworkProxyCredentialOperation;
+};
+
+/** Runtime Host read projection; the saved secret itself never crosses IPC. */
+export interface RuntimeHostNetworkProxySettings extends NetworkProxySettings {
+  readonly passwordConfigured: boolean;
 }
 
 /**
@@ -402,7 +463,13 @@ export function normalizeTerminalFontSize(value: unknown): number {
   );
 }
 
+export type WorkbarTogglePosition = 'titlebar' | 'edge';
+
 export interface AppearanceSettings {
+  /** Show personal-assistant index workers and delegated tasks in session navigation. */
+  showAssistantBackgroundSessions?: boolean;
+  /** Where the desktop exposes the Workbar expand/collapse control. */
+  workbarTogglePosition?: WorkbarTogglePosition;
   theme: ThemePreference;
   /** Optional palette override; missing values normalize to `default`. */
   palette?: ThemePalette;
@@ -449,7 +516,7 @@ export interface PrivacySettings {
 }
 
 /**
- * `explore` is excluded — it's reserved for Deep Research sessions and
+ * `explore` is excluded — it's reserved for read-only sessions and
  * Bot-incoming guards and is never a mode the user picks, in the composer
  * dropdown or here. Derived from the canonical PERMISSION_MODES (not a
  * hand-copied literal) so adding a future mode updates every consumer —
@@ -474,28 +541,20 @@ export function isChatDefaultPermissionMode(value: unknown): value is ChatDefaul
 /** Seeds new sessions' starting permission mode (Settings → 通用 → 默认权限模式). */
 export interface ChatDefaultsSettings {
   permissionMode: ChatDefaultPermissionMode;
-  /**
-   * Seeds new sessions' thinking level. `undefined` means "whatever the model
-   * does on its own" — the absence of a preference, not a level.
-   *
-   * A chosen level is a wish, not a guarantee: models expose different ladders,
-   * so one that does not offer the chosen rung falls back to its own default
-   * for that session rather than being forced to the nearest neighbour. The
-   * composer already resolves it that way for the per-session picker.
-   */
+  /** Applies only when a new task is created. */
+  codeModeEnabled?: boolean;
+  /** @deprecated Read-only compatibility for older settings; new tasks ignore it. */
   thinkingLevel?: ThinkingLevel;
 }
 
 /**
- * Desktop OS notifications (Settings → 通用 → 通知). The runtime only
- * knows a turn ended from the renderer; the main process owns the focus
- * gate + native `Notification`, so this is a pure product on/off toggle.
+ * Client-local preference for desktop notifications.
  */
 export interface NotificationSettings {
   /**
-   * When enabled, the desktop app raises a native notification once an
-   * agent turn finishes (completed or errored) **while its window is not
-   * focused**. Focus + OS-permission gating live in the main process.
+   * When enabled, the desktop app raises a native notification and bounces
+   * the dock once an agent turn finishes (completed or errored) or waits on the user
+   * **while its window is not focused**. Delivery still depends on OS permissions.
    */
   runComplete: boolean;
 }
@@ -532,6 +591,8 @@ export interface ShellSettings {
 }
 
 export interface AppSettings {
+  /** Host-owned projection. apiKey is masked; writes go to the Host credential vault. */
+  jev: { enabled: boolean; apiKey: string };
   schemaVersion: 1;
   network: AppNetworkSettings;
   botChat: BotChatSettings;
@@ -548,8 +609,15 @@ export interface AppSettings {
   notifications: NotificationSettings;
   workHub: WorkHubSettings;
   system: SystemSettings;
+  externalAgents: { antigravity: { executable: string } };
   shell: ShellSettings;
   subagents: SubagentSettings;
+}
+
+export interface RuntimeHostAppSettings extends Omit<AppSettings, 'network'> {
+  network: {
+    proxy: RuntimeHostNetworkProxySettings;
+  };
 }
 
 export interface UsageRequestLog {
@@ -588,6 +656,13 @@ export interface UsageSummary {
 }
 
 export interface UsageStats {
+  navigation?: {
+    activityTotal: number;
+    revision: string;
+    queryIdentity: string;
+    query: UsageScreenQuery;
+    nextCursor: string | null;
+  };
   summary: UsageSummary;
   logs: UsageRequestLog[];
   byProvider: Array<{
@@ -630,6 +705,54 @@ export interface UsageStats {
   logsTruncated?: boolean;
 }
 
+/** A fixed query; activity filters never change headline accounting. */
+export interface UsageScreenQuery {
+  range: { from: number; to: number };
+  search: string;
+  status: 'all' | 'success' | 'error' | 'aborted';
+}
+
+export interface UsageActivityPage {
+  revision: string;
+  queryIdentity: string;
+  logs: UsageRequestLog[];
+  nextCursor: string | null;
+}
+
+export interface UsageScreen extends UsageStats, UsageActivityPage {
+  activityTotal: number;
+  query: UsageScreenQuery;
+}
+
+export type UsageScreenFailure =
+  | { kind: 'revision_changed' }
+  | {
+      kind: 'screen_response_too_large';
+      section:
+        | 'provider_breakdown'
+        | 'model_breakdown'
+        | 'tool_breakdown'
+        | 'pricing'
+        | 'activity_page'
+        | 'screen'
+        | 'message';
+    };
+
+export type UsageScreenRequest =
+  | { kind: 'screen'; query: UsageScreenQuery }
+  | {
+      kind: 'activity';
+      query: UsageScreenQuery;
+      revision: string;
+      queryIdentity: string;
+      cursor: string;
+    };
+
+export type UsageScreenResult =
+  | { kind: 'screen'; screen: UsageScreen }
+  | { kind: 'activity'; page: UsageActivityPage }
+  | UsageScreenFailure;
+
 export interface SettingsTestResult {
   ok: boolean;
   code?: SettingsTestResultCode;
@@ -642,6 +765,7 @@ export type SettingsTestResultCode =
   | 'proxy_reachable'
   | 'proxy_disabled'
   | 'proxy_configuration_missing'
+  | 'proxy_credential_missing'
   | 'proxy_timeout'
   | 'proxy_http_error'
   | 'proxy_unreachable'
@@ -649,11 +773,20 @@ export type SettingsTestResultCode =
   | 'bot_token_missing'
   | 'bot_token_invalid'
   | 'bot_app_credentials_missing'
+  | 'slack_tokens_missing'
+  | 'wecom_credentials_missing'
+  | 'dingtalk_credentials_missing'
+  | 'dingtalk_no_access_token'
+  | 'qq_credentials_missing'
+  | 'qq_no_access_token'
+  | 'wechat_bridge_url_invalid'
+  | 'wechat_ilink_credentials_incomplete'
   | 'bot_connection_failed';
 
 export type UpdateAppSettingsInput = Partial<{
+  jev: Partial<AppSettings['jev']>;
   network: Partial<{
-    proxy: Partial<NetworkProxySettings>;
+    proxy: NetworkProxySettingsPatch;
   }>;
   botChat: BotChatSettingsPatch;
   usage: Partial<UsageSettings>;
@@ -667,10 +800,16 @@ export type UpdateAppSettingsInput = Partial<{
   notifications: Partial<NotificationSettings>;
   workHub: Partial<WorkHubSettings>;
   system: Partial<SystemSettings>;
+  externalAgents: AppSettings['externalAgents'];
   shell: Partial<ShellSettings>;
   webSearch: WebSearchSettingsPatch;
   subagents: SubagentSettings;
 }>;
+
+/** Preconditions for a Host-owned Settings write that must not be retried past a semantic change. */
+export interface RuntimeHostSettingsUpdateGuard {
+  readonly expectedExternalAgentExecutable?: string;
+}
 
 export type PersonalizationSettingsWarning =
   | 'override-attempt'
@@ -681,8 +820,8 @@ export interface UpdateAppSettingsWarnings {
   personalization?: PersonalizationSettingsWarning[];
 }
 
-export interface UpdateAppSettingsResult {
-  settings: AppSettings;
+export interface UpdateAppSettingsResult<TSettings extends AppSettings = AppSettings> {
+  settings: TSettings;
   warnings?: UpdateAppSettingsWarnings;
 }
 
@@ -706,7 +845,6 @@ export function createDefaultSettings(): AppSettings {
         port: 7890,
         authEnabled: false,
         username: '',
-        password: '',
         bypassList: ['metaso.cn', 'baidu.com'],
         autoBypassDomains: DEFAULT_PROXY_BYPASS_DOMAINS,
       },
@@ -720,6 +858,8 @@ export function createDefaultSettings(): AppSettings {
       activeTab: 'requests',
     },
     appearance: {
+      showAssistantBackgroundSessions: false,
+      workbarTogglePosition: 'titlebar',
       theme: 'auto',
       palette: 'default',
       appIcon: DEFAULT_APP_ICON,
@@ -742,6 +882,7 @@ export function createDefaultSettings(): AppSettings {
     },
     privacy: defaultPrivacySettings(),
     projects: defaultProjectPreferencesSettings(),
+    jev: { enabled: false, apiKey: '' },
     chatDefaults: defaultChatDefaultsSettings(),
     notifications: {
       runComplete: true,
@@ -754,6 +895,7 @@ export function createDefaultSettings(): AppSettings {
       // battery-affecting opt-in, not a silent default.
       keepSystemAwake: false,
     },
+    externalAgents: { antigravity: { executable: '' } },
     shell: {
       preference: 'auto',
       executable: '',
@@ -763,6 +905,15 @@ export function createDefaultSettings(): AppSettings {
 }
 
 export function mergeSettings(current: AppSettings, patch: UpdateAppSettingsInput): AppSettings {
+  const {
+    credential: _credential,
+    password: _legacyPassword,
+    passwordConfigured: _derivedStatus,
+    ...proxyPatch
+  } = (patch.network?.proxy ?? {}) as NetworkProxySettingsPatch & {
+    password?: unknown;
+    passwordConfigured?: unknown;
+  };
   return {
     ...current,
     network: {
@@ -770,7 +921,7 @@ export function mergeSettings(current: AppSettings, patch: UpdateAppSettingsInpu
       ...(patch.network ?? {}),
       proxy: {
         ...current.network.proxy,
-        ...(patch.network?.proxy ?? {}),
+        ...proxyPatch,
       },
     },
     botChat: mergeBotChatSettings(current.botChat, patch.botChat),
@@ -833,6 +984,7 @@ export function mergeSettings(current: AppSettings, patch: UpdateAppSettingsInpu
       ...current.system,
       ...(patch.system ?? {}),
     },
+    externalAgents: patch.externalAgents ?? current.externalAgents,
     shell: {
       ...current.shell,
       ...(patch.shell ?? {}),
@@ -864,6 +1016,7 @@ export function normalizeSettings(input: unknown): AppSettings {
     notifications: value.notifications,
     workHub: value.workHub,
     system: value.system,
+    externalAgents: value.externalAgents,
     shell: value.shell,
     subagents: value.subagents,
   });
@@ -900,6 +1053,8 @@ export function normalizeSettings(input: unknown): AppSettings {
     // position; UI density is no longer a product setting.
     appearance: {
       ...appearanceWithoutLegacyFields,
+      showAssistantBackgroundSessions: base.appearance.showAssistantBackgroundSessions === true,
+      workbarTogglePosition: base.appearance.workbarTogglePosition === 'edge' ? 'edge' : 'titlebar',
       palette: isThemePalette(base.appearance.palette) ? base.appearance.palette : 'default',
       // Same fail-closed rule as `palette` above, for the same reason: an
       // unknown id would otherwise reach the main process and resolve to a
@@ -928,13 +1083,12 @@ export function normalizeSettings(input: unknown): AppSettings {
     // PR-LANG-PREF-0: closed-enum fail-closed for the new
     // `personalization.uiLocale` preference. mergeSettings spreads
     // raw user values, so an unknown value would otherwise reach the
-    // renderer outside the closed reactive-locale contract. Fall back to
-    // 'auto' on any miss.
+    // renderer outside the closed reactive-locale contract. Preserve the
+    // former generic `zh` preference as Simplified Chinese, then fall back to
+    // 'auto' on any other miss.
     personalization: {
       ...base.personalization,
-      uiLocale: isUiLocalePreference(base.personalization.uiLocale)
-        ? base.personalization.uiLocale
-        : 'auto',
+      uiLocale: normalizeUiLocalePreference(base.personalization.uiLocale),
       selectedPetId: normalizeSelectedPetId(base.personalization.selectedPetId),
     },
     botChat: normalizeBotChatSettings(base.botChat, value.botChat),
@@ -968,6 +1122,14 @@ export function normalizeSettings(input: unknown): AppSettings {
     system: {
       keepSystemAwake:
         typeof base.system.keepSystemAwake === 'boolean' ? base.system.keepSystemAwake : false,
+    },
+    externalAgents: {
+      antigravity: {
+        executable:
+          typeof base.externalAgents?.antigravity?.executable === 'string'
+            ? base.externalAgents.antigravity.executable
+            : '',
+      },
     },
     shell: normalizeShellSettings(base.shell),
     subagents: normalizeSubagentSettings(base.subagents),
@@ -1005,7 +1167,7 @@ function defaultProjectPreferencesSettings(): ProjectPreferencesSettings {
 }
 
 function defaultChatDefaultsSettings(): ChatDefaultsSettings {
-  return { permissionMode: 'ask' };
+  return { permissionMode: 'bypass' };
 }
 
 // Closed-enum fail-closed, same reasoning as appearance.palette /
@@ -1015,9 +1177,9 @@ function defaultChatDefaultsSettings(): ChatDefaultsSettings {
 // doesn't recognize -- fall back to the safest default instead.
 function normalizeChatDefaultsSettings(settings: ChatDefaultsSettings): ChatDefaultsSettings {
   return {
-    // Same fail-closed reasoning as the mode below: a garbage persisted level
-    // drops to "no preference" (the model's own default) rather than reaching
-    // session creation as a rung no picker recognizes.
+    ...(settings.codeModeEnabled === true ? { codeModeEnabled: true } : {}),
+    // Preserve the retired field while older settings documents still carry it.
+    // No task creation path consumes it; defaults now live on model overrides.
     thinkingLevel: isThinkingLevel(settings.thinkingLevel) ? settings.thinkingLevel : undefined,
     // A retired mode is decoded (not rejected) so an existing settings file
     // keeps working; knowing which modes are retired lives in one place.

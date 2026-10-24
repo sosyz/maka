@@ -17,8 +17,37 @@
  * under the License.
  */
 
+import { nextId } from '@maka/core/test-only/async-primitives';
+import { sectionedSummary } from './history-compact-test-fixtures.js';
+import { runtimeInvocationFailureClass } from '../runtime-event-read-model.js';
 import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createSessionStore } from '@maka/storage/session-store';
+import {
+  openInteractivePlanStoreForWrite,
+  type InteractivePlanStoreWriter,
+} from '@maka/storage/plan-authority';
+import { resolveStorageRoot, tryAcquireInteractiveRootOwner } from '@maka/storage/root-authority';
+import { DEFAULT_TOOL_MODE } from '@maka/core/tool-mode';
+import {
+  buildInvocationOpenedEvent,
+  isSessionInlineInvocation,
+  runtimeInvocationOutcome,
+  runtimeInvocationsFromSessionEvents,
+  type RootExecutionDescriptor,
+  type RuntimeInvocationRecord,
+} from '@maka/core/runtime-invocation';
+import type {
+  RuntimeEventInvocationOpenedContent,
+  RuntimeInvocationLineage,
+  RuntimeInvocationRootAuthority,
+} from '@maka/core/runtime-event';
+import type { PermissionMode } from '@maka/core/permission';
+import type { PersistedBackendKind } from '@maka/core/session';
+import type { ToolMode } from '@maka/core/tool-mode';
 import { setTimeout as timerDelay } from 'node:timers/promises';
 import { createHash } from 'node:crypto';
 import {
@@ -26,14 +55,17 @@ import {
   createGenesisExecutionBoundary,
   isSandboxBoundaryRestartClosure,
 } from '@maka/core/sandbox-boundary';
-import { createWorkspaceWritePermissionProfile } from '@maka/core/permission-profile';
-import { DEEP_RESEARCH_SESSION_LABEL } from '@maka/core/deep-research';
-import { SIDE_CONVERSATION_SESSION_LABEL } from '@maka/core/side-conversation';
+import {
+  canReadPath,
+  createReadOnlyPermissionProfile,
+  createWorkspaceWritePermissionProfile,
+  isReadOnlyPermissionProfile,
+} from '@maka/core/permission-profile';
 import { RUNTIME_CONTINUATION_AUTHORITY_V1 } from '@maka/core/runtime-event-store';
 import { deriveTurnRecords } from '@maka/core/session';
-import { isSessionInlineRun } from '@maka/core/agent-run';
 import { isTerminalRuntimeEvent } from '@maka/core/runtime-event';
 import { canonicalToolArgsHash } from '@maka/core/tool-args-identity';
+import { resolveRuntimeRecovery } from '../recovery-resolver.js';
 import { buildImmutableRuntimePrefix, decodeContinuationClaim } from '@maka/core/runtime-boundary';
 import type {
   CreateSandboxBoundaryRequest,
@@ -48,7 +80,7 @@ import type {
   UserMessageInput,
 } from '@maka/core/runtime-inputs';
 import type { ExecutionBoundary } from '@maka/core/sandbox-boundary';
-import type { SessionEvent, ShellRunSnapshotResult } from '@maka/core/events';
+import type { SessionEvent } from '@maka/core/events';
 import type {
   AgentGraphIntentClaim,
   AgentGraphIntentClaimStore,
@@ -57,13 +89,7 @@ import type {
   AgentGraphOperatorProvisionRequest,
   AgentGraphOperatorProvisionResult,
 } from '@maka/core/agent-graph-topology';
-import type {
-  AgentRunEvent,
-  EmittedAgentRunEvent,
-  AgentRunHeader,
-  AgentRunStore,
-  RootExecutionDescriptor,
-} from '@maka/core/agent-run';
+import type { AgentRunEvent, AgentRunStore, EmittedAgentRunEvent } from '@maka/core/agent-run';
 import type { ArtifactRecord } from '@maka/core/artifacts';
 import type { ContinuationClaimV1, RuntimeBoundaryDigest } from '@maka/core/runtime-boundary';
 import type {
@@ -72,14 +98,27 @@ import type {
 } from '@maka/core/runtime-event-store';
 import type { RuntimeEvent } from '@maka/core/runtime-event';
 import type { SessionHeader, SessionSummary, StoredMessage, TurnRecord } from '@maka/core/session';
-import type { BackendSendInput, BackendStopMode } from '@maka/core/backend-types';
-import { PlanConflictError, emptyPlanSessionState, type PlanStore } from '@maka/core/plan';
-import { expect } from '../test-helpers.js';
+import type {
+  BackendCompactHistoryInput,
+  BackendSendInput,
+  BackendStopMode,
+} from '@maka/core/backend-types';
+import {
+  PlanConflictError,
+  emptyPlanSessionState,
+  type PlanEvent,
+  type PlanSessionState,
+  type PlanStepStatus,
+  type PlanStore,
+  type UpdatePlanExecutionInput,
+} from '@maka/core/plan';
 import { MockLanguageModelV4, simulateReadableStream } from 'ai/test';
 import { createTestAiSdkBackend } from './execution-boundary-test-helpers.js';
+import { assertDoubleRunNotSealed } from './runtime-event-store-seal.js';
 import type { LanguageModelV4StreamPart } from '@ai-sdk/provider';
 import { z } from 'zod';
 import { AiSdkBackend } from '../ai-sdk-backend.js';
+import { renderPlanModePrompt, selectCollaborationTools } from '../plan-mode.js';
 import {
   BackendRegistry,
   SessionConfigurationRevisionConflictError,
@@ -87,6 +126,7 @@ import {
   SessionManager,
   headerToSummary,
   type BackendFactoryContext,
+  type SessionConfigurationTransitionRequest,
   type SessionConfigurationStoreUpdate,
   type SessionStore,
   type VersionedSessionHeader,
@@ -101,7 +141,6 @@ import { RuntimeReadModel, RuntimeReadModelError } from '../runtime-read-model.j
 import type { AgentBackend } from '@maka/core/backend-types';
 import type { MakaTool } from '../tool-runtime.js';
 import type { ShellRunProcessManager } from '../shell-run-manager.js';
-import type { RuntimeCommitSink } from '../runtime-commit-sink.js';
 import {
   buildHistoryCompactCheckpoint,
   type HistoryCompactCheckpoint,
@@ -189,7 +228,7 @@ test('sendMessage rejects removed child AgentRun lineage as a live trigger', asy
         ),
       /removed child AgentRun lineage/,
     );
-    expect(await runStore.listSessionRuns(session.id)).toEqual([]);
+    assert.deepStrictEqual(await runStore.listSessionInvocations(session.id), []);
   }
 });
 
@@ -300,9 +339,9 @@ describe('SessionManager Plan control boundaries', () => {
 
     await manager.approvePlan(input);
 
-    expect(committedApprovals).toBe(1);
-    expect((await store.readHeader(sessionId)).collaborationMode).toBe('agent');
-    expect(runtimeKernel.disposed).toEqual([sessionId]);
+    assert.strictEqual(committedApprovals, 1);
+    assert.strictEqual((await store.readHeader(sessionId)).collaborationMode, 'agent');
+    assert.deepStrictEqual(runtimeKernel.disposed, [sessionId]);
   });
 
   test('does not commit a same-mode Plan revision before backend disposal succeeds', async () => {
@@ -336,11 +375,11 @@ describe('SessionManager Plan control boundaries', () => {
       manager.requestPlanRevision(sessionId, 'proposal-1', 'revision-operation'),
       /backend disposal failed/,
     );
-    expect(committedRevisions).toBe(0);
+    assert.strictEqual(committedRevisions, 0);
 
     await manager.requestPlanRevision(sessionId, 'proposal-1', 'revision-operation');
-    expect(committedRevisions).toBe(1);
-    expect(runtimeKernel.disposed).toEqual([sessionId]);
+    assert.strictEqual(committedRevisions, 1);
+    assert.deepStrictEqual(runtimeKernel.disposed, [sessionId]);
   });
 
   test('does not commit Plan cancellation before backend disposal succeeds', async () => {
@@ -390,11 +429,11 @@ describe('SessionManager Plan control boundaries', () => {
       manager.cancelPlanExecution(sessionId, 'execution-1', 'cancel-operation'),
       /backend disposal failed/,
     );
-    expect(committedCancellations).toBe(0);
+    assert.strictEqual(committedCancellations, 0);
 
     await manager.cancelPlanExecution(sessionId, 'execution-1', 'cancel-operation');
-    expect(committedCancellations).toBe(1);
-    expect(runtimeKernel.disposed).toEqual([sessionId]);
+    assert.strictEqual(committedCancellations, 1);
+    assert.deepStrictEqual(runtimeKernel.disposed, [sessionId]);
   });
 
   test('classifies an ineligible execution cancellation as a domain conflict', async () => {
@@ -469,6 +508,7 @@ describe('SessionManager Plan control boundaries', () => {
       manager.transitionSessionConfiguration(child.id, {
         expectedRevision: 1,
         clearConnectionBlock: false,
+        permissionModeOnly: false,
         configuration: {
           backend: child.backend,
           llmConnectionId: 'test-connection-id',
@@ -491,7 +531,204 @@ describe('SessionManager Plan control boundaries', () => {
   });
 });
 
+describe('SessionManager Plan terminal settlement', () => {
+  test('a completed root Turn commits the terminal steps the model already reported', async () => {
+    const harness = await mountPlanSettlement('session-1', [
+      ['step-1', 'completed'],
+      ['step-2', 'skipped'],
+    ]);
+
+    const result = await harness.manager.settleActivePlanExecutionAfterRootTurn(
+      harness.sessionId,
+      'completed',
+      'plan_root_terminal_run-1',
+    );
+
+    assert.equal(result?.event.type, 'plan_execution_completed');
+    assert.deepEqual(harness.updates, [
+      {
+        operationId: 'plan_root_terminal_run-1',
+        sessionId: harness.sessionId,
+        executionId: 'execution-1',
+        steps: [
+          { id: 'step-1', status: 'completed' },
+          { id: 'step-2', status: 'skipped' },
+        ],
+      },
+    ]);
+    // Every step is already terminal, so there is nothing to interrupt: the
+    // settlement keeps the running backend instead of disposing it.
+    assert.deepEqual(harness.runtimeKernel.disposed, []);
+  });
+
+  test('a completed root Turn interrupts an execution that never reached a terminal step', async () => {
+    const harness = await mountPlanSettlement('session-1', [
+      ['step-1', 'in_progress'],
+      ['step-2', 'pending'],
+    ]);
+
+    const result = await harness.manager.settleActivePlanExecutionAfterRootTurn(
+      harness.sessionId,
+      'completed',
+      'plan_root_terminal_run-1',
+    );
+
+    assert.equal(result?.event.type, 'plan_execution_interrupted');
+    assert.deepEqual(harness.updates, []);
+    assert.deepEqual(harness.runtimeKernel.disposed, [harness.sessionId]);
+    assert.match(harness.interrupts[0]?.reason ?? '', /completed before all Plan steps/);
+  });
+
+  test('a failed or cancelled root Turn interrupts the active execution', async () => {
+    for (const [status, expected] of [
+      ['failed', /root Turn failed/],
+      ['cancelled', /root Turn was cancelled/],
+    ] as const) {
+      const harness = await mountPlanSettlement('session-1', [['step-1', 'in_progress']]);
+
+      const result = await harness.manager.settleActivePlanExecutionAfterRootTurn(
+        harness.sessionId,
+        status,
+        `plan_root_terminal_${status}`,
+      );
+
+      assert.equal(result?.event.type, 'plan_execution_interrupted');
+      assert.deepEqual(harness.updates, []);
+      assert.deepEqual(harness.runtimeKernel.disposed, [harness.sessionId]);
+      assert.match(harness.interrupts[0]?.reason ?? '', expected);
+    }
+  });
+
+  // The retry guarantee is the Plan store's operation receipt, so it is asserted
+  // on the production store rather than a stub: a stub that hands back a receipt
+  // it was told to hand back states the stub, not the store.
+  test('a repeated settlement replays the recorded receipt without a second write', async (t) => {
+    const harness = await mountRealPlanSettlement();
+    t.after(harness.close);
+    const settle = () =>
+      harness.manager.settleActivePlanExecutionAfterRootTurn(
+        harness.sessionId,
+        'failed',
+        'plan_root_terminal_run-1',
+      );
+
+    const first = await settle();
+    assert.equal(first?.event.type, 'plan_execution_interrupted');
+    assert.deepEqual(harness.runtimeKernel.disposed, [harness.sessionId]);
+
+    const replay = await settle();
+
+    assert.deepEqual(replay?.event, first?.event, 'a replay must return the recorded event');
+    assert.equal(replay?.state.storeVersion, first?.state.storeVersion, 'a replay must not write');
+    assert.equal(replay?.state.activeExecutionId, undefined);
+    assert.equal(
+      (await harness.store.readState(harness.sessionId)).storeVersion,
+      first?.state.storeVersion,
+    );
+    assert.deepEqual(
+      harness.runtimeKernel.disposed,
+      [harness.sessionId],
+      'a replay must not dispose the Plan backend a second time',
+    );
+  });
+
+  test('settling an execution that already finished writes nothing', async (t) => {
+    const harness = await mountRealPlanSettlement();
+    t.after(harness.close);
+    // The Turn that ran the plan already reported every step through the store.
+    await harness.store.updateExecution({
+      sessionId: harness.sessionId,
+      executionId: harness.executionId,
+      steps: [
+        { id: 'step-1', status: 'completed' },
+        { id: 'step-2', status: 'completed' },
+      ],
+    });
+    const completed = await harness.store.readState(harness.sessionId);
+    assert.equal(completed.activeExecutionId, undefined);
+
+    assert.equal(
+      await harness.manager.settleActivePlanExecutionAfterRootTurn(
+        harness.sessionId,
+        'completed',
+        'plan_root_terminal_run-2',
+      ),
+      null,
+    );
+
+    assert.equal(
+      (await harness.store.readState(harness.sessionId)).storeVersion,
+      completed.storeVersion,
+    );
+  });
+
+  test('a Session without Plan authority settles nothing', async () => {
+    const manager = new SessionManager({
+      store: new MemorySessionStore(),
+      backends: new BackendRegistry(),
+      newId: nextId(),
+      now: nextNow(1),
+    });
+
+    assert.equal(
+      await manager.settleActivePlanExecutionAfterRootTurn(
+        'session-without-plan-authority',
+        'completed',
+        'plan_root_terminal_run-1',
+      ),
+      null,
+    );
+  });
+});
+
 describe('SessionManager graph operator provisioning', () => {
+  test('graph provisioning restores a delegated policy after the supervisor run returns', async () => {
+    const store = new MemorySessionStore();
+    const runStore = new MemoryAgentRunStore();
+    const manager = new SessionManager({
+      store,
+      runStore,
+      runtimeEventStore: runStore,
+      backends: new BackendRegistry(),
+      childTools: [testTool('Read'), testTool('Glob'), testTool('Grep')],
+      resolveExecutionPolicy: async (_sessionId, runId) =>
+        runId === 'delegated-supervisor'
+          ? { permissionMode: 'bypass', questions: 'return' }
+          : undefined,
+      newId: nextId(),
+      now: nextNow(10),
+    });
+    const parent = await manager.createSession(makeInput({ permissionMode: 'ask' }));
+    await seedInvocationFromHeader(
+      runStore,
+      makeRunHeader({
+        sessionId: parent.id,
+        runId: 'delegated-supervisor',
+        turnId: 'delegated-supervisor-turn',
+        status: 'completed',
+        permissionMode: 'bypass',
+      }),
+    );
+    const result = await manager.provisionAgentGraphOperator({
+      graphId: 'delegated-graph',
+      workId: `graph_work_${'a'.repeat(32)}`,
+      agentId: LOCAL_READ_AGENT_ID,
+      operatorId: `graph_operator_${'b'.repeat(32)}`,
+      source: {
+        sessionId: parent.id,
+        runId: 'delegated-supervisor',
+        turnId: 'delegated-supervisor-turn',
+        toolCallId: 'schedule-delegated',
+      },
+      edges: [],
+      expectedScheduleRevision: 1,
+    });
+    assert.equal(result.header.permissionMode, 'bypass');
+    assert.equal((await store.readExecutionBoundary(result.header.id)).kind, 'bypass');
+    assert.equal((await store.readHeader(parent.id)).permissionMode, 'ask');
+    assert.equal((await store.readExecutionBoundary(parent.id)).kind, 'managed');
+  });
+
   test('provisions a graph operator before its active supervisor turn returns', async () => {
     const store = new MemorySessionStore();
     const runStore = new MemoryAgentRunStore();
@@ -526,7 +763,7 @@ describe('SessionManager graph operator provisioning', () => {
       .sendMessage(parent.id, { turnId: 'supervisor-turn', text: 'schedule graph work' })
       [Symbol.asyncIterator]();
     await parentTurn.next();
-    const sourceRun = (await runStore.listSessionRuns(parent.id))[0];
+    const sourceRun = (await runStore.listSessionInvocations(parent.id))[0];
     if (!sourceRun) throw new Error('Supervisor Run was not recorded');
 
     let provisionSettled = false;
@@ -549,15 +786,15 @@ describe('SessionManager graph operator provisioning', () => {
         provisionSettled = true;
       });
     await new Promise<void>((resolve) => setImmediate(resolve));
-    expect(provisionSettled).toBe(true);
+    assert.strictEqual(provisionSettled, true);
     const provisioned = await provision;
-    expect(provisioned.created).toBe(true);
-    expect(provisioned.header.name).toBe('Fast graph reader');
-    expect(provisioned.header.llmConnectionSlug).toBe('worker-connection');
-    expect(provisioned.header.model).toBe('worker-model');
-    expect(provisioned.header.thinkingLevel).toBe('low');
-    expect(provisioned.header.subagentRuntime?.presetId).toBe('fast-reader');
-    expect(provisioned.provision.agentId).toBe(LOCAL_READ_AGENT_ID);
+    assert.strictEqual(provisioned.created, true);
+    assert.strictEqual(provisioned.header.name, 'Fast graph reader');
+    assert.strictEqual(provisioned.header.llmConnectionSlug, 'worker-connection');
+    assert.strictEqual(provisioned.header.model, 'worker-model');
+    assert.strictEqual(provisioned.header.thinkingLevel, 'low');
+    assert.strictEqual(provisioned.header.subagentRuntime?.presetId, 'fast-reader');
+    assert.strictEqual(provisioned.provision.agentId, LOCAL_READ_AGENT_ID);
 
     parentGate.release();
     while (!(await parentTurn.next()).done) {}
@@ -584,7 +821,8 @@ describe('SessionManager graph operator provisioning', () => {
       } as never,
     });
     const parent = await manager.createSession(makeInput({ permissionMode: 'bypass' }));
-    await runStore.createRun(
+    await seedInvocationFromHeader(
+      runStore,
       makeRunHeader({
         sessionId: parent.id,
         runId: 'supervisor-run',
@@ -619,6 +857,7 @@ describe('SessionManager graph operator provisioning', () => {
       .transitionSessionConfiguration(parent.id, {
         expectedRevision: 1,
         clearConnectionBlock: false,
+        permissionModeOnly: false,
         configuration: {
           backend: parent.backend,
           llmConnectionId: 'test-connection-id',
@@ -639,17 +878,17 @@ describe('SessionManager graph operator provisioning', () => {
         transitionSettled = true;
       });
     await new Promise<void>((resolve) => setImmediate(resolve));
-    expect(transitionSettled).toBe(false);
+    assert.strictEqual(transitionSettled, false);
 
     releaseProvision.release();
     const provisioned = await provision;
     const transitionResult = await transition;
-    expect(transitionResult.ok).toBe(false);
+    assert.strictEqual(transitionResult.ok, false);
     if (transitionResult.ok) throw new Error('Configuration transition unexpectedly committed');
     assert.ok(transitionResult.error instanceof SessionConfigurationTransitionError);
-    expect(transitionResult.error.code).toBe('operation_conflict');
-    expect((await store.readHeader(parent.id)).permissionMode).toBe('bypass');
-    expect(provisioned.header.permissionMode).toBe('bypass');
+    assert.strictEqual(transitionResult.error.code, 'operation_conflict');
+    assert.strictEqual((await store.readHeader(parent.id)).permissionMode, 'bypass');
+    assert.strictEqual(provisioned.header.permissionMode, 'bypass');
   });
 
   test('snapshots a catalog agent into a metadata-only child with reserved activation ids', async () => {
@@ -673,7 +912,8 @@ describe('SessionManager graph operator provisioning', () => {
         permissionMode: 'ask',
       }),
     );
-    await runStore.createRun(
+    await seedInvocationFromHeader(
+      runStore,
       makeRunHeader({
         sessionId: parent.id,
         runId: 'supervisor-run',
@@ -703,17 +943,67 @@ describe('SessionManager graph operator provisioning', () => {
       expectedScheduleRevision: 1,
     });
 
-    expect(result.created).toBe(true);
-    expect(result.header.subagentParent?.graph).toEqual({
+    assert.strictEqual(result.created, true);
+    assert.deepStrictEqual(result.header.subagentParent?.graph, {
       graphId: 'graph-1',
       workId: `graph_work_${'1'.repeat(32)}`,
       operatorId: `graph_operator_${'2'.repeat(32)}`,
     });
-    expect(result.header.subagentRuntime?.agentId).toBe(LOCAL_READ_AGENT_ID);
-    expect(result.header.permissionMode).toBe('explore');
-    expect(result.provision.initialTurnId).toBe(result.header.subagentSpawn?.initialTurnId);
-    expect(result.provision.initialRunId).toBe(result.header.subagentSpawn?.initialRunId);
-    expect(await runStore.listSessionRuns(result.header.id)).toEqual([]);
+    assert.strictEqual(result.header.subagentRuntime?.agentId, LOCAL_READ_AGENT_ID);
+    assert.strictEqual(result.header.permissionMode, 'explore');
+    assert.strictEqual(result.provision.initialTurnId, result.header.subagentSpawn?.initialTurnId);
+    assert.strictEqual(result.provision.initialRunId, result.header.subagentSpawn?.initialRunId);
+    assert.deepStrictEqual(await runStore.listSessionInvocations(result.header.id), []);
+  });
+
+  test('provisions a graph child on an explicit plugin executor without Maka tools', async () => {
+    const store = new MemorySessionStore();
+    const runStore = new MemoryAgentRunStore();
+    const checkedExecutors: string[] = [];
+    const manager = new SessionManager({
+      store,
+      runStore,
+      runtimeEventStore: runStore,
+      backends: new BackendRegistry(),
+      childTools: [],
+      assertChildExecutorAvailable: (parentSessionId, executorId) => {
+        checkedExecutors.push(`${parentSessionId}:${executorId}`);
+      },
+      newId: nextId(),
+      now: nextNow(40),
+    });
+    const parent = await manager.createSession(makeInput());
+    await seedInvocationFromHeader(
+      runStore,
+      makeRunHeader({
+        sessionId: parent.id,
+        runId: 'supervisor-run',
+        turnId: 'supervisor-turn',
+      }),
+    );
+
+    const result = await manager.provisionAgentGraphOperator({
+      graphId: 'graph-external',
+      workId: `graph_work_${'4'.repeat(32)}`,
+      agentId: LOCAL_READ_AGENT_ID,
+      executorId: 'codex',
+      operatorId: `graph_operator_${'5'.repeat(32)}`,
+      source: {
+        sessionId: parent.id,
+        runId: 'supervisor-run',
+        turnId: 'supervisor-turn',
+        toolCallId: 'schedule-tool',
+      },
+      edges: [],
+      expectedScheduleRevision: 1,
+    });
+
+    assert.strictEqual(result.header.backend, 'plugin-executor');
+    assert.strictEqual(result.header.executorId, 'codex');
+    assert.strictEqual(result.header.llmConnectionId, undefined);
+    assert.strictEqual(result.header.llmConnectionSlug, 'executor:codex');
+    assert.deepStrictEqual(result.header.subagentRuntime?.toolNames, []);
+    assert.deepStrictEqual(checkedExecutors, [`${parent.id}:codex`]);
   });
 
   test('keeps four large graph branches and a replacement off the supervisor data plane', async () => {
@@ -729,7 +1019,8 @@ describe('SessionManager graph operator provisioning', () => {
       now: nextNow(90),
     });
     const parent = await manager.createSession(makeInput({ permissionMode: 'ask' }));
-    await runStore.createRun(
+    await seedInvocationFromHeader(
+      runStore,
       makeRunHeader({
         sessionId: parent.id,
         runId: 'large-supervisor-run',
@@ -810,7 +1101,10 @@ describe('SessionManager graph operator provisioning', () => {
           role: 'system',
           author: 'system',
           status: failed ? 'failed' : 'completed',
-          actions: { endInvocation: true },
+          actions: {
+            endInvocation: true,
+            ...(failed ? { stateDelta: { failureClass: 'branch_failed' } } : {}),
+          },
         }),
       ]);
       outputs.push(
@@ -827,14 +1121,26 @@ describe('SessionManager graph operator provisioning', () => {
     }
 
     const serializedOutputs = JSON.stringify(outputs);
-    expect(Buffer.byteLength(oversizedPayload, 'utf8') * outputs.length >= 2_500 * 1024).toBe(true);
-    expect(Buffer.byteLength(serializedOutputs, 'utf8') < 64 * 1024).toBe(true);
-    expect(serializedOutputs.includes(oversizedPayload.slice(0, 1024))).toBe(false);
-    expect(outputs.every((output) => output.runtimeEvents.length === 0)).toBe(true);
-    expect(outputs.every((output) => output.budget.projectedBytes <= 32 * 1024)).toBe(true);
-    expect(outputs[2]?.result?.status).toBe('failed');
-    expect(outputs[2]?.result?.failureClass).toBe('branch_failed');
-    expect(outputs[4]?.result?.text).toBe('Replacement branch completed with a verified answer.');
+    assert.strictEqual(
+      Buffer.byteLength(oversizedPayload, 'utf8') * outputs.length >= 2_500 * 1024,
+      true,
+    );
+    assert.strictEqual(Buffer.byteLength(serializedOutputs, 'utf8') < 64 * 1024, true);
+    assert.strictEqual(serializedOutputs.includes(oversizedPayload.slice(0, 1024)), false);
+    assert.strictEqual(
+      outputs.every((output) => output.runtimeEvents.length === 0),
+      true,
+    );
+    assert.strictEqual(
+      outputs.every((output) => output.budget.projectedBytes <= 32 * 1024),
+      true,
+    );
+    assert.strictEqual(outputs[2]?.result?.status, 'failed');
+    assert.strictEqual(outputs[2]?.result?.failureClass, 'branch_failed');
+    assert.strictEqual(
+      outputs[4]?.result?.text,
+      'Replacement branch completed with a verified answer.',
+    );
   });
 
   test('does not advertise implementation when the current project cannot use worktrees', async () => {
@@ -868,10 +1174,10 @@ describe('SessionManager graph operator provisioning', () => {
       (definition) => definition.id === IMPLEMENTATION_AGENT_ID,
     );
 
-    expect(checkedSources).toEqual([
+    assert.deepStrictEqual(checkedSources, [
       { sourceCwd: '/tmp/plain-folder', sourceProjectId: 'plain-project' },
     ]);
-    expect(implementation?.availability).toEqual({
+    assert.deepStrictEqual(implementation?.availability, {
       status: 'unavailable',
       reason: 'workspace_isolation_unavailable',
       workspace: AGENT_WORKSPACE_WORKTREE,
@@ -931,7 +1237,8 @@ describe('SessionManager graph operator provisioning', () => {
         permissionMode: 'ask',
       }),
     );
-    await runStore.createRun(
+    await seedInvocationFromHeader(
+      runStore,
       makeRunHeader({
         sessionId: parent.id,
         runId: 'supervisor-run',
@@ -955,18 +1262,19 @@ describe('SessionManager graph operator provisioning', () => {
       expectedScheduleRevision: 1,
     });
 
-    expect(provisioned).toHaveLength(1);
-    expect(result.header.projectId).toBe('project-1');
-    expect(result.header.permissionMode).toBe('ask');
-    expect(
+    assert.strictEqual(provisioned.length, 1);
+    assert.strictEqual(result.header.projectId, 'project-1');
+    assert.strictEqual(result.header.permissionMode, 'ask');
+    assert.strictEqual(
       result.header.subagentRuntime
         ? 'permissionCeiling' in result.header.subagentRuntime
         : undefined,
-    ).toBe(false);
-    expect(result.header.cwd).toBe(result.header.subagentWorkspace?.worktreePath);
-    expect(result.header.subagentWorkspace?.kind).toBe('git_worktree');
-    expect(result.header.subagentWorkspace?.branch).toMatch(/^maka\/subagent\//);
-    expect(result.header.subagentRuntime?.toolNames).toEqual([
+      false,
+    );
+    assert.strictEqual(result.header.cwd, result.header.subagentWorkspace?.worktreePath);
+    assert.strictEqual(result.header.subagentWorkspace?.kind, 'git_worktree');
+    assert.match(String(result.header.subagentWorkspace?.branch), /^maka\/subagent\//);
+    assert.deepStrictEqual(result.header.subagentRuntime?.toolNames, [
       'Read',
       'Glob',
       'Grep',
@@ -975,7 +1283,8 @@ describe('SessionManager graph operator provisioning', () => {
       'WriteStdin',
       'StopBackgroundTask',
     ]);
-    expect(headerToSummary(result.header).subagentWorkspace).toEqual(
+    assert.deepStrictEqual(
+      headerToSummary(result.header).subagentWorkspace,
       result.header.subagentWorkspace,
     );
   });
@@ -1084,7 +1393,6 @@ describe('SessionManager graph operator provisioning', () => {
           sizeBytes: patch.byteLength,
           mimeType: 'text/x-diff; charset=utf-8',
           source: 'subagent_writeback',
-          status: 'live',
         };
         artifacts.set(`${sessionId}:${turnId}`, [record]);
         return record;
@@ -1097,8 +1405,8 @@ describe('SessionManager graph operator provisioning', () => {
     await manager.recoverChildWorkspacePatches([parent.id, child.id]);
     await manager.recoverChildWorkspacePatches([child.id]);
 
-    expect(captures).toBe(1);
-    expect(artifacts.get(`${child.id}:child-turn`)?.[0]?.source).toBe('subagent_writeback');
+    assert.strictEqual(captures, 1);
+    assert.strictEqual(artifacts.get(`${child.id}:child-turn`)?.[0]?.source, 'subagent_writeback');
 
     await seedRuntimeRun(
       runStore,
@@ -1150,7 +1458,7 @@ describe('SessionManager graph operator provisioning', () => {
       }),
       /cannot reconstruct the historical workspace patch/,
     );
-    expect(captures).toBe(1);
+    assert.strictEqual(captures, 1);
   });
 });
 
@@ -1183,9 +1491,9 @@ describe('SessionManager claimed graph intent execution', () => {
       /requires its trusted graph execution capability/,
     );
 
-    expect(await runStore.listSessionRuns(child.id)).toEqual([]);
-    expect(await store.readMessages(child.id)).toEqual([]);
-    expect(backendBuilds).toBe(0);
+    assert.deepStrictEqual(await runStore.listSessionInvocations(child.id), []);
+    assert.deepStrictEqual(await store.readMessages(child.id), []);
+    assert.strictEqual(backendBuilds, 0);
   });
 
   test('hosted execution reads the trusted claim and delegates the exact root descriptor', async () => {
@@ -1258,27 +1566,28 @@ describe('SessionManager claimed graph intent execution', () => {
       claimStore: callerClaimStore,
     });
 
-    expect(result.status).toBe('completed');
-    expect(trustedReads).toBe(1);
-    expect(executions).toHaveLength(1);
-    expect(executions[0]).toMatchObject({
+    assert.strictEqual(result.status, 'completed');
+    assert.strictEqual(trustedReads, 1);
+    assert.strictEqual(executions.length, 1);
+    assert.partialDeepStrictEqual(executions[0], {
       sessionId: child.id,
       turnId: claim.targetTurnId,
       runId: claim.targetRunId,
       userMessageId: 'id-1',
-      execution: {
-        kind: 'claimed_agent_graph_intent',
-        claim,
-        agentId: LOCAL_READ_AGENT_ID,
-        agentName: LOCAL_READ_AGENT_DEFINITION.name,
-      },
-      content: { text: prompt },
     });
-    expect(
-      (await store.readMessages(child.id)).find(
+    assert.deepStrictEqual((executions[0] as { execution?: unknown }).execution, {
+      kind: 'claimed_agent_graph_intent',
+      claim,
+      agentId: LOCAL_READ_AGENT_ID,
+      agentName: LOCAL_READ_AGENT_DEFINITION.name,
+    });
+    assert.deepStrictEqual((executions[0] as { content?: unknown }).content, { text: prompt });
+    assert.partialDeepStrictEqual(
+      (await manager.getMessages(child.id)).find(
         (message) => message.type === 'user' && message.turnId === claim.targetTurnId,
       ),
-    ).toMatchObject({ id: 'id-1', text: prompt });
+      { id: 'id-1', text: prompt },
+    );
   });
 
   test('hosted execution rejects prompt drift from the durable graph claim before admission', async () => {
@@ -1352,13 +1661,14 @@ describe('SessionManager claimed graph intent execution', () => {
       /does not match its durable claim/,
     );
 
-    expect(hostedExecutions).toBe(0);
-    expect(backendBuilds).toBe(0);
-    expect(await runStore.listSessionRuns(child.id)).toEqual([]);
-    expect(await store.readMessages(child.id)).toEqual([]);
-    expect(
+    assert.strictEqual(hostedExecutions, 0);
+    assert.strictEqual(backendBuilds, 0);
+    assert.deepStrictEqual(await runStore.listSessionInvocations(child.id), []);
+    assert.deepStrictEqual(await store.readMessages(child.id), []);
+    assert.strictEqual(
       await runStore.readRootTurnAdmission(child.id, proposedClaim.targetTurnId),
-    ).toBeUndefined();
+      undefined,
+    );
   });
 
   test('hosted retry reuses an admitted user message identity before a Run exists', async () => {
@@ -1392,7 +1702,7 @@ describe('SessionManager claimed graph intent execution', () => {
     const authority = hostedRootAuthority();
     authority.executeRoot = async (input) => {
       newIdCallsAtExecution = newIdCalls;
-      expect(input.userMessageId).toBe('durable-graph-user-message');
+      assert.strictEqual(input.userMessageId, 'durable-graph-user-message');
       for await (const event of input.start({
         runId: input.runId,
         userMessageId: input.userMessageId,
@@ -1420,16 +1730,17 @@ describe('SessionManager claimed graph intent execution', () => {
       graphExecutionInput(claim, 'resume admitted graph root'),
     );
 
-    expect(result.status).toBe('completed');
-    expect(newIdCallsAtExecution).toBe(0);
-    expect(
-      (await store.readMessages(child.id)).find(
+    assert.strictEqual(result.status, 'completed');
+    assert.strictEqual(newIdCallsAtExecution, 0);
+    assert.partialDeepStrictEqual(
+      (await manager.getMessages(child.id)).find(
         (message) => message.type === 'user' && message.turnId === claim.targetTurnId,
       ),
-    ).toMatchObject({
-      id: 'durable-graph-user-message',
-      text: 'resume admitted graph root',
-    });
+      {
+        id: 'durable-graph-user-message',
+        text: 'resume admitted graph root',
+      },
+    );
   });
 
   test('hosted retry rejects an existing Run without its durable RootTurn admission', async () => {
@@ -1451,7 +1762,8 @@ describe('SessionManager claimed graph intent execution', () => {
       },
       'must not be backfilled',
     );
-    await runStore.createRun(
+    await seedInvocationFromHeader(
+      runStore,
       makeRunHeader({
         sessionId: child.id,
         runId: claim.targetRunId,
@@ -1488,10 +1800,13 @@ describe('SessionManager claimed graph intent execution', () => {
       /missing its durable RootTurn admission/,
     );
 
-    expect(hostedExecutions).toBe(0);
-    expect(backendBuilds).toBe(0);
-    expect(await store.readMessages(child.id)).toEqual([]);
-    expect((await runStore.readRun(child.id, claim.targetRunId)).status).toBe('completed');
+    assert.strictEqual(hostedExecutions, 0);
+    assert.strictEqual(backendBuilds, 0);
+    assert.deepStrictEqual(await store.readMessages(child.id), []);
+    assert.strictEqual(
+      runtimeInvocationOutcome(await readInvocation(runStore, child.id, claim.targetRunId)),
+      'completed',
+    );
   });
 
   test('hosted explicit abort stops only the exact claimed root identity', async () => {
@@ -1546,14 +1861,14 @@ describe('SessionManager claimed graph intent execution', () => {
     abort.abort();
     await execution;
 
-    expect(stoppedRoots).toEqual([
+    assert.deepStrictEqual(stoppedRoots, [
       {
         sessionId: child.id,
         turnId: claim.targetTurnId,
         runId: claim.targetRunId,
       },
     ]);
-    expect(stoppedSessions).toBe(0);
+    assert.strictEqual(stoppedSessions, 0);
   });
 
   test('recovers a pending hosted graph admission without source lineage', async () => {
@@ -1588,27 +1903,27 @@ describe('SessionManager claimed graph intent execution', () => {
       },
     });
 
-    const run = await runStore.readRun(child.id, claim.targetRunId);
-    expect(run).toMatchObject({
-      status: 'failed',
-      failureClass: 'app_restarted',
+    const run = await readInvocation(runStore, child.id, claim.targetRunId);
+    assert.strictEqual(runtimeInvocationOutcome(run), 'failed');
+    assert.strictEqual(runtimeInvocationFailureClass(run), 'app_restarted');
+    assert.partialDeepStrictEqual(run.opening.lineage, {
       agentId: LOCAL_READ_AGENT_ID,
       agentName: LOCAL_READ_AGENT_DEFINITION.name,
     });
-    expect(run.workspaceIdentity).toBe(undefined);
-    expect(run.resumedFromRunId).toBe(undefined);
-    expect(run.retriedFromRunId).toBe(undefined);
+    assert.strictEqual(run.opening.configuration.workspaceIdentity, undefined);
+    assert.strictEqual(run.opening.lineage?.resumedFromRunId, undefined);
+    assert.strictEqual(run.opening.lineage?.retriedFromRunId, undefined);
     const terminalEvents = (await runStore.readRuntimeEvents(child.id, claim.targetRunId)).filter(
       (event) => event.status === 'failed',
     );
-    expect(terminalEvents).toHaveLength(1);
-    expect(terminalEvents[0]?.actions?.stateDelta).toMatchObject({
+    assert.strictEqual(terminalEvents.length, 1);
+    assert.partialDeepStrictEqual(terminalEvents[0]?.actions?.stateDelta, {
       recovered: true,
       recoveryReason: 'child_internal_admission_without_run',
       executionKind: 'claimed_agent_graph_intent',
       failureClass: 'app_restarted',
     });
-    expect(terminalEvents[0]?.actions?.stateDelta?.sourceRunId).toBe(undefined);
+    assert.strictEqual(terminalEvents[0]?.actions?.stateDelta?.sourceRunId, undefined);
   });
 
   test('runs the exact claimed session-inline activation and durably deduplicates retries', async () => {
@@ -1627,6 +1942,30 @@ describe('SessionManager claimed graph intent execution', () => {
       runtimeEventStore: runStore,
       backends,
       childTools: [testTool('Read'), testTool('Glob'), testTool('Grep')],
+      listArtifactsForTurn: async (sessionId, turnId) => [
+        {
+          id: 'child-output',
+          sessionId,
+          turnId,
+          createdAt: 98,
+          name: 'answer.txt',
+          kind: 'file',
+          relativePath: `${sessionId}/child-output-answer.txt`,
+          sizeBytes: 6,
+          source: 'tool_result',
+        },
+        {
+          id: 'child-internal-archive',
+          sessionId,
+          turnId,
+          createdAt: 99,
+          name: 'tool-result.json',
+          kind: 'file',
+          relativePath: `${sessionId}/child-internal-archive-tool-result.json`,
+          sizeBytes: 12,
+          source: 'tool_result_archive',
+        },
+      ],
       newId: nextId(),
       now: nextNow(40),
     });
@@ -1649,7 +1988,7 @@ describe('SessionManager claimed graph intent execution', () => {
       },
     });
 
-    expect(result).toMatchObject({
+    assert.partialDeepStrictEqual(result, {
       claimId: claim.claimId,
       graphId: claim.graphId,
       intentId: claim.intentId,
@@ -1661,7 +2000,8 @@ describe('SessionManager claimed graph intent execution', () => {
       status: 'completed',
       summary: 'ok',
     });
-    expect(ready).toEqual([
+    assert.deepStrictEqual(result.artifactIds, ['child-output']);
+    assert.deepStrictEqual(ready, [
       {
         claimId: claim.claimId,
         graphId: claim.graphId,
@@ -1674,21 +2014,22 @@ describe('SessionManager claimed graph intent execution', () => {
         agentName: LOCAL_READ_AGENT_DEFINITION.name,
       },
     ]);
-    const run = await runStore.readRun(child.id, 'graph-run');
-    expect(isSessionInlineRun(run)).toBe(true);
-    expect(run.parentRunId).toBe(undefined);
-    expect(run.turnId).toBe('graph-turn');
-    expect(
-      (await store.readMessages(child.id)).find(
+    const run = await readInvocation(runStore, child.id, 'graph-run');
+    assert.strictEqual(isSessionInlineInvocation(run.opening), true);
+    assert.strictEqual(run.opening.lineage?.parentRunId, undefined);
+    assert.strictEqual(run.turnId, 'graph-turn');
+    assert.partialDeepStrictEqual(
+      (await manager.getMessages(child.id)).find(
         (message) => message.type === 'user' && message.turnId === 'graph-turn',
       ),
-    ).toMatchObject({ text: 'summarize the routed records' });
+      { text: 'summarize the routed records' },
+    );
 
     await store.updateHeader(child.id, { isArchived: true });
     const retry = await manager.runClaimedAgentGraphIntent({
       ...graphExecutionInput(claim, 'summarize the routed records'),
     });
-    expect(retry).toMatchObject({
+    assert.partialDeepStrictEqual(retry, {
       claimId: result.claimId,
       childSessionId: result.childSessionId,
       turnId: result.turnId,
@@ -1696,8 +2037,8 @@ describe('SessionManager claimed graph intent execution', () => {
       status: 'completed',
       summary: 'ok',
     });
-    expect((await runStore.listSessionRuns(child.id)).length).toBe(1);
-    expect(backendsBySession.get(child.id)?.sendInputs.length).toBe(1);
+    assert.strictEqual((await runStore.listSessionInvocations(child.id)).length, 1);
+    assert.strictEqual(backendsBySession.get(child.id)?.sendInputs.length, 1);
     await expectRejects(
       manager.runClaimedAgentGraphIntent({
         ...graphExecutionInput(claim, 'perform different work'),
@@ -1747,9 +2088,9 @@ describe('SessionManager claimed graph intent execution', () => {
     childGate.release();
 
     const [firstResult, joinedResult] = await Promise.all([first, joined]);
-    expect(joinedResult).toEqual(firstResult);
-    expect(childBackend?.sendInputs.length).toBe(1);
-    expect((await runStore.listSessionRuns(child.id)).length).toBe(1);
+    assert.deepStrictEqual(joinedResult, firstResult);
+    assert.strictEqual(childBackend?.sendInputs.length, 1);
+    assert.strictEqual((await runStore.listSessionInvocations(child.id)).length, 1);
   });
 
   test('serializes different claims per child session without letting a queued abort stop active work', async () => {
@@ -1767,28 +2108,450 @@ describe('SessionManager claimed graph intent execution', () => {
       },
     });
     await new Promise<void>((resolve) => setImmediate(resolve));
-    expect(secondReadyCount).toBe(0);
-    expect(backend?.sendInputs.length).toBe(1);
+    assert.strictEqual(secondReadyCount, 0);
+    assert.strictEqual(backend?.sendInputs.length, 1);
 
     queuedAbort.abort();
     await new Promise<void>((resolve) => setImmediate(resolve));
-    expect(backend?.stopCalls).toBe(0);
-    expect((await runStore.listSessionRuns(child.id)).length).toBe(1);
+    assert.strictEqual(backend?.stopCalls, 0);
+    assert.strictEqual((await runStore.listSessionInvocations(child.id)).length, 1);
 
     activeGate.release();
-    expect((await first).status).toBe('completed');
+    assert.strictEqual((await first).status, 'completed');
     await expectRejects(second, /cancelled before runtime admission/);
-    expect(secondReadyCount).toBe(0);
-    expect(backend?.stopCalls).toBe(0);
-    expect(backend?.sendInputs.length).toBe(1);
+    assert.strictEqual(secondReadyCount, 0);
+    assert.strictEqual(backend?.stopCalls, 0);
+    assert.strictEqual(backend?.sendInputs.length, 1);
 
     const third = await manager.runClaimedAgentGraphIntent(
       graphExecutionInput(thirdClaim, 'third activation'),
     );
-    expect(third.status).toBe('completed');
-    expect(backend?.sendInputs.length).toBe(2);
-    expect((await runStore.listSessionRuns(child.id)).length).toBe(2);
+    assert.strictEqual(third.status, 'completed');
+    assert.strictEqual(backend?.sendInputs.length, 2);
+    assert.strictEqual((await runStore.listSessionInvocations(child.id)).length, 2);
   });
+
+  test('scoped graph stop preserves another queued claim on the same Session', {
+    timeout: 2_000,
+  }, async () => {
+    const { manager, child, runStore, first, claims } = await createQueuedGraphScenario();
+    const [firstClaim, secondClaim] = claims;
+    const second = manager.runClaimedAgentGraphIntent(
+      graphExecutionInput(secondClaim, 'queued activation'),
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await manager.stopAgentGraphActivation(
+      {
+        sessionId: child.id,
+        runId: firstClaim.targetRunId,
+        turnId: firstClaim.targetTurnId,
+      },
+      { source: 'graph_supervisor' },
+    );
+    assert.strictEqual((await first).status, 'cancelled');
+    assert.strictEqual((await second).status, 'completed');
+    assert.deepStrictEqual(
+      (await runStore.listSessionInvocations(child.id)).map((run) => [
+        run.turnId,
+        runtimeInvocationOutcome(run),
+      ]),
+      [
+        [firstClaim.targetTurnId, 'cancelled'],
+        [secondClaim.targetTurnId, 'completed'],
+      ],
+    );
+  });
+
+  test('scoped graph stop cancels only a queued capability before runtime admission', {
+    timeout: 2_000,
+  }, async () => {
+    const { manager, child, runStore, activeGate, first, claims } =
+      await createQueuedGraphScenario();
+    const [firstClaim, secondClaim, thirdClaim] = claims;
+    const queued = manager.runClaimedAgentGraphIntent(
+      graphExecutionInput(secondClaim, 'queued activation'),
+    );
+    const rejected = assert.rejects(queued, /cancelled before dispatch/);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await manager.stopAgentGraphActivation({
+      sessionId: child.id,
+      runId: secondClaim.targetRunId,
+      turnId: secondClaim.targetTurnId,
+    });
+    await rejected;
+    assert.strictEqual(
+      (await readInvocation(runStore, child.id, firstClaim.targetRunId)).terminalEvent,
+      undefined,
+    );
+    activeGate.release();
+    assert.strictEqual((await first).status, 'completed');
+    assert.strictEqual(
+      (
+        await manager.runClaimedAgentGraphIntent(
+          graphExecutionInput(thirdClaim, 'third activation'),
+        )
+      ).status,
+      'completed',
+    );
+    assert.deepStrictEqual(
+      (await runStore.listSessionInvocations(child.id)).map((run) => run.turnId),
+      [firstClaim.targetTurnId, thirdClaim.targetTurnId],
+    );
+  });
+
+  test('scoped graph stop retries failed terminal persistence on its captured owner', {
+    timeout: 2_000,
+  }, async () => {
+    const store = new MemorySessionStore();
+    let rejectAbort = true;
+    const runStore = new MemoryAgentRunStore({
+      beforeRuntimeEventAppend: (_sessionId, _runId, event) => {
+        if (rejectAbort && event.status === 'aborted')
+          throw new Error('scoped abort persistence unavailable');
+      },
+    });
+    const backends = new BackendRegistry();
+    const sendGate = makeGate();
+    const ready = makeGate();
+    backends.register('ai-sdk', (ctx) => new CountingStopBackend(ctx, sendGate));
+    const manager = new SessionManager({
+      store,
+      runStore,
+      runtimeEventStore: runStore,
+      backends,
+      childTools: [testTool('Read'), testTool('Glob'), testTool('Grep')],
+      newId: nextId(),
+      now: nextNow(80),
+    });
+    const parent = await manager.createSession(makeInput());
+    const child = await createGraphOperatorSession(store, parent.id);
+    const claim = graphIntentClaim({ targetSessionId: child.id }, 'retry scoped stop');
+    const running = manager.runClaimedAgentGraphIntent({
+      ...graphExecutionInput(claim, 'retry scoped stop'),
+      onReady: () => ready.release(),
+    });
+    await ready.promise;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const identity = {
+      sessionId: child.id,
+      runId: claim.targetRunId,
+      turnId: claim.targetTurnId,
+    };
+    await assert.rejects(
+      manager.stopAgentGraphActivation(identity),
+      /scoped abort persistence unavailable/,
+    );
+    rejectAbort = false;
+    await manager.stopAgentGraphActivation(identity);
+    sendGate.release();
+    assert.strictEqual((await running).status, 'cancelled');
+    assert.strictEqual(
+      runtimeInvocationOutcome(await readInvocation(runStore, child.id, claim.targetRunId)),
+      'cancelled',
+    );
+    assert.strictEqual(
+      (await runStore.readRuntimeEvents(child.id, claim.targetRunId)).filter(
+        (event) => event.status === 'aborted',
+      ).length,
+      1,
+    );
+  });
+
+  test('a scoped graph stop whose backend delivery fails keeps the child result authoritative', {
+    timeout: 2_000,
+  }, async () => {
+    const store = new MemorySessionStore();
+    const runStore = new MemoryAgentRunStore();
+    const backends = new BackendRegistry();
+    const sendGate = makeGate();
+    const ready = makeGate();
+    backends.register(
+      'ai-sdk',
+      (ctx) =>
+        new (class extends TestBackend {
+          override async stop(): Promise<void> {
+            this.stopCalls += 1;
+            sendGate.release();
+            throw new Error('backend stop delivery failed');
+          }
+        })(ctx, sendGate),
+    );
+    const manager = new SessionManager({
+      store,
+      runStore,
+      runtimeEventStore: runStore,
+      backends,
+      childTools: [testTool('Read'), testTool('Glob'), testTool('Grep')],
+      newId: nextId(),
+      now: nextNow(85),
+    });
+    const parent = await manager.createSession(makeInput());
+    const child = await createGraphOperatorSession(store, parent.id);
+    const claim = graphIntentClaim({ targetSessionId: child.id }, 'failed stop delivery');
+    const running = manager.runClaimedAgentGraphIntent({
+      ...graphExecutionInput(claim, 'failed stop delivery'),
+      onReady: () => ready.release(),
+    });
+    void running.catch(() => undefined);
+    await ready.promise;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const identity = {
+      sessionId: child.id,
+      runId: claim.targetRunId,
+      turnId: claim.targetTurnId,
+    };
+    // The stopper owns the cleanup failure; a retry settles the retained
+    // operation as failed without delivering to the backend again.
+    await assert.rejects(manager.stopAgentGraphActivation(identity), /stop delivery failed/);
+    await assert.rejects(manager.stopAgentGraphActivation(identity), /stop delivery failed/);
+    const result = await running;
+    assert.strictEqual(result.status, 'cancelled');
+    assert.strictEqual(
+      runtimeInvocationOutcome(await readInvocation(runStore, child.id, claim.targetRunId)),
+      'cancelled',
+    );
+  });
+
+  for (const recovery of ['retry', 'session_stop'] as const) {
+    test(`scoped graph stop cleanup failure keeps the Session queue fenced until ${recovery}`, {
+      timeout: 2_000,
+    }, async () => {
+      const store = new MemorySessionStore();
+      let rejectAbort = true;
+      const runStore = new MemoryAgentRunStore({
+        beforeRuntimeEventAppend: (_sessionId, _runId, event) => {
+          if (rejectAbort && event.status === 'aborted')
+            throw new Error('scoped cleanup unavailable');
+        },
+      });
+      const backends = new BackendRegistry();
+      const sendGate = makeGate();
+      const ready = makeGate();
+      backends.register('ai-sdk', (ctx) => new CountingStopBackend(ctx, sendGate));
+      const manager = new SessionManager({
+        store,
+        runStore,
+        runtimeEventStore: runStore,
+        backends,
+        childTools: [testTool('Read'), testTool('Glob'), testTool('Grep')],
+        newId: nextId(),
+        now: nextNow(90),
+      });
+      const parent = await manager.createSession(makeInput());
+      const child = await createGraphOperatorSession(store, parent.id);
+      const firstClaim = graphIntentClaim({ targetSessionId: child.id }, 'stop before successor');
+      const secondClaim = graphIntentClaim(
+        {
+          targetSessionId: child.id,
+          claimId: `graph_claim_${'c'.repeat(32)}`,
+          intentId: `graph_intent_${'d'.repeat(32)}`,
+          targetRunId: 'successor-run',
+          targetTurnId: 'successor-turn',
+        },
+        'successor',
+      );
+      const first = manager.runClaimedAgentGraphIntent({
+        ...graphExecutionInput(firstClaim, 'stop before successor'),
+        onReady: () => ready.release(),
+      });
+      await ready.promise;
+      const second = manager.runClaimedAgentGraphIntent(
+        graphExecutionInput(secondClaim, 'successor'),
+      );
+      const settled = Promise.allSettled([first, second]);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      const identity = {
+        sessionId: child.id,
+        runId: firstClaim.targetRunId,
+        turnId: firstClaim.targetTurnId,
+      };
+      await assert.rejects(
+        manager.stopAgentGraphActivation(identity),
+        /scoped cleanup unavailable/,
+      );
+      sendGate.release();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.deepStrictEqual(
+        (await runStore.listSessionInvocations(child.id)).map((run) => run.turnId),
+        [firstClaim.targetTurnId],
+      );
+      rejectAbort = false;
+      if (recovery === 'retry') await manager.stopAgentGraphActivation(identity);
+      else await manager.stopSession(child.id);
+      const outcomes = await settled;
+      assert.strictEqual(
+        runtimeInvocationOutcome(await readInvocation(runStore, child.id, firstClaim.targetRunId)),
+        'cancelled',
+      );
+      assert.strictEqual(outcomes[1]!.status, recovery === 'retry' ? 'fulfilled' : 'rejected');
+      if (outcomes[1]!.status === 'fulfilled')
+        assert.strictEqual(outcomes[1]!.value.status, 'completed');
+    });
+  }
+
+  test('a retained graph stop quarantines an unrelated Turn until its cleanup succeeds', {
+    timeout: 2_000,
+  }, async () => {
+    const store = new MemorySessionStore();
+    let rejectAbort = true;
+    const runStore = new MemoryAgentRunStore({
+      beforeRuntimeEventAppend: (_sessionId, _runId, event) => {
+        if (rejectAbort && event.status === 'aborted') throw new Error('stop cleanup unavailable');
+      },
+    });
+    const backends = new BackendRegistry();
+    const sendGate = makeGate();
+    const ready = makeGate();
+    backends.register('ai-sdk', (ctx) => new CountingStopBackend(ctx, sendGate));
+    const manager = new SessionManager({
+      store,
+      runStore,
+      runtimeEventStore: runStore,
+      backends,
+      childTools: [testTool('Read'), testTool('Glob'), testTool('Grep')],
+      newId: nextId(),
+      now: nextNow(97),
+    });
+    const parent = await manager.createSession(makeInput());
+    const child = await createGraphOperatorSession(store, parent.id);
+    const claim = graphIntentClaim({ targetSessionId: child.id }, 'retained stop');
+    // The stopped Run's own finalization reports the same persistence fault.
+    const running = manager
+      .runClaimedAgentGraphIntent({
+        ...graphExecutionInput(claim, 'retained stop'),
+        onReady: () => ready.release(),
+      })
+      .catch((error: unknown) => error);
+    await ready.promise;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const identity = {
+      sessionId: child.id,
+      runId: claim.targetRunId,
+      turnId: claim.targetTurnId,
+    };
+    await assert.rejects(manager.stopAgentGraphActivation(identity), /stop cleanup unavailable/);
+    sendGate.release();
+    assert.strictEqual(manager.hasPendingAgentGraphActivationStop(identity), true);
+    // A Turn that holds no stop intent of the retained operation cannot use
+    // the stop owner's quarantine bypass.
+    await assert.rejects(
+      drain(manager.sendMessage(child.id, { turnId: 'unrelated-turn', text: 'must wait' })),
+      /quarantined by a retained stop operation/,
+    );
+    rejectAbort = false;
+    await manager.stopAgentGraphActivation(identity);
+    assert.strictEqual(manager.hasPendingAgentGraphActivationStop(identity), false);
+    await running;
+    await drain(manager.sendMessage(child.id, { turnId: 'after-cleanup', text: 'runs now' }));
+    const runs = await runStore.listSessionInvocations(child.id);
+    assert.strictEqual(
+      runtimeInvocationOutcome(runs.find((run) => run.turnId === claim.targetTurnId)!),
+      'cancelled',
+    );
+    assert.strictEqual(
+      runtimeInvocationOutcome(runs.find((run) => run.turnId === 'after-cleanup')!),
+      'completed',
+    );
+  });
+
+  test('scoped graph stop for a completed identity leaves its active successor intact', {
+    timeout: 2_000,
+  }, async () => {
+    const successorGate = makeGate();
+    const { manager, child, runStore, activeGate, first, claims } = await createQueuedGraphScenario(
+      undefined,
+      successorGate,
+    );
+    const [firstClaim, secondClaim] = claims;
+    activeGate.release();
+    assert.strictEqual((await first).status, 'completed');
+    const ready = makeGate();
+    const second = manager.runClaimedAgentGraphIntent({
+      ...graphExecutionInput(secondClaim, 'queued activation'),
+      onReady: () => ready.release(),
+    });
+    await ready.promise;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    try {
+      await manager.stopAgentGraphActivation(
+        {
+          sessionId: child.id,
+          runId: firstClaim.targetRunId,
+          turnId: firstClaim.targetTurnId,
+        },
+        { source: 'graph_supervisor' },
+      );
+      assert.strictEqual(
+        (await readInvocation(runStore, child.id, secondClaim.targetRunId)).terminalEvent,
+        undefined,
+      );
+    } finally {
+      successorGate.release();
+    }
+    assert.strictEqual((await second).status, 'completed');
+    assert.deepStrictEqual(
+      (await runStore.listSessionInvocations(child.id)).map((run) => [
+        run.turnId,
+        runtimeInvocationOutcome(run),
+      ]),
+      [
+        [firstClaim.targetTurnId, 'completed'],
+        [secondClaim.targetTurnId, 'completed'],
+      ],
+    );
+  });
+
+  for (const source of ['graph_supervisor', 'stop_button'] as const) {
+    test(`a graph operator stopped by a ${source} Session stop ${source === 'graph_supervisor' ? 'accepts' : 'refuses'} its next claim`, {
+      timeout: 2_000,
+    }, async () => {
+      const store = new MemorySessionStore();
+      const runStore = new MemoryAgentRunStore();
+      const backends = new BackendRegistry();
+      const sendGate = makeGate();
+      const ready = makeGate();
+      backends.register('ai-sdk', (ctx) => new TestBackend(ctx, sendGate));
+      const manager = new SessionManager({
+        store,
+        runStore,
+        runtimeEventStore: runStore,
+        backends,
+        childTools: [testTool('Read'), testTool('Glob'), testTool('Grep')],
+        newId: nextId(),
+        now: nextNow(95),
+      });
+      const parent = await manager.createSession(makeInput());
+      const child = await createGraphOperatorSession(store, parent.id);
+      const stoppedClaim = graphIntentClaim({ targetSessionId: child.id }, 'stopped activation');
+      const stopped = manager.runClaimedAgentGraphIntent({
+        ...graphExecutionInput(stoppedClaim, 'stopped activation'),
+        onReady: () => ready.release(),
+      });
+      await ready.promise;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await manager.stopSession(child.id, { source });
+      sendGate.release();
+      assert.strictEqual((await stopped).status, 'cancelled');
+      assert.strictEqual((await store.readHeader(child.id)).status, 'aborted');
+      // A whole-graph stop keeps durable schedule facts so the supervisor can
+      // wake the same graph again; a user stop still terminates the operator.
+      const nextClaim = graphIntentClaim(
+        {
+          targetSessionId: child.id,
+          claimId: `graph_claim_${'e'.repeat(32)}`,
+          intentId: `graph_intent_${'f'.repeat(32)}`,
+          targetRunId: 'resumed-run',
+          targetTurnId: 'resumed-turn',
+        },
+        'resumed activation',
+      );
+      const next = manager.runClaimedAgentGraphIntent(
+        graphExecutionInput(nextClaim, 'resumed activation'),
+      );
+      if (source === 'graph_supervisor') assert.strictEqual((await next).status, 'completed');
+      else await assert.rejects(next, /target child session is terminated/);
+    });
+  }
 
   test('evaluates execution admission only after a claimed child-session slot is available', async () => {
     const store = new MemorySessionStore();
@@ -1838,76 +2601,88 @@ describe('SessionManager claimed graph intent execution', () => {
       },
     });
     await new Promise<void>((resolve) => setImmediate(resolve));
-    expect(admissionChecks).toBe(0);
+    assert.strictEqual(admissionChecks, 0);
 
     firstGate.release();
-    expect((await first).status).toBe('completed');
+    assert.strictEqual((await first).status, 'completed');
     await expectRejects(queued, /cancelled before runtime admission/);
-    expect(admissionChecks).toBe(1);
-    expect(backend?.sendInputs.length).toBe(1);
-    expect((await runStore.listSessionRuns(child.id)).length).toBe(1);
+    assert.strictEqual(admissionChecks, 1);
+    assert.strictEqual(backend?.sendInputs.length, 1);
+    assert.strictEqual((await runStore.listSessionInvocations(child.id)).length, 1);
   });
 
-  test('keeps a stop pending across graph admission with an idle cached backend', async () => {
-    const store = new MemorySessionStore();
-    const runStore = new MemoryAgentRunStore();
-    const backends = new BackendRegistry();
-    const admissionStarted = makeGate();
-    const releaseAdmission = makeGate();
-    let backend: TestBackend | undefined;
-    backends.register('ai-sdk', (ctx) => {
-      backend = new TestBackend(ctx);
-      return backend;
-    });
-    const manager = new SessionManager({
-      store,
-      runStore,
-      runtimeEventStore: runStore,
-      backends,
-      childTools: [testTool('Read'), testTool('Glob'), testTool('Grep')],
-      newId: nextId(),
-      now: nextNow(77),
-    });
-    const parent = await manager.createSession(makeInput());
-    const child = await createGraphOperatorSession(store, parent.id);
-    await drain(
-      manager.sendMessage(child.id, {
-        turnId: 'completed-before-admission',
-        text: 'warm the cached operator backend',
-      }),
-    );
-    expect(backend?.sendInputs).toHaveLength(1);
-    const claim = graphIntentClaim(
-      { targetSessionId: child.id },
-      'activation stopped during admission',
-    );
-    const execution = manager.runClaimedAgentGraphIntent({
-      ...graphExecutionInput(claim, 'activation stopped during admission'),
-      async admitExecution() {
-        admissionStarted.release();
-        await releaseAdmission.promise;
-        return 'executing';
-      },
-    });
-    await admissionStarted.promise;
+  for (const scoped of [false, true])
+    test(`keeps a ${scoped ? 'scoped graph stop' : 'session stop'} pending across graph admission with an idle cached backend`, async () => {
+      const store = new MemorySessionStore();
+      const runStore = new MemoryAgentRunStore();
+      const backends = new BackendRegistry();
+      const admissionStarted = makeGate();
+      const releaseAdmission = makeGate();
+      let backend: TestBackend | undefined;
+      backends.register('ai-sdk', (ctx) => {
+        backend = new TestBackend(ctx);
+        return backend;
+      });
+      const manager = new SessionManager({
+        store,
+        runStore,
+        runtimeEventStore: runStore,
+        backends,
+        childTools: [testTool('Read'), testTool('Glob'), testTool('Grep')],
+        newId: nextId(),
+        now: nextNow(77),
+      });
+      const parent = await manager.createSession(makeInput());
+      const child = await createGraphOperatorSession(store, parent.id);
+      await drain(
+        manager.sendMessage(child.id, {
+          turnId: 'completed-before-admission',
+          text: 'warm the cached operator backend',
+        }),
+      );
+      assert.strictEqual(backend?.sendInputs?.length, 1);
+      const claim = graphIntentClaim(
+        { targetSessionId: child.id },
+        'activation stopped during admission',
+      );
+      const execution = manager.runClaimedAgentGraphIntent({
+        ...graphExecutionInput(claim, 'activation stopped during admission'),
+        async admitExecution() {
+          admissionStarted.release();
+          await releaseAdmission.promise;
+          return 'executing';
+        },
+      });
+      await admissionStarted.promise;
 
-    let stopSettled = false;
-    const stop = manager.stopSession(child.id, { source: 'graph_supervisor' }).finally(() => {
-      stopSettled = true;
+      let stopSettled = false;
+      const stop = (
+        scoped
+          ? manager.stopAgentGraphActivation({
+              sessionId: child.id,
+              runId: claim.targetRunId,
+              turnId: claim.targetTurnId,
+            })
+          : manager.stopSession(child.id, { source: 'graph_supervisor' })
+      ).finally(() => {
+        stopSettled = true;
+      });
+      await Promise.resolve();
+      assert.strictEqual(stopSettled, false);
+      assert.strictEqual(backend?.sendInputs?.length, 1);
+
+      releaseAdmission.release();
+      await stop;
+      const result = await execution;
+
+      assert.strictEqual(result.status, 'cancelled');
+      assert.strictEqual(backend?.stopCalls, 1);
+      assert.strictEqual(backend?.sendInputs?.length, 1);
+      assert.strictEqual(
+        runtimeInvocationOutcome(await readInvocation(runStore, child.id, claim.targetRunId)),
+        'cancelled',
+      );
     });
-    await Promise.resolve();
-    expect(stopSettled).toBe(false);
-    expect(backend?.sendInputs).toHaveLength(1);
-
-    releaseAdmission.release();
-    await stop;
-    const result = await execution;
-
-    expect(result.status).toBe('cancelled');
-    expect(backend?.stopCalls).toBe(1);
-    expect(backend?.sendInputs).toHaveLength(1);
-    expect((await runStore.readRun(child.id, claim.targetRunId)).status).toBe('cancelled');
-  });
 
   test('runtime stop settles queued graph claims without letting their slots pass the active claim', async () => {
     const firstAbort = new AbortController();
@@ -1944,22 +2719,27 @@ describe('SessionManager claimed graph intent execution', () => {
       bound.abort();
     }
 
-    expect(results[0]?.status).toBe('fulfilled');
-    expect(results[1]?.status).toBe('rejected');
-    expect(results[2]?.status).toBe('rejected');
-    expect(queuedReady).toBe(0);
-    expect(backend?.sendInputs.map((input) => input.turnId)).toEqual([firstClaim.targetTurnId]);
-    expect((await runStore.listSessionRuns(child.id)).map((run) => run.turnId)).toEqual([
-      firstClaim.targetTurnId,
-    ]);
-    expect(
-      (await store.readMessages(child.id)).filter(
+    assert.strictEqual(results[0]?.status, 'fulfilled');
+    assert.strictEqual(results[1]?.status, 'rejected');
+    assert.strictEqual(results[2]?.status, 'rejected');
+    assert.strictEqual(queuedReady, 0);
+    assert.deepStrictEqual(
+      backend?.sendInputs.map((input) => input.turnId),
+      [firstClaim.targetTurnId],
+    );
+    assert.deepStrictEqual(
+      (await runStore.listSessionInvocations(child.id)).map((run) => run.turnId),
+      [firstClaim.targetTurnId],
+    );
+    assert.deepStrictEqual(
+      (await manager.getMessages(child.id)).filter(
         (message) =>
           'turnId' in message &&
           (message.turnId === secondClaim.targetTurnId ||
             message.turnId === thirdClaim.targetTurnId),
       ),
-    ).toEqual([]);
+      [],
+    );
   });
 
   test('recovers an existing nonterminal claimed run without invoking the backend again', async () => {
@@ -2000,7 +2780,7 @@ describe('SessionManager claimed graph intent execution', () => {
           sessionId: child.id,
           runId: claim.targetRunId,
           turnId: claim.targetTurnId,
-          type: 'run_started',
+          type: 'turn_started',
           ts: 81,
         }),
       ],
@@ -2010,10 +2790,10 @@ describe('SessionManager claimed graph intent execution', () => {
       ...graphExecutionInput(claim, 'interrupted turn'),
     });
 
-    expect(recovered.status).toBe('failed');
-    expect(recovered.failureClass).toBe('app_restarted');
-    expect(backendBuilds).toBe(0);
-    expect((await runStore.listSessionRuns(child.id)).length).toBe(1);
+    assert.strictEqual(recovered.status, 'failed');
+    assert.strictEqual(recovered.failureClass, 'app_restarted');
+    assert.strictEqual(backendBuilds, 0);
+    assert.strictEqual((await runStore.listSessionInvocations(child.id)).length, 1);
   });
 
   test('target Session stop owns a claimed graph execution before its first runtime preflight', async () => {
@@ -2057,14 +2837,17 @@ describe('SessionManager claimed graph intent execution', () => {
       stopSettled = true;
     });
     await Promise.resolve();
-    expect(stopSettled).toBe(false);
+    assert.strictEqual(stopSettled, false);
 
     releaseRead.release();
     const [result] = await Promise.all([executing, stopping]);
-    expect(result.status).toBe('cancelled');
-    expect(backend?.sendInputs).toEqual([]);
-    expect((await runStore.readRun(child.id, claim.targetRunId)).status).toBe('cancelled');
-    expect((await store.readHeader(child.id)).status === 'blocked').toBe(false);
+    assert.strictEqual(result.status, 'cancelled');
+    assert.deepStrictEqual(backend?.sendInputs, []);
+    assert.strictEqual(
+      runtimeInvocationOutcome(await readInvocation(runStore, child.id, claim.targetRunId)),
+      'cancelled',
+    );
+    assert.strictEqual((await store.readHeader(child.id)).status === 'blocked', false);
   });
 
   test('fails closed before runtime when claim routing collides or targets a main session', async () => {
@@ -2120,7 +2903,8 @@ describe('SessionManager claimed graph intent execution', () => {
 
     const child = await createGraphOperatorSession(store, parent.id);
     const claim = graphIntentClaim({ targetSessionId: child.id }, 'must not run');
-    await runStore.createRun(
+    await seedInvocationFromHeader(
+      runStore,
       makeRunHeader({
         sessionId: child.id,
         runId: 'different-run',
@@ -2174,11 +2958,148 @@ describe('SessionManager claimed graph intent execution', () => {
       ),
       /target child session is terminated/,
     );
-    expect(backendBuilds).toBe(0);
+    assert.strictEqual(backendBuilds, 0);
   });
 });
 
 describe('SessionManager child-session runtime primitive', () => {
+  test('runs an explicitly delegated child through a plugin executor with no Maka tools', async () => {
+    const store = new MemorySessionStore();
+    const runStore = new MemoryAgentRunStore();
+    const backends = new BackendRegistry();
+    const parentGate = makeGate();
+    let childContext: BackendFactoryContext | undefined;
+    const checkedExecutors: string[] = [];
+    backends.register('ai-sdk', (ctx) => new TestBackend(ctx, parentGate));
+    backends.register('plugin-executor', (ctx) => {
+      childContext = ctx;
+      return {
+        kind: 'plugin-executor' as const,
+        sessionId: ctx.sessionId,
+        async *send(input: BackendSendInput): AsyncIterable<SessionEvent> {
+          yield {
+            type: 'text_complete',
+            id: 'external-complete-text',
+            turnId: input.turnId,
+            ts: 1,
+            messageId: 'external-message',
+            text: 'external result',
+          };
+          yield {
+            type: 'complete',
+            id: 'external-complete',
+            turnId: input.turnId,
+            ts: 2,
+            stopReason: 'end_turn',
+          };
+        },
+        async stop() {},
+        async respondToSandboxBoundary() {},
+        async dispose() {},
+      };
+    });
+    const manager = new SessionManager({
+      store,
+      runStore,
+      runtimeEventStore: runStore,
+      backends,
+      childTools: [],
+      assertChildExecutorAvailable: (parentSessionId, executorId) => {
+        checkedExecutors.push(`${parentSessionId}:${executorId}`);
+      },
+      newId: nextId(),
+      now: nextNow(80),
+    });
+    const parent = await manager.createSession(makeInput());
+    const parentTurn = manager
+      .sendMessage(parent.id, { turnId: 'parent-turn', text: 'delegate externally' })
+      [Symbol.asyncIterator]();
+    await parentTurn.next();
+    const [parentRun] = await runStore.listSessionInvocations(parent.id);
+    if (!parentRun) throw new Error('parent run was not recorded');
+
+    const result = await manager.spawnChildSession(parent.id, {
+      spawnedBy: {
+        parentRunId: parentRun.runId,
+        parentTurnId: parentRun.turnId,
+        toolCallId: 'tool-call-external',
+      },
+      agentProfile: LOCAL_READ_AGENT_PROFILE,
+      executorId: 'codex',
+      prompt: 'inspect through codex',
+    });
+    const child = await store.readHeader(result.childSessionId);
+
+    assert.strictEqual(result.status, 'completed');
+    assert.strictEqual(result.summary, 'external result');
+    assert.strictEqual(child.backend, 'plugin-executor');
+    assert.strictEqual(child.executorId, 'codex');
+    assert.strictEqual(child.llmConnectionId, undefined);
+    assert.deepStrictEqual(child.subagentRuntime?.toolNames, []);
+    assert.deepStrictEqual(childContext?.tools, []);
+    assert.strictEqual(childContext?.systemPrompt, LOCAL_READ_AGENT_DEFINITION.systemPrompt);
+    assert.deepStrictEqual(checkedExecutors, [`${parent.id}:codex`]);
+
+    parentGate.release();
+    while (!(await parentTurn.next()).done) {}
+  });
+
+  test('delegated child execution uses the parent run policy without changing saved parent permissions', async () => {
+    const store = new MemorySessionStore();
+    const runStore = new MemoryAgentRunStore();
+    const backends = new BackendRegistry();
+    const parentGate = makeGate();
+    const contexts: BackendFactoryContext[] = [];
+    backends.register('ai-sdk', (ctx) => {
+      contexts.push(ctx);
+      return new TestBackend(ctx, ctx.header.subagentRuntime ? undefined : parentGate);
+    });
+    const manager = new SessionManager({
+      store,
+      runStore,
+      runtimeEventStore: runStore,
+      backends,
+      childTools: [testTool('Read'), testTool('Glob'), testTool('Grep')],
+      newId: nextId(),
+      now: nextNow(100),
+    });
+    const parent = await manager.createSession(makeInput({ permissionMode: 'ask' }));
+    const savedBoundary = await store.readExecutionBoundary(parent.id);
+    const policy = { permissionMode: 'bypass' as const, questions: 'return' as const };
+    const parentTurn = manager
+      .sendMessage(
+        parent.id,
+        { turnId: 'delegated-parent', text: 'inspect using a child' },
+        { executionPolicy: policy },
+      )
+      [Symbol.asyncIterator]();
+    await parentTurn.next();
+    try {
+      const [run] = await runStore.listSessionInvocations(parent.id);
+      assert.ok(run);
+      const result = await manager.spawnChildSession(parent.id, {
+        spawnedBy: {
+          parentRunId: run.runId,
+          parentTurnId: run.turnId,
+          toolCallId: 'delegated-child',
+        },
+        agentProfile: LOCAL_READ_AGENT_PROFILE,
+        prompt: 'inspect',
+      });
+      assert.equal(result.status, 'completed');
+      const child = contexts.find((context) => context.sessionId === result.childSessionId)!;
+      assert.deepEqual(child.executionPolicy, policy);
+      assert.equal(child.header.permissionMode, 'bypass');
+      assert.equal((await child.store.readExecutionBoundary(child.sessionId)).kind, 'bypass');
+      assert.equal((await store.readHeader(parent.id)).permissionMode, 'ask');
+      assert.deepEqual(await store.readExecutionBoundary(parent.id), savedBoundary);
+      assert.equal((await store.readHeader(child.sessionId)).permissionMode, 'explore');
+    } finally {
+      parentGate.release();
+      while (!(await parentTurn.next()).done) {}
+    }
+  });
+
   test('creates a fresh read-only child with a session-inline first run and no parent history', async () => {
     const store = new MemorySessionStore();
     const runStore = new MemoryAgentRunStore();
@@ -2224,7 +3145,7 @@ describe('SessionManager child-session runtime primitive', () => {
       .sendMessage(parent.id, { turnId: 'parent-turn', text: 'private parent history' })
       [Symbol.asyncIterator]();
     await parentTurn.next();
-    const [parentRun] = await runStore.listSessionRuns(parent.id);
+    const [parentRun] = await runStore.listSessionInvocations(parent.id);
     if (!parentRun) throw new Error('parent run was not recorded');
 
     const result = await manager.spawnChildSession(parent.id, {
@@ -2238,18 +3159,22 @@ describe('SessionManager child-session runtime primitive', () => {
     });
 
     const childHeader = await store.readHeader(result.childSessionId);
-    expect(await store.readExecutionBoundary(result.childSessionId)).toEqual(
+    assert.deepStrictEqual(
+      await store.readExecutionBoundary(result.childSessionId),
       await store.readExecutionBoundary(parent.id),
     );
-    expect(childHeader.cwd).toBe('/tmp/project');
-    expect(childHeader.projectId).toBe('project-1');
-    expect(childHeader.workspaceRoot).toBe((await store.readHeader(parent.id)).workspaceRoot);
-    expect(childHeader.llmConnectionSlug).toBe('connection-1');
-    expect(childHeader.model).toBe('model-1');
-    expect(childHeader.thinkingLevel).toBe('medium');
-    expect(childHeader.permissionMode).toBe('explore');
-    expect(childHeader.connectionLocked).toBe(true);
-    expect(childHeader.subagentParent).toEqual({
+    assert.strictEqual(childHeader.cwd, '/tmp/project');
+    assert.strictEqual(childHeader.projectId, 'project-1');
+    assert.strictEqual(
+      childHeader.workspaceRoot,
+      (await store.readHeader(parent.id)).workspaceRoot,
+    );
+    assert.strictEqual(childHeader.llmConnectionSlug, 'connection-1');
+    assert.strictEqual(childHeader.model, 'model-1');
+    assert.strictEqual(childHeader.thinkingLevel, 'medium');
+    assert.strictEqual(childHeader.permissionMode, 'explore');
+    assert.strictEqual(childHeader.connectionLocked, true);
+    assert.deepStrictEqual(childHeader.subagentParent, {
       kind: 'subagent',
       parentSessionId: parent.id,
       spawnedBy: {
@@ -2259,7 +3184,7 @@ describe('SessionManager child-session runtime primitive', () => {
       },
       lifecycle: 'foreground',
     });
-    expect(childHeader.subagentRuntime).toEqual({
+    assert.deepStrictEqual(childHeader.subagentRuntime, {
       schemaVersion: 1,
       definitionVersion: 1,
       agentId: LOCAL_READ_AGENT_ID,
@@ -2269,74 +3194,82 @@ describe('SessionManager child-session runtime primitive', () => {
       toolNames: ['Read', 'Glob', 'Grep'],
       categoryPolicy: {},
     });
-    expect(childHeader.subagentSpawn?.schemaVersion).toBe(1);
-    expect(childHeader.subagentSpawn?.requestFingerprint).toMatch(/^[a-f0-9]{64}$/);
-    expect(childHeader.subagentSpawn?.initialTurnId).toBe(result.turnId);
-    expect(childHeader.subagentSpawn?.initialRunId).toBe(result.runId);
+    assert.strictEqual(childHeader.subagentSpawn?.schemaVersion, 1);
+    assert.match(String(childHeader.subagentSpawn?.requestFingerprint), /^[a-f0-9]{64}$/);
+    assert.strictEqual(childHeader.subagentSpawn?.initialTurnId, result.turnId);
+    assert.strictEqual(childHeader.subagentSpawn?.initialRunId, result.runId);
 
-    const [childRun] = await runStore.listSessionRuns(result.childSessionId);
+    const [childRun] = await runStore.listSessionInvocations(result.childSessionId);
     if (!childRun) throw new Error('child run was not recorded');
-    expect(childRun.runId).toBe(result.runId);
-    expect(childRun.parentRunId).toBe(undefined);
-    expect(childRun.agentId).toBe(LOCAL_READ_AGENT_ID);
-    expect(isSessionInlineRun(childRun)).toBe(true);
-    expect(result.status).toBe('completed');
-    expect(backendActivationSessions).toEqual([parent.id, result.childSessionId]);
-    expect(
+    assert.strictEqual(childRun.runId, result.runId);
+    assert.strictEqual(childRun.opening.lineage?.parentRunId, undefined);
+    assert.strictEqual(childRun.opening.lineage?.agentId, LOCAL_READ_AGENT_ID);
+    assert.strictEqual(isSessionInlineInvocation(childRun.opening), true);
+    assert.strictEqual(result.status, 'completed');
+    assert.deepStrictEqual(backendActivationSessions, [parent.id, result.childSessionId]);
+    assert.strictEqual(
       (await runStore.readRuntimeEvents(result.childSessionId, childRun.runId)).every(
         (event) => event.sessionId === result.childSessionId,
       ),
-    ).toBe(true);
+      true,
+    );
 
     const childContext = contexts.find((ctx) => ctx.sessionId === result.childSessionId);
-    expect(childContext?.systemPrompt).toBe(LOCAL_READ_AGENT_DEFINITION.systemPrompt);
-    expect(childContext?.tools?.map((tool) => tool.name)).toEqual(['Read', 'Glob', 'Grep']);
-    expect(backendsBySession.get(result.childSessionId)?.sendInputs[0]?.context).toEqual([]);
-    expect(
+    assert.strictEqual(childContext?.systemPrompt, LOCAL_READ_AGENT_DEFINITION.systemPrompt);
+    assert.deepStrictEqual(
+      childContext?.tools?.map((tool) => tool.name),
+      ['Read', 'Glob', 'Grep'],
+    );
+    assert.strictEqual(
+      backendsBySession.get(result.childSessionId)?.sendInputs[0]?.context,
+      undefined,
+    );
+    assert.strictEqual(
       backendsBySession
         .get(result.childSessionId)
         ?.sendInputs[0]?.runtimeContext?.some(
           (event) =>
             event.content?.kind === 'text' && event.content.text === 'private parent history',
         ) ?? false,
-    ).toBe(false);
+      false,
+    );
 
-    const parentMessages = await store.readMessages(parent.id);
-    const childMessages = await store.readMessages(result.childSessionId);
-    expect(
+    const parentMessages = await manager.getMessages(parent.id);
+    const childMessages = await manager.getMessages(result.childSessionId);
+    assert.strictEqual(
       parentMessages.some(
         (message) => message.type === 'user' && message.text === 'inspect the storage boundary',
       ),
-    ).toBe(false);
-    expect(
+      false,
+    );
+    assert.strictEqual(
       childMessages.some(
         (message) => message.type === 'user' && message.text === 'inspect the storage boundary',
       ),
-    ).toBe(true);
-    await manager.setPermissionMode(result.childSessionId, 'bypass');
-    expect((await store.readHeader(result.childSessionId)).permissionMode).toBe('bypass');
+      true,
+    );
     const projection = await manager.listChildAgents(parent.id);
-    expect(projection.runs).toEqual([]);
-    expect(projection.executions).toHaveLength(1);
-    expect(projection.executions[0]?.execution).toEqual({
+    assert.deepStrictEqual(projection.runs, []);
+    assert.strictEqual(projection.executions.length, 1);
+    assert.deepStrictEqual(projection.executions[0]?.execution, {
       kind: 'child_session',
       sessionId: result.childSessionId,
       currentRunId: result.runId,
     });
-    expect(projection.executions[0]?.status).toBe('completed');
+    assert.strictEqual(projection.executions[0]?.status, 'completed');
     const output = await manager.readChildAgentOutput(parent.id, {
       execution: {
         kind: 'child_session',
         sessionId: result.childSessionId,
       },
     });
-    expect(output.execution).toEqual({
+    assert.deepStrictEqual(output.execution, {
       kind: 'child_session',
       sessionId: result.childSessionId,
       currentRunId: result.runId,
     });
-    expect(output.header.sessionId).toBe(result.childSessionId);
-    expect(output.header.runId).toBe(result.runId);
+    assert.strictEqual(output.invocation.sessionId, result.childSessionId);
+    assert.strictEqual(output.invocation.runId, result.runId);
     const unrelatedParent = await manager.createSession(makeInput({ name: 'Unrelated parent' }));
     await expectRejects(
       manager.readChildAgentOutput(unrelatedParent.id, {
@@ -2410,7 +3343,7 @@ describe('SessionManager child-session runtime primitive', () => {
       .sendMessage(parent.id, { turnId: 'parent-turn-preset', text: 'delegate' })
       [Symbol.asyncIterator]();
     await parentTurn.next();
-    const [parentRun] = await runStore.listSessionRuns(parent.id);
+    const [parentRun] = await runStore.listSessionInvocations(parent.id);
     if (!parentRun) throw new Error('parent run was not recorded');
 
     const result = await manager.spawnChildSession(parent.id, {
@@ -2425,17 +3358,54 @@ describe('SessionManager child-session runtime primitive', () => {
     });
     const child = await store.readHeader(result.childSessionId);
 
-    expect(child.llmConnectionSlug).toBe('worker-connection');
-    expect(child.llmConnectionId).toBe('33333333-3333-4333-8333-333333333333');
-    expect(child.model).toBe('worker-model');
-    expect(child.thinkingLevel).toBe('low');
-    expect(child.subagentRuntime?.presetId).toBe('fast-reader');
-    expect(child.subagentRuntime?.agentName).toBe('Fast reader');
-    expect(child.connectionLocked).toBe(true);
-    expect((await manager.listChildAgents(parent.id)).presets[0]?.id).toBe('fast-reader');
+    assert.strictEqual(child.llmConnectionSlug, 'worker-connection');
+    assert.strictEqual(child.llmConnectionId, '33333333-3333-4333-8333-333333333333');
+    assert.strictEqual(child.model, 'worker-model');
+    assert.strictEqual(child.thinkingLevel, 'low');
+    assert.strictEqual(child.subagentRuntime?.presetId, 'fast-reader');
+    assert.strictEqual(child.subagentRuntime?.agentName, 'Fast reader');
+    assert.strictEqual(child.connectionLocked, true);
+    assert.strictEqual((await manager.listChildAgents(parent.id)).presets[0]?.id, 'fast-reader');
 
     parentGate.release();
     while (!(await parentTurn.next()).done) {}
+  });
+
+  test('tells callers to retry when a subagent preset profile changes during spawn', async () => {
+    const manager = new SessionManager({
+      store: new MemorySessionStore(),
+      backends: new BackendRegistry(),
+      subagentCatalog: {
+        list: async () => [],
+        resolve: async (id) => ({
+          connectionId: '33333333-3333-4333-8333-333333333333',
+          id,
+          name: 'Changed preset',
+          description: 'Changed while spawning',
+          profile: IMPLEMENTATION_AGENT_DEFINITION.profile,
+          connectionSlug: 'worker-connection',
+          model: 'worker-model',
+          thinkingLevel: 'low',
+          enabled: true,
+        }),
+      },
+      newId: nextId(),
+      now: nextNow(150),
+    });
+
+    await expectRejects(
+      manager.spawnChildSession('parent-session', {
+        spawnedBy: {
+          parentRunId: 'parent-run',
+          parentTurnId: 'parent-turn',
+          toolCallId: 'tool-call-preset-race',
+        },
+        agentProfile: LOCAL_READ_AGENT_PROFILE,
+        subagentId: 'changed-preset',
+        prompt: 'inspect cheaply',
+      }),
+      /profile changed during spawn\. Retry the same agent_spawn call\./,
+    );
   });
 
   test('child sessions preserve an explicit no-project association', async () => {
@@ -2461,7 +3431,7 @@ describe('SessionManager child-session runtime primitive', () => {
       .sendMessage(parent.id, { turnId: 'parent-turn', text: 'keep the parent active' })
       [Symbol.asyncIterator]();
     await parentTurn.next();
-    const [parentRun] = await runStore.listSessionRuns(parent.id);
+    const [parentRun] = await runStore.listSessionInvocations(parent.id);
     if (!parentRun) throw new Error('parent run was not recorded');
 
     const child = await manager.spawnChildSession(parent.id, {
@@ -2474,7 +3444,7 @@ describe('SessionManager child-session runtime primitive', () => {
       prompt: 'inspect without a project',
     });
 
-    expect((await store.readHeader(child.childSessionId)).projectId).toBe(null);
+    assert.strictEqual((await store.readHeader(child.childSessionId)).projectId, null);
     parentGate.release();
     while (!(await parentTurn.next()).done) {}
   });
@@ -2506,7 +3476,7 @@ describe('SessionManager child-session runtime primitive', () => {
       .sendMessage(parent.id, { turnId: 'parent-turn', text: 'keep parent active' })
       [Symbol.asyncIterator]();
     await parentTurn.next();
-    const [parentRun] = await runStore.listSessionRuns(parent.id);
+    const [parentRun] = await runStore.listSessionInvocations(parent.id);
     if (!parentRun) throw new Error('parent run was not recorded');
     const spawnInput = {
       spawnedBy: {
@@ -2528,20 +3498,23 @@ describe('SessionManager child-session runtime primitive', () => {
       manager.spawnChildSession(parent.id, { ...spawnInput, prompt: 'different work' }),
       /reused for different work/,
     );
-    expect((await manager.listChildSessions(parent.id)).length).toBe(1);
+    assert.strictEqual((await manager.listChildSessions(parent.id)).length, 1);
 
     childGate.release();
     const [firstResult, joinedResult] = await Promise.all([first, joined]);
-    expect(joinedResult.childSessionId).toBe(firstResult.childSessionId);
-    expect(joinedResult.runId).toBe(firstResult.runId);
-    expect((await runStore.listSessionRuns(firstResult.childSessionId)).length).toBe(1);
+    assert.strictEqual(joinedResult.childSessionId, firstResult.childSessionId);
+    assert.strictEqual(joinedResult.runId, firstResult.runId);
+    assert.strictEqual(
+      (await runStore.listSessionInvocations(firstResult.childSessionId)).length,
+      1,
+    );
 
     const durableRetry = await manager.spawnChildSession(parent.id, spawnInput);
-    expect(durableRetry.childSessionId).toBe(firstResult.childSessionId);
-    expect(durableRetry.runId).toBe(firstResult.runId);
-    expect(durableRetry.summary).toBe('ok');
-    expect((await manager.listChildSessions(parent.id)).length).toBe(1);
-    expect(backendsBySession.get(firstResult.childSessionId)?.sendInputs.length).toBe(1);
+    assert.strictEqual(durableRetry.childSessionId, firstResult.childSessionId);
+    assert.strictEqual(durableRetry.runId, firstResult.runId);
+    assert.strictEqual(durableRetry.summary, 'ok');
+    assert.strictEqual((await manager.listChildSessions(parent.id)).length, 1);
+    assert.strictEqual(backendsBySession.get(firstResult.childSessionId)?.sendInputs.length, 1);
 
     parentGate.release();
     while (!(await parentTurn.next()).done) {}
@@ -2551,10 +3524,8 @@ describe('SessionManager child-session runtime primitive', () => {
     const store = new MemorySessionStore();
     const abortController = new AbortController();
     const runStore = new MemoryAgentRunStore({
-      beforeRunRead: (sessionId, runId) => {
-        if (sessionId === 'session-3' && runId === 'cancelled-child-run') {
-          abortController.abort();
-        }
+      beforeListSessionRuns: (sessionId) => {
+        if (sessionId === 'session-3') abortController.abort();
       },
     });
     const backends = new BackendRegistry();
@@ -2577,7 +3548,7 @@ describe('SessionManager child-session runtime primitive', () => {
       .sendMessage(parent.id, { turnId: 'parent-turn', text: 'keep parent active' })
       [Symbol.asyncIterator]();
     await parentTurn.next();
-    const [parentRun] = await runStore.listSessionRuns(parent.id);
+    const [parentRun] = await runStore.listSessionInvocations(parent.id);
     if (!parentRun) throw new Error('parent run was not recorded');
 
     const seedMetadataOnlyChild = async (
@@ -2657,10 +3628,10 @@ describe('SessionManager child-session runtime primitive', () => {
         readyCalls += 1;
       },
     });
-    expect(resumed.childSessionId).toBe(metadataOnly.id);
-    expect(resumed.runId).toBe('metadata-only-run');
-    expect(readyCalls).toBe(1);
-    expect((await runStore.listSessionRuns(metadataOnly.id)).length).toBe(1);
+    assert.strictEqual(resumed.childSessionId, metadataOnly.id);
+    assert.strictEqual(resumed.runId, 'metadata-only-run');
+    assert.strictEqual(readyCalls, 1);
+    assert.strictEqual((await runStore.listSessionInvocations(metadataOnly.id)).length, 1);
 
     const cancelled = await seedMetadataOnlyChild(
       'cancelled-metadata-tool',
@@ -2685,8 +3656,8 @@ describe('SessionManager child-session runtime primitive', () => {
       }),
       /cancelled before its first run/,
     );
-    expect(cancelledReadyCalls).toBe(0);
-    expect(await runStore.listSessionRuns(cancelled.id)).toEqual([]);
+    assert.strictEqual(cancelledReadyCalls, 0);
+    assert.deepStrictEqual(await runStore.listSessionInvocations(cancelled.id), []);
 
     parentGate.release();
     while (!(await parentTurn.next()).done) {}
@@ -2716,7 +3687,7 @@ describe('SessionManager child-session runtime primitive', () => {
       .sendMessage(parent.id, { turnId: 'parent-turn', text: 'keep parent active' })
       [Symbol.asyncIterator]();
     await parentTurn.next();
-    const [parentRun] = await runStore.listSessionRuns(parent.id);
+    const [parentRun] = await runStore.listSessionInvocations(parent.id);
     if (!parentRun) throw new Error('parent run was not recorded');
     const child = await manager.spawnChildSession(parent.id, {
       spawnedBy: {
@@ -2745,8 +3716,8 @@ describe('SessionManager child-session runtime primitive', () => {
         refreshSettled = true;
       });
       await Promise.resolve();
-      expect(refreshSettled).toBe(false);
-      expect(contexts.filter((ctx) => ctx.sessionId === parent.id).length).toBe(1);
+      assert.strictEqual(refreshSettled, false);
+      assert.strictEqual(contexts.filter((ctx) => ctx.sessionId === parent.id).length, 1);
       await drainParentTurn();
       await refresh;
       await drain(
@@ -2761,9 +3732,12 @@ describe('SessionManager child-session runtime primitive', () => {
     }
 
     const childContexts = contexts.filter((ctx) => ctx.sessionId === child.childSessionId);
-    expect(childContexts.length).toBe(2);
-    expect(childContexts[1]?.systemPrompt).toBe(durablePrompt);
-    expect(childContexts[1]?.tools?.map((tool) => tool.name)).toEqual(['Read', 'Glob', 'Grep']);
+    assert.strictEqual(childContexts.length, 2);
+    assert.strictEqual(childContexts[1]?.systemPrompt, durablePrompt);
+    assert.deepStrictEqual(
+      childContexts[1]?.tools?.map((tool) => tool.name),
+      ['Read', 'Glob', 'Grep'],
+    );
 
     const missingToolManager = new SessionManager({
       store,
@@ -2812,7 +3786,7 @@ describe('SessionManager child-session runtime primitive', () => {
       .sendMessage(parent.id, { turnId: 'parent-turn', text: 'private parent context' })
       [Symbol.asyncIterator]();
     await parentTurn.next();
-    const [parentRun] = await runStore.listSessionRuns(parent.id);
+    const [parentRun] = await runStore.listSessionInvocations(parent.id);
     if (!parentRun) throw new Error('parent run was not recorded');
 
     const child = await manager.spawnChildSession(parent.id, {
@@ -2833,7 +3807,9 @@ describe('SessionManager child-session runtime primitive', () => {
       runtimeEventStore: runStore,
       backends,
       childTools: [testTool('Read'), testTool('Glob'), testTool('Grep')],
-      newId: nextId(),
+      // Its own id space: a restarted host mints fresh ids, it does not replay
+      // the sequence the dead process was on.
+      newId: nextId('restarted'),
       now: nextNow(196),
     });
     await drain(
@@ -2844,39 +3820,54 @@ describe('SessionManager child-session runtime primitive', () => {
     );
     const restartedBackend = childBackends.at(-1);
     const followUpContext = restartedBackend?.sendInputs.at(-1)?.runtimeContext ?? [];
-    expect(followUpContext.some((event) => event.runId === child.runId)).toBe(true);
-    expect(
+    assert.strictEqual(
+      followUpContext.some((event) => event.runId === child.runId),
+      true,
+    );
+    assert.strictEqual(
       followUpContext.some(
         (event) =>
           event.content?.kind === 'text' && event.content.text.includes('private parent context'),
       ),
-    ).toBe(false);
+      false,
+    );
 
     await drain(restarted.compactSession(child.childSessionId, { turnId: 'child-compact' }));
-    expect(compactCalls).toHaveLength(1);
-    expect(compactCalls[0]?.turnId).toBe('child-compact');
+    assert.strictEqual(compactCalls.length, 1);
+    assert.strictEqual(compactCalls[0]?.turnId, 'child-compact');
 
     const childMessages = await restarted.getMessages(child.childSessionId);
-    expect(childMessages.some((message) => message.type === 'tool_call')).toBe(true);
-    expect(childMessages.some((message) => message.type === 'tool_result')).toBe(true);
-    expect(childMessages.some((message) => message.type === 'token_usage')).toBe(true);
-    expect(
+    assert.strictEqual(
+      childMessages.some((message) => message.type === 'tool_call'),
+      true,
+    );
+    assert.strictEqual(
+      childMessages.some((message) => message.type === 'tool_result'),
+      true,
+    );
+    assert.strictEqual(
+      childMessages.some((message) => message.type === 'token_usage'),
+      true,
+    );
+    assert.strictEqual(
       childMessages.some(
         (message) =>
           message.type === 'turn_state' &&
           message.turnId === 'child-compact' &&
           message.status === 'completed',
       ),
-    ).toBe(true);
+      true,
+    );
     const parentMessages = await restarted.getMessages(parent.id);
-    expect(
+    assert.strictEqual(
       parentMessages.some(
         (message) =>
           message.turnId === child.turnId ||
           message.turnId === 'child-follow-up' ||
           message.turnId === 'child-compact',
       ),
-    ).toBe(false);
+      false,
+    );
 
     parentGate.release();
     while (!(await parentTurn.next()).done) {}
@@ -2902,7 +3893,7 @@ describe('SessionManager child-session runtime primitive', () => {
       .sendMessage(parent.id, { turnId: 'parent-turn', text: 'keep parent active' })
       [Symbol.asyncIterator]();
     await parentTurn.next();
-    const [parentRun] = await runStore.listSessionRuns(parent.id);
+    const [parentRun] = await runStore.listSessionInvocations(parent.id);
     if (!parentRun) throw new Error('parent run was not recorded');
     const toolCallId = 'recovery-tool-call';
     const prompt = 'recover this exact request';
@@ -2972,7 +3963,7 @@ describe('SessionManager child-session runtime primitive', () => {
           sessionId: child.id,
           runId: 'stale-child-run',
           turnId: 'stale-child-turn',
-          type: 'run_started',
+          type: 'turn_started',
           ts: 191,
         }),
       ],
@@ -2987,11 +3978,11 @@ describe('SessionManager child-session runtime primitive', () => {
       agentProfile: LOCAL_READ_AGENT_PROFILE,
       prompt,
     });
-    expect(recovered.childSessionId).toBe(child.id);
-    expect(recovered.runId).toBe('stale-child-run');
-    expect(recovered.status).toBe('failed');
-    expect(recovered.failureClass).toBe('app_restarted');
-    expect((await manager.listChildSessions(parent.id)).length).toBe(1);
+    assert.strictEqual(recovered.childSessionId, child.id);
+    assert.strictEqual(recovered.runId, 'stale-child-run');
+    assert.strictEqual(recovered.status, 'failed');
+    assert.strictEqual(recovered.failureClass, 'app_restarted');
+    assert.strictEqual((await manager.listChildSessions(parent.id)).length, 1);
 
     parentGate.release();
     while (!(await parentTurn.next()).done) {}
@@ -3015,7 +4006,7 @@ describe('SessionManager child-session runtime primitive', () => {
     await drain(
       manager.sendMessage(parent.id, { turnId: 'parent-turn', text: 'already complete' }),
     );
-    const [parentRun] = await runStore.listSessionRuns(parent.id);
+    const [parentRun] = await runStore.listSessionInvocations(parent.id);
     if (!parentRun) throw new Error('parent run was not recorded');
 
     await expectRejects(
@@ -3030,7 +4021,7 @@ describe('SessionManager child-session runtime primitive', () => {
       }),
       /parent run is not active/,
     );
-    expect(await manager.listChildSessions(parent.id)).toEqual([]);
+    assert.deepStrictEqual(await manager.listChildSessions(parent.id), []);
   });
 
   test('admits child work through an external parent-run authority', async () => {
@@ -3061,7 +4052,7 @@ describe('SessionManager child-session runtime primitive', () => {
     });
     const parent = await manager.createSession(makeInput());
     await drain(manager.sendMessage(parent.id, { turnId: 'parent-turn', text: 'parent' }));
-    const [parentRun] = await runStore.listSessionRuns(parent.id);
+    const [parentRun] = await runStore.listSessionInvocations(parent.id);
     if (!parentRun) throw new Error('parent run was not recorded');
     externalParent = {
       sessionId: parent.id,
@@ -3079,8 +4070,8 @@ describe('SessionManager child-session runtime primitive', () => {
       prompt: 'inspect',
     });
 
-    expect(child.status).toBe('completed');
-    expect(child.childSessionId === parent.id).toBe(false);
+    assert.strictEqual(child.status, 'completed');
+    assert.strictEqual(child.childSessionId === parent.id, false);
   });
 
   test('child stop is isolated while parent stop reaches every foreground child session', async () => {
@@ -3111,7 +4102,7 @@ describe('SessionManager child-session runtime primitive', () => {
       .sendMessage(parent.id, { turnId: 'parent-turn', text: 'coordinate children' })
       [Symbol.asyncIterator]();
     await parentTurn.next();
-    const [parentRun] = await runStore.listSessionRuns(parent.id);
+    const [parentRun] = await runStore.listSessionInvocations(parent.id);
     if (!parentRun) throw new Error('parent run was not recorded');
 
     const childOneStarted = makeGate();
@@ -3155,22 +4146,293 @@ describe('SessionManager child-session runtime primitive', () => {
     await childTwoStarted.promise;
 
     await manager.stopSession(childOneId, { source: 'stop_button' });
-    expect(backendsBySession.get(childOneId)?.stopCalls).toBe(1);
-    expect(backendsBySession.get(childTwoId)?.stopCalls).toBe(0);
-    expect(backendsBySession.get(parent.id)?.stopCalls).toBe(0);
-    expect((await runStore.readRun(parent.id, parentRun.runId)).status).toBe('running');
+    assert.strictEqual(backendsBySession.get(childOneId)?.stopCalls, 1);
+    assert.strictEqual(backendsBySession.get(childTwoId)?.stopCalls, 0);
+    assert.strictEqual(backendsBySession.get(parent.id)?.stopCalls, 0);
+    assert.strictEqual(
+      runtimeInvocationOutcome(await readInvocation(runStore, parent.id, parentRun.runId)),
+      undefined,
+    );
 
     await manager.stopSession(parent.id, { source: 'stop_button' });
-    expect(backendsBySession.get(parent.id)?.stopCalls).toBe(1);
-    expect(backendsBySession.get(childOneId)?.stopCalls).toBe(1);
-    expect(backendsBySession.get(childTwoId)?.stopCalls).toBe(1);
+    assert.strictEqual(backendsBySession.get(parent.id)?.stopCalls, 1);
+    assert.strictEqual(backendsBySession.get(childOneId)?.stopCalls, 1);
+    assert.strictEqual(backendsBySession.get(childTwoId)?.stopCalls, 1);
 
     parentGate.release();
     for (const gate of childGates) gate.release();
     while (!(await parentTurn.next()).done) {}
     const [childOneResult, childTwoResult] = await Promise.all([childOne, childTwo]);
-    expect(childOneResult.status).toBe('cancelled');
-    expect(childTwoResult.status).toBe('cancelled');
+    assert.strictEqual(childOneResult.status, 'cancelled');
+    assert.strictEqual(childTwoResult.status, 'cancelled');
+  });
+
+  test('scoped Hosted stop includes earlier runs in its turn and preserves other turn children', async () => {
+    const store = new MemorySessionStore();
+    const runStore = new MemoryAgentRunStore();
+    const backends = new BackendRegistry();
+    const parentGate = makeGate();
+    const childGates = [makeGate(), makeGate()];
+    let childGateIndex = 0;
+    const backendsBySession = new Map<string, TestBackend>();
+    backends.register('ai-sdk', (ctx) => {
+      const gate = ctx.header.subagentRuntime ? childGates[childGateIndex++] : parentGate;
+      const backend = new TestBackend(ctx, gate);
+      backendsBySession.set(ctx.sessionId, backend);
+      return backend;
+    });
+    const manager = new SessionManager({
+      store,
+      runStore,
+      runtimeEventStore: runStore,
+      isParentRunActive: (_sessionId, runId) =>
+        ['earlier-physical-run', 'other-parent-run'].includes(runId),
+      backends,
+      childTools: [testTool('Read'), testTool('Glob'), testTool('Grep')],
+      newId: nextId(),
+      now: nextNow(300),
+    });
+    const parent = await manager.createSession(makeInput());
+    const parentTurn = manager
+      .sendMessage(parent.id, { turnId: 'parent-turn', text: 'coordinate children' })
+      [Symbol.asyncIterator]();
+    await parentTurn.next();
+    const [parentRun] = await runStore.listSessionInvocations(parent.id);
+    if (!parentRun) throw new Error('parent run was not recorded');
+
+    await seedInvocationFromHeader(
+      runStore,
+      makeRunHeader({
+        sessionId: parent.id,
+        runId: 'earlier-physical-run',
+        status: 'running',
+        turnId: parentRun.turnId,
+      }),
+    );
+    await seedInvocationFromHeader(
+      runStore,
+      makeRunHeader({
+        sessionId: parent.id,
+        runId: 'other-parent-run',
+        status: 'running',
+        turnId: 'other-logical-turn',
+      }),
+    );
+    const childOneStarted = makeGate();
+    let childOneId = '';
+    const childOne = manager.spawnChildSession(parent.id, {
+      name: 'Child one',
+      spawnedBy: {
+        parentRunId: 'earlier-physical-run',
+        parentTurnId: parentRun.turnId,
+        toolCallId: 'tool-call-1',
+      },
+      agentProfile: LOCAL_READ_AGENT_PROFILE,
+      prompt: 'first child',
+      onReady: ({ childSessionId }) => {
+        childOneId = childSessionId;
+      },
+      onEvent: (event) => {
+        if (event.type === 'text_delta') childOneStarted.release();
+      },
+    });
+    await childOneStarted.promise;
+
+    const childTwoStarted = makeGate();
+    let childTwoId = '';
+    const childTwo = manager.spawnChildSession(parent.id, {
+      name: 'Child two',
+      spawnedBy: {
+        parentRunId: 'other-parent-run',
+        parentTurnId: 'other-logical-turn',
+        toolCallId: 'tool-call-2',
+      },
+      agentProfile: LOCAL_READ_AGENT_PROFILE,
+      prompt: 'second child',
+      onReady: ({ childSessionId }) => {
+        childTwoId = childSessionId;
+      },
+      onEvent: (event) => {
+        if (event.type === 'text_delta') childTwoStarted.release();
+      },
+    });
+    await childTwoStarted.promise;
+
+    await manager.deliverHostedRootStop(
+      parent.id,
+      { source: 'graph_supervisor' },
+      {
+        sessionId: parent.id,
+        runId: parentRun.runId,
+        turnId: parentRun.turnId,
+      },
+    );
+    assert.strictEqual(backendsBySession.get(parent.id)?.stopCalls, 1);
+    assert.strictEqual(backendsBySession.get(childOneId)?.stopCalls, 1);
+    assert.strictEqual(backendsBySession.get(childTwoId)?.stopCalls, 0);
+
+    parentGate.release();
+    for (const gate of childGates) gate.release();
+    while (!(await parentTurn.next()).done) {}
+    const [childOneResult, childTwoResult] = await Promise.all([childOne, childTwo]);
+    assert.strictEqual(childOneResult.status, 'cancelled');
+    assert.strictEqual(childTwoResult.status, 'completed');
+  });
+
+  for (const { name, stopOptions, stop } of [
+    {
+      name: 'observes a rejected hosted stop while child lookup is pending',
+      stopOptions: (rejectStop: () => Promise<never>) => {
+        const authority = hostedRootAuthority();
+        authority.stopSession = rejectStop;
+        return { messageAuthority: authority };
+      },
+      stop: (manager: SessionManager) =>
+        manager.stopSession('session-1', { source: 'stop_button' }),
+    },
+    {
+      name: 'observes a rejected direct stop while hosted child lookup is pending',
+      stopOptions: (rejectStop: () => Promise<never>) => ({
+        runtimeKernel: { stopSession: rejectStop } as unknown as RuntimeKernelLike,
+        messageAuthority: hostedRootAuthority(),
+      }),
+      stop: (manager: SessionManager) =>
+        manager.deliverHostedRootStop('session-1', { source: 'stop_button' }),
+    },
+  ]) {
+    test(name, async () => {
+      const store = new MemorySessionStore();
+      const listStarted = makeGate();
+      const releaseList = makeGate();
+      const childLookupError = new Error('child lookup failed');
+      store.list = async () => {
+        listStarted.release();
+        await releaseList.promise;
+        throw childLookupError;
+      };
+      const runStore = new MemoryAgentRunStore();
+      const ownStopError = new Error('own stop rejected');
+      const manager = new SessionManager({
+        store,
+        runStore,
+        runtimeEventStore: runStore,
+        backends: new BackendRegistry(),
+        ...stopOptions(async () => {
+          throw ownStopError;
+        }),
+        newId: nextId(),
+        now: nextNow(350),
+      });
+      const unhandled: unknown[] = [];
+      const onUnhandledRejection = (reason: unknown) => {
+        if (reason === ownStopError) unhandled.push(reason);
+      };
+      process.on('unhandledRejection', onUnhandledRejection);
+
+      const stopping = stop(manager);
+      const stopRejection = assert.rejects(stopping, (error: unknown) => error === ownStopError);
+      try {
+        await listStarted.promise;
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        assert.deepStrictEqual(unhandled, []);
+      } finally {
+        releaseList.release();
+        try {
+          await stopRejection;
+        } finally {
+          process.off('unhandledRejection', onUnhandledRejection);
+        }
+      }
+    });
+  }
+
+  test('startup recovery reads Runtime handoff evidence only for a domain-owned active Plan', async () => {
+    const store = new MemorySessionStore();
+    const runtimeEventStore = new MemoryAgentRunStore();
+    const originalListInvocations =
+      runtimeEventStore.listSessionInvocations.bind(runtimeEventStore);
+    let planStateReads = 0;
+    const invocationReads: string[] = [];
+    const planInterrupts: string[] = [];
+    let activePlanSessionId = '';
+    runtimeEventStore.listSessionInvocations = async (sessionId: string) => {
+      invocationReads.push(sessionId);
+      return originalListInvocations(sessionId);
+    };
+    const manager = new SessionManager({
+      store,
+      runtimeEventStore,
+      backends: new BackendRegistry(),
+      newId: nextId(),
+      now: nextNow(400),
+      planStore: {
+        readState: async (sessionId: string) => {
+          planStateReads += 1;
+          return sessionId === activePlanSessionId
+            ? { ...emptyPlanSessionState(sessionId), activeExecutionId: 'active-plan-execution' }
+            : emptyPlanSessionState(sessionId);
+        },
+        interruptActiveExecution: async (sessionId: string) => {
+          planInterrupts.push(sessionId);
+          return {
+            event: {} as PlanEvent,
+            state: emptyPlanSessionState(sessionId),
+          };
+        },
+      } as unknown as PlanStore,
+    });
+    await manager.createSession(makeInput());
+    activePlanSessionId = (await manager.createSession(makeInput())).id;
+
+    assert.deepStrictEqual(await manager.recoverInterruptedSessions(), [activePlanSessionId]);
+    assert.strictEqual(planStateReads, 2);
+    assert.deepStrictEqual(invocationReads, [activePlanSessionId]);
+    assert.deepStrictEqual(planInterrupts, [activePlanSessionId]);
+  });
+
+  test('startup recovery reads Plan evidence only for inventory candidates', async () => {
+    const store = new MemorySessionStore();
+    const runtimeEventStore = new MemoryAgentRunStore();
+    const originalListInvocations =
+      runtimeEventStore.listSessionInvocations.bind(runtimeEventStore);
+    const planStateReads: string[] = [];
+    const invocationReads: string[] = [];
+    const planInterrupts: string[] = [];
+    let activePlanSessionId = '';
+    runtimeEventStore.listSessionInvocations = async (sessionId: string) => {
+      invocationReads.push(sessionId);
+      return originalListInvocations(sessionId);
+    };
+    const manager = new SessionManager({
+      store,
+      runtimeEventStore,
+      backends: new BackendRegistry(),
+      newId: nextId(),
+      now: nextNow(400),
+      planStore: {
+        listPlanRecoverySessionIds: async () => [activePlanSessionId],
+        readState: async (sessionId: string) => {
+          planStateReads.push(sessionId);
+          return sessionId === activePlanSessionId
+            ? { ...emptyPlanSessionState(sessionId), activeExecutionId: 'active-plan-execution' }
+            : emptyPlanSessionState(sessionId);
+        },
+        interruptActiveExecution: async (sessionId: string) => {
+          planInterrupts.push(sessionId);
+          return {
+            event: {} as PlanEvent,
+            state: emptyPlanSessionState(sessionId),
+          };
+        },
+      } as unknown as PlanStore,
+    });
+    await manager.createSession(makeInput());
+    activePlanSessionId = (await manager.createSession(makeInput())).id;
+
+    assert.deepStrictEqual(await manager.recoverInterruptedSessions(), [activePlanSessionId]);
+    assert.deepStrictEqual(planStateReads, [activePlanSessionId]);
+    assert.deepStrictEqual(invocationReads, [activePlanSessionId]);
+    assert.deepStrictEqual(planInterrupts, [activePlanSessionId]);
   });
 
   test('startup recovery repairs an interrupted child inline run only in the child session', async () => {
@@ -3244,7 +4506,7 @@ describe('SessionManager child-session runtime primitive', () => {
           sessionId: child.id,
           runId: 'child-run',
           turnId: 'child-turn',
-          type: 'run_started',
+          type: 'turn_started',
           ts: 11,
         }),
         makeRunEvent({
@@ -3256,25 +4518,50 @@ describe('SessionManager child-session runtime primitive', () => {
         }),
       ],
     );
+    const unrelated = await manager.createSession(
+      makeInput({ name: 'Out of scope', status: 'running' }),
+    );
+    await seedRunningTurn(store, unrelated.id, 'unrelated-turn');
+    await seedRun(
+      runStore,
+      makeRunHeader({
+        sessionId: unrelated.id,
+        runId: 'unrelated-run',
+        turnId: 'unrelated-turn',
+        status: 'running',
+      }),
+      [
+        makeRunEvent({
+          sessionId: unrelated.id,
+          runId: 'unrelated-run',
+          turnId: 'unrelated-turn',
+          type: 'turn_started',
+          ts: 21,
+        }),
+      ],
+    );
     const parentMessagesBefore = await store.readMessages(parent.id);
 
-    const recovered = await manager.recoverInterruptedSessions();
+    const recovered = await manager.recoverInterruptedSessionsForSessions([child.id]);
 
-    expect(recovered).toEqual([child.id]);
-    const recoveredRun = await runStore.readRun(child.id, 'child-run');
-    expect(recoveredRun.parentRunId).toBe(undefined);
-    expect(isSessionInlineRun(recoveredRun)).toBe(true);
-    expect(recoveredRun.status).toBe('failed');
-    expect(recoveredRun.failureClass).toBe('app_restarted');
-    expect(
-      (await store.readMessages(child.id)).some(
+    assert.deepStrictEqual(recovered, [child.id]);
+    const recoveredRun = await readInvocation(runStore, child.id, 'child-run');
+    assert.strictEqual(recoveredRun.opening.lineage?.parentRunId, undefined);
+    assert.strictEqual(isSessionInlineInvocation(recoveredRun.opening), true);
+    assert.strictEqual(runtimeInvocationOutcome(recoveredRun), 'failed');
+    assert.strictEqual(runtimeInvocationFailureClass(recoveredRun), 'app_restarted');
+    assert.strictEqual(
+      (await manager.getMessages(child.id)).some(
         (message) =>
           message.type === 'turn_state' &&
           message.turnId === 'child-turn' &&
           message.status === 'failed',
       ),
-    ).toBe(true);
-    expect(await store.readMessages(parent.id)).toEqual(parentMessagesBefore);
+      true,
+    );
+    assert.deepStrictEqual(await store.readMessages(parent.id), parentMessagesBefore);
+    const unrelatedRun = await readInvocation(runStore, unrelated.id, 'unrelated-run');
+    assert.strictEqual(runtimeInvocationOutcome(unrelatedRun), undefined);
   });
 });
 
@@ -3293,51 +4580,82 @@ describe('SessionManager manual compaction and quiescent session changes', () =>
       newId: nextId(),
       now: nextNow(10_000),
     });
-    const session = await manager.createSession(makeInput({ permissionMode: 'bypass' }));
+    const session = await manager.createSession(
+      makeInput({ permissionMode: 'bypass', llmConnectionId: 'connection-compact' }),
+    );
 
     await drain(manager.sendMessage(session.id, { turnId: 'turn-1', text: 'hello' }));
+    const sourceRun = (await runStore.listSessionInvocations(session.id)).find(
+      (run) => run.turnId === 'turn-1',
+    );
+    assert.ok(sourceRun);
+    const sourceRoute = sourceRun.opening.route;
+    assert.equal(sourceRoute.provenance, 'runtime');
     runStore.operations = [];
     const events = await collectSessionEvents(
       manager.compactSession(session.id, { turnId: 'turn-compact' }),
     );
 
-    expect(compactCalls).toEqual([{ turnId: 'turn-compact', runtimeContextCount: 3 }]);
-    expect(events.map((event) => event.type)).toEqual(['token_usage', 'complete']);
+    assert.deepStrictEqual(compactCalls, [
+      {
+        turnId: 'turn-compact',
+        // Opening fact, prompt, answer, terminal.
+        runtimeContextCount: 4,
+        sourceRoutes: [
+          {
+            runId: sourceRun.runId,
+            connectionId:
+              sourceRoute.provenance === 'runtime' && sourceRoute.backendKind !== 'plugin-executor'
+                ? sourceRoute.llmConnectionId
+                : undefined,
+            modelId: sourceRoute.modelId,
+          },
+        ],
+      },
+    ]);
+    assert.deepStrictEqual(
+      events.map((event) => event.type),
+      ['token_usage', 'complete'],
+    );
     const usage = events[0];
     if (usage?.type !== 'token_usage') throw new Error('expected token_usage');
-    expect(usage.contextBudget?.compactionDecisions?.[0]?.decision).toBe('replaced');
+    assert.strictEqual(usage.contextBudget?.compactionDecisions?.[0]?.decision, 'replaced');
     const complete = events[1];
     if (complete?.type !== 'complete') throw new Error('expected complete');
-    expect(complete.contextCompactionOutcome?.kind).toBe('compacted');
+    assert.strictEqual(complete.contextCompactionOutcome?.kind, 'compacted');
 
-    const messages = await store.readMessages(session.id);
-    expect(
+    const messages = await manager.getMessages(session.id);
+    assert.strictEqual(
       messages.some((message) => message.type === 'user' && message.text.includes('compact')),
-    ).toBe(false);
-    expect(
+      false,
+    );
+    assert.strictEqual(
       messages.some(
         (message) => message.type === 'token_usage' && message.turnId === 'turn-compact',
       ),
-    ).toBe(true);
-    expect(
+      true,
+    );
+    assert.strictEqual(
       messages.some(
         (message) =>
           message.type === 'turn_state' &&
           message.turnId === 'turn-compact' &&
           message.status === 'completed',
       ),
-    ).toBe(true);
+      true,
+    );
 
-    const compactRun = (await runStore.listSessionRuns(session.id)).find(
+    const compactRun = (await runStore.listSessionInvocations(session.id)).find(
       (run) => run.turnId === 'turn-compact',
     );
-    expect(compactRun?.status).toBe('completed');
-    expect(runStore.operations).toEqual(['terminalRuntimeEvent', 'completedRunHeader']);
-    expect(
+    assert.strictEqual(compactRun && runtimeInvocationOutcome(compactRun), 'completed');
+    assert.deepStrictEqual(runStore.operations, ['terminalRuntimeEvent']);
+    assert.strictEqual(
       (await runStore.readRuntimeEvents(session.id, compactRun!.runId)).some(
         (event) => event.actions?.stateDelta?.contextCompactionOutcome,
       ),
-    ).toBe(true);
+      true,
+    );
     await manager.stopSession(session.id, { source: 'stop_button' });
   });
 
@@ -3373,7 +4691,6 @@ describe('SessionManager manual compaction and quiescent session changes', () =>
       createTestAiSdkBackend({
         sessionId: ctx.sessionId,
         header: ctx.header,
-        appendMessage: async () => {},
         connection: {
           slug: 'mock-main',
           providerType: 'anthropic',
@@ -3409,7 +4726,6 @@ describe('SessionManager manual compaction and quiescent session changes', () =>
         now: nextNow(1),
         contextBudget: {
           name: 'manual-compact-accounting',
-          maxHistoryEstimatedTokens: 10_000,
           charsPerToken: 1,
         },
         summarizeHistoryCompact: buildLlmHistorySummarizer({
@@ -3435,7 +4751,7 @@ describe('SessionManager manual compaction and quiescent session changes', () =>
     await drain(manager.sendMessage(session.id, { turnId: 'turn-2', text: 'second' }));
     await drain(manager.compactSession(session.id, { turnId: 'turn-compact' }));
 
-    const compactRun = (await runStore.listSessionRuns(session.id)).find(
+    const compactRun = (await runStore.listSessionInvocations(session.id)).find(
       (run) => run.turnId === 'turn-compact',
     );
     assert.ok(compactRun, 'the kernel opens a run for a manual compaction');
@@ -3472,13 +4788,94 @@ describe('SessionManager manual compaction and quiescent session changes', () =>
     await drain(manager.sendMessage(session.id, { turnId: 'turn-1', text: 'hello' }));
     await drain(manager.compactSession(session.id, { turnId: 'turn-compact' }));
 
-    const warnings = (await store.readMessages(session.id)).filter(
+    const warnings = (await manager.getMessages(session.id)).filter(
       (message) =>
         message.type === 'system_note' &&
         message.turnId === 'turn-compact' &&
         message.kind === 'context_compaction_failed_open',
     );
-    expect(warnings).toHaveLength(1);
+    assert.strictEqual(warnings.length, 1);
+  });
+
+  test('persists exactly one context_compacted note when manual compaction succeeds', async () => {
+    const store = new MemorySessionStore();
+    const runStore = new MemoryAgentRunStore();
+    const backends = new BackendRegistry();
+    const compactCalls: Array<{ turnId: string; runtimeContextCount: number }> = [];
+    backends.register('ai-sdk', (ctx) => new CompactingTestBackend(ctx, compactCalls));
+    const manager = new SessionManager({
+      store,
+      runStore,
+      runtimeEventStore: runStore,
+      backends,
+      newId: nextId(),
+      now: nextNow(12_000),
+    });
+    const session = await manager.createSession(makeInput({ permissionMode: 'bypass' }));
+
+    await drain(manager.sendMessage(session.id, { turnId: 'turn-1', text: 'hello' }));
+    await drain(manager.compactSession(session.id, { turnId: 'turn-compact' }));
+
+    const messages = await manager.getMessages(session.id);
+    const notes = messages.filter(
+      (message) =>
+        message.type === 'system_note' &&
+        message.turnId === 'turn-compact' &&
+        message.kind === 'context_compacted',
+    );
+    // The kernel writes the note on the compaction turn itself, so the row
+    // appears the moment compaction ends — not one send later.
+    assert.strictEqual(notes.length, 1);
+    // The apply-time boundary row lands beside it, on the same turn.
+    const applied = messages.filter(
+      (message) =>
+        message.type === 'system_note' &&
+        message.turnId === 'turn-compact' &&
+        message.kind === 'context_compaction_applied',
+    );
+    assert.strictEqual(applied.length, 1);
+    // And no duplicate failed-open note on a successful compaction.
+    const failed = messages.filter(
+      (message) =>
+        message.type === 'system_note' && message.kind === 'context_compaction_failed_open',
+    );
+    assert.strictEqual(failed.length, 0);
+  });
+
+  test('persists a fail-open note when the backend throws during manual compaction', async () => {
+    const store = new MemorySessionStore();
+    const runStore = new MemoryAgentRunStore();
+    const backends = new BackendRegistry();
+    backends.register('ai-sdk', (ctx) => new ThrowingCompactingBackend(ctx));
+    const manager = new SessionManager({
+      store,
+      runStore,
+      runtimeEventStore: runStore,
+      backends,
+      newId: nextId(),
+      now: nextNow(12_000),
+    });
+    const session = await manager.createSession(makeInput({ permissionMode: 'bypass' }));
+
+    await drain(manager.sendMessage(session.id, { turnId: 'turn-1', text: 'hello' }));
+    let threw = false;
+    try {
+      await drain(manager.compactSession(session.id, { turnId: 'turn-compact' }));
+    } catch {
+      threw = true;
+    }
+    assert.ok(threw, 'a backend that throws surfaces the failure to the caller');
+
+    // A thrown compaction still leaves one durable fail-open row: the internal
+    // compaction turn has no assistant content, so recordFailure alone would
+    // render an empty turn.
+    const notes = (await manager.getMessages(session.id)).filter(
+      (message) =>
+        message.type === 'system_note' &&
+        message.turnId === 'turn-compact' &&
+        message.kind === 'context_compaction_failed_open',
+    );
+    assert.strictEqual(notes.length, 1);
   });
 
   test('manual compaction stopped before backend start does not write compact artifacts', async () => {
@@ -3518,19 +4915,32 @@ describe('SessionManager manual compaction and quiescent session changes', () =>
     });
     await Promise.resolve();
     await Promise.resolve();
-    expect(stopSettled).toBe(false);
-    expect(compactCalls).toEqual([]);
+    assert.strictEqual(stopSettled, false);
+    assert.deepStrictEqual(compactCalls, []);
 
     readGate.release();
     await stop;
     const compactEvents = await compactPromise.catch(() => []);
 
-    expect(compactCalls).toEqual([]);
-    expect(compactEvents.some((event) => event.type === 'token_usage')).toBe(false);
-    const compactRun = (await runStore.listSessionRuns(session.id)).find(
+    assert.deepStrictEqual(compactCalls, []);
+    assert.strictEqual(
+      compactEvents.some((event) => event.type === 'token_usage'),
+      false,
+    );
+    const compactRun = (await runStore.listSessionInvocations(session.id)).find(
       (run) => run.turnId === 'turn-compact',
     );
-    expect(compactRun?.status).toBe('cancelled');
+    assert.strictEqual(compactRun && runtimeInvocationOutcome(compactRun), 'cancelled');
+    // An interrupted compaction leaves no durable transcript row.
+    assert.deepStrictEqual(
+      (await store.readMessages(session.id)).filter(
+        (message) =>
+          message.type === 'system_note' &&
+          (message.kind === 'context_compacted' ||
+            message.kind === 'context_compaction_failed_open'),
+      ),
+      [],
+    );
   });
 
   test('cold manual compaction normalizes only its execution cancellation reason', async () => {
@@ -3583,7 +4993,7 @@ describe('SessionManager manual compaction and quiescent session changes', () =>
       source: 'stop_button',
     });
     const [cancelledEvents] = await Promise.all([cancelledCompact, cancelledStop]);
-    expect(cancelledEvents).toEqual([]);
+    assert.deepStrictEqual(cancelledEvents, []);
 
     const abortErrorCompact = collectSessionEvents(
       manager.compactSession(abortErrorSession.id, { turnId: 'compact-abort-error-factory' }),
@@ -3595,10 +5005,10 @@ describe('SessionManager manual compaction and quiescent session changes', () =>
     });
     await Promise.all([abortErrorRejection, abortErrorStop]);
 
-    const [cancelledRun] = await runStore.listSessionRuns(cancelledSession.id);
-    const [abortErrorRun] = await runStore.listSessionRuns(abortErrorSession.id);
-    expect(cancelledRun?.status).toBe('cancelled');
-    expect(abortErrorRun?.status).toBe('cancelled');
+    const [cancelledRun] = await runStore.listSessionInvocations(cancelledSession.id);
+    const [abortErrorRun] = await runStore.listSessionInvocations(abortErrorSession.id);
+    assert.strictEqual(cancelledRun && runtimeInvocationOutcome(cancelledRun), 'cancelled');
+    assert.strictEqual(abortErrorRun && runtimeInvocationOutcome(abortErrorRun), 'cancelled');
   });
 
   test('stopSession waits for compaction blocked before Run reservation', async () => {
@@ -3630,18 +5040,18 @@ describe('SessionManager manual compaction and quiescent session changes', () =>
     });
     await Promise.resolve();
     await Promise.resolve();
-    expect(stopSettled).toBe(false);
-    expect(compactCalls).toEqual([]);
+    assert.strictEqual(stopSettled, false);
+    assert.deepStrictEqual(compactCalls, []);
 
     releaseRead.release();
     await stop;
     await compact.catch(() => []);
 
-    expect(compactCalls).toEqual([]);
-    const compactRun = (await runStore.listSessionRuns(session.id)).find(
+    assert.deepStrictEqual(compactCalls, []);
+    const compactRun = (await runStore.listSessionInvocations(session.id)).find(
       (run) => run.turnId === 'turn-compact-pending',
     );
-    expect(compactRun?.status).toBe('cancelled');
+    assert.strictEqual(compactRun && runtimeInvocationOutcome(compactRun), 'cancelled');
   });
 
   test('manual compaction is stopped through the active runtime run lifecycle', async () => {
@@ -3681,12 +5091,27 @@ describe('SessionManager manual compaction and quiescent session changes', () =>
     compactGate.release();
     const compactEvents = await compactPromise.catch(() => []);
 
-    expect(compactingBackend?.stopCalls).toBe(1);
-    expect(compactEvents.some((event) => event.type === 'token_usage')).toBe(false);
-    const compactRun = (await runStore.listSessionRuns(session.id)).find(
+    assert.strictEqual(compactingBackend?.stopCalls, 1);
+    assert.strictEqual(
+      compactEvents.some((event) => event.type === 'token_usage'),
+      false,
+    );
+    const compactRun = (await runStore.listSessionInvocations(session.id)).find(
       (run) => run.turnId === 'turn-compact',
     );
-    expect(compactRun?.status).toBe('cancelled');
+    assert.strictEqual(compactRun && runtimeInvocationOutcome(compactRun), 'cancelled');
+    // A compaction stopped mid-run leaves no durable transcript row: the note is
+    // written only after the terminal completeEvent commits, and the catch path
+    // skips it while the run is stopped.
+    assert.deepStrictEqual(
+      (await store.readMessages(session.id)).filter(
+        (message) =>
+          message.type === 'system_note' &&
+          (message.kind === 'context_compacted' ||
+            message.kind === 'context_compaction_failed_open'),
+      ),
+      [],
+    );
   });
 
   test('compactSession rejects while a turn is running and writes no compact artifacts', async () => {
@@ -3723,16 +5148,19 @@ describe('SessionManager manual compaction and quiescent session changes', () =>
     const compactError = await collectSessionEvents(
       manager.compactSession(session.id, { turnId: 'turn-compact' }),
     ).catch((error: unknown) => error);
-    expect(compactError instanceof RuntimeContextCompactError).toBe(true);
-    expect((compactError as RuntimeContextCompactError).code).toBe('session_busy');
+    assert.strictEqual(compactError instanceof RuntimeContextCompactError, true);
+    assert.strictEqual((compactError as RuntimeContextCompactError).code, 'session_busy');
 
-    expect(compactCalls).toEqual([]);
+    assert.deepStrictEqual(compactCalls, []);
     const messages = await store.readMessages(session.id);
-    expect(messages.some((message) => message.turnId === 'turn-compact')).toBe(false);
-    const compactRun = (await runStore.listSessionRuns(session.id)).find(
+    assert.strictEqual(
+      messages.some((message) => message.turnId === 'turn-compact'),
+      false,
+    );
+    const compactRun = (await runStore.listSessionInvocations(session.id)).find(
       (run) => run.turnId === 'turn-compact',
     );
-    expect(compactRun).toBeUndefined();
+    assert.strictEqual(compactRun, undefined);
 
     sendGate.release();
     await sendPromise;
@@ -3768,6 +5196,7 @@ describe('SessionManager manual compaction and quiescent session changes', () =>
       manager.transitionSessionConfiguration(session.id, {
         expectedRevision: 1,
         clearConnectionBlock: false,
+        permissionModeOnly: false,
         configuration: baseConfiguration,
       }),
       (error: unknown) => {
@@ -3782,6 +5211,7 @@ describe('SessionManager manual compaction and quiescent session changes', () =>
     const committed = await manager.transitionSessionConfiguration(session.id, {
       expectedRevision: 1,
       clearConnectionBlock: false,
+      permissionModeOnly: false,
       configuration: baseConfiguration,
     });
     assert.equal(committed.revision, 2);
@@ -3790,8 +5220,24 @@ describe('SessionManager manual compaction and quiescent session changes', () =>
 
     await assert.rejects(
       manager.transitionSessionConfiguration(session.id, {
+        expectedRevision: 1,
+        clearConnectionBlock: false,
+        permissionModeOnly: false,
+        configuration: baseConfiguration,
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof SessionConfigurationRevisionConflictError);
+        assert.equal(error.expectedRevision, 1);
+        assert.equal(error.actualRevision, 2);
+        return true;
+      },
+    );
+
+    await assert.rejects(
+      manager.transitionSessionConfiguration(session.id, {
         expectedRevision: 2,
         clearConnectionBlock: false,
+        permissionModeOnly: true,
         configuration: {
           ...baseConfiguration,
           permissionMode: 'explore',
@@ -3834,6 +5280,7 @@ describe('SessionManager manual compaction and quiescent session changes', () =>
     const preserved = await manager.transitionSessionConfiguration(session.id, {
       expectedRevision: 1,
       clearConnectionBlock: false,
+      permissionModeOnly: false,
       configuration,
     });
     assert.equal(preserved.header.blockedReason, 'NO_REAL_CONNECTION');
@@ -3842,6 +5289,7 @@ describe('SessionManager manual compaction and quiescent session changes', () =>
     const recovered = await manager.transitionSessionConfiguration(session.id, {
       expectedRevision: 2,
       clearConnectionBlock: true,
+      permissionModeOnly: false,
       configuration,
     });
     assert.equal(recovered.header.blockedReason, undefined);
@@ -3936,6 +5384,7 @@ describe('SessionManager manual compaction and quiescent session changes', () =>
       .transitionSessionConfiguration(session.id, {
         expectedRevision: 1,
         clearConnectionBlock: false,
+        permissionModeOnly: false,
         configuration: {
           backend: session.backend,
           llmConnectionId: 'test-connection-id',
@@ -3989,6 +5438,7 @@ describe('SessionManager manual compaction and quiescent session changes', () =>
     const transition = manager.transitionSessionConfiguration(session.id, {
       expectedRevision: 1,
       clearConnectionBlock: false,
+      permissionModeOnly: false,
       configuration: {
         backend: session.backend,
         llmConnectionId: 'test-connection-id',
@@ -4006,13 +5456,11 @@ describe('SessionManager manual compaction and quiescent session changes', () =>
     const turn = drain(manager.sendMessage(session.id, { turnId: 'turn-1', text: 'start' }));
     await new Promise<void>((resolve) => setImmediate(resolve));
     assert.deepEqual(activatedModels, []);
-    assert.equal((await store.readHeader(session.id)).transcriptLedgerVersion, undefined);
 
     releaseUpdate.release();
     await transition;
     await turn;
     assert.deepEqual(activatedModels, ['new-model']);
-    assert.equal((await store.readHeader(session.id)).transcriptLedgerVersion, 1);
   });
 
   test('backend refresh propagates delayed disposal failure after an active turn settles', async () => {
@@ -4047,8 +5495,8 @@ describe('SessionManager manual compaction and quiescent session changes', () =>
     await firstTurn;
 
     const refreshError = await refreshResult;
-    expect(refreshError instanceof Error).toBe(true);
-    expect((refreshError as Error).message).toBe('injected delayed disposal failure');
+    assert.strictEqual(refreshError instanceof Error, true);
+    assert.strictEqual((refreshError as Error).message, 'injected delayed disposal failure');
   });
 
   test('backend refresh joins an in-flight best-effort disposal and observes its failure', async () => {
@@ -4093,17 +5541,17 @@ describe('SessionManager manual compaction and quiescent session changes', () =>
       strictSettled = true;
     });
     await Promise.resolve();
-    expect(strictSettled).toBe(false);
+    assert.strictEqual(strictSettled, false);
 
     releaseDispose.release();
     await bestEffort;
     const strict = await strictResult;
 
-    expect(strict.ok).toBe(false);
+    assert.strictEqual(strict.ok, false);
     if (strict.ok) throw new Error('Strict refresh unexpectedly succeeded');
-    expect(strict.error instanceof Error).toBe(true);
-    expect((strict.error as Error).message).toBe('injected concurrent disposal failure');
-    expect(disposeCalls).toBe(1);
+    assert.strictEqual(strict.error instanceof Error, true);
+    assert.strictEqual((strict.error as Error).message, 'injected concurrent disposal failure');
+    assert.strictEqual(disposeCalls, 1);
   });
 
   test('backend activation waits for disposal and a later mutation invalidates its replacement', async () => {
@@ -4168,7 +5616,7 @@ describe('SessionManager manual compaction and quiescent session changes', () =>
     await replacementPreBuildReached.promise;
     releaseReplacementPreBuild.release();
     await new Promise<void>((resolve) => setImmediate(resolve));
-    expect(builds).toBe(1);
+    assert.strictEqual(builds, 1);
     const mutation = runMutation(() => manager.refreshIdleBackends());
 
     releaseFirstDispose.release();
@@ -4176,10 +5624,10 @@ describe('SessionManager manual compaction and quiescent session changes', () =>
     await replacementTurn;
     await mutation;
 
-    expect(builds).toBe(2);
-    expect(disposed).toEqual([1, 2]);
+    assert.strictEqual(builds, 2);
+    assert.deepStrictEqual(disposed, [1, 2]);
     await drain(manager.sendMessage(session.id, { turnId: 'turn-c', text: 'build C' }));
-    expect(builds).toBe(3);
+    assert.strictEqual(builds, 3);
   });
 
   test('backend refresh invalidates only cached sessions without listing persisted history', async () => {
@@ -4210,13 +5658,502 @@ describe('SessionManager manual compaction and quiescent session changes', () =>
 
     await manager.refreshIdleBackends();
 
-    expect(disposed).toEqual([cached.id]);
+    assert.deepStrictEqual(disposed, [cached.id]);
   });
 });
 
 describe('SessionManager permission mode updates', () => {
+  test('preserves the plugin executor when widening permission with an active turn', async () => {
+    const store = new VersionedConfigurationMemorySessionStore();
+    const kernel = new DelegatingRuntimeKernel();
+    const manager = new SessionManager({
+      store,
+      backends: new BackendRegistry(),
+      newId: nextId(),
+      now: nextNow(977),
+      runtimeKernel: kernel,
+    });
+    const session = await manager.createSession(
+      makeInput({ permissionMode: 'explore', executorId: 'codex' }),
+    );
+    const current = await store.readHeaderRecordSnapshot(session.id);
+    kernel.activeRuns = true;
+
+    const next = await manager.transitionSessionConfiguration(session.id, {
+      expectedRevision: current.revision,
+      clearConnectionBlock: false,
+      permissionModeOnly: true,
+      configuration: configurationForHeader(current.header, { permissionMode: 'bypass' }),
+    });
+
+    assert.strictEqual(next.header.backend, 'plugin-executor');
+    assert.strictEqual(next.header.executorId, 'codex');
+    assert.strictEqual(next.header.permissionMode, 'bypass');
+    assert.strictEqual(next.revision, current.revision + 1);
+    assert.deepStrictEqual((await store.readHeaderRecordSnapshot(session.id)).header, next.header);
+    assert.strictEqual((await store.readExecutionBoundary(session.id)).kind, 'bypass');
+    assert.deepStrictEqual(kernel.stopped, []);
+    assert.deepStrictEqual(kernel.disposed, []);
+  });
+
+  test('configuration authority rejects a stale revision without changing the committed grant', async () => {
+    const store = new VersionedConfigurationMemorySessionStore();
+    const manager = new SessionManager({
+      store,
+      backends: new BackendRegistry(),
+      newId: nextId(),
+      now: nextNow(978),
+    });
+    const session = await manager.createSession(makeInput({ permissionMode: 'explore' }));
+    const original = await store.readHeaderRecordSnapshot(session.id);
+    const update = (permissionMode: PermissionMode) =>
+      manager.transitionSessionConfiguration(session.id, {
+        expectedRevision: original.revision,
+        clearConnectionBlock: false,
+        permissionModeOnly: true,
+        configuration: configurationForHeader(original.header, { permissionMode }),
+      });
+
+    await update('bypass');
+    const committed = await store.readHeaderRecordSnapshot(session.id);
+    const boundary = await store.readExecutionBoundary(session.id);
+    assert.strictEqual(committed.revision, original.revision + 1);
+    assert.strictEqual(committed.header.permissionMode, 'bypass');
+    await assert.rejects(update('ask'), (error: unknown) => {
+      assert.ok(error instanceof SessionConfigurationRevisionConflictError);
+      assert.strictEqual(error.expectedRevision, original.revision);
+      assert.strictEqual(error.actualRevision, committed.revision);
+      return true;
+    });
+    assert.deepStrictEqual(await store.readHeaderRecordSnapshot(session.id), committed);
+    assert.deepStrictEqual(await store.readExecutionBoundary(session.id), boundary);
+  });
+
+  test('serializes configuration commits that observed the same execution boundary', {
+    timeout: 10_000,
+  }, async (t) => {
+    const root = await mkdtemp(join(tmpdir(), 'maka-boundary-commit-race-'));
+    const store = createSessionStore(root);
+    const gate = makeGate();
+    const bothBoundariesRead = makeGate();
+    const releaseBoundaryReads = makeGate();
+    const readExecutionBoundary = store.readExecutionBoundary.bind(store);
+    t.after(async () => {
+      releaseBoundaryReads.release();
+      gate.release();
+      await store.close?.();
+      await rm(root, { recursive: true, force: true });
+    });
+    const calls: string[] = [];
+    const backends = new BackendRegistry();
+    let backend: TestBackend | undefined;
+    backends.register('ai-sdk', (ctx) => (backend = new TestBackend(ctx, gate)));
+    const manager = new SessionManager({
+      store,
+      backends,
+      newId: nextId(),
+      now: nextNow(979),
+      shellRuns: {
+        async terminateSession(sessionId: string) {
+          calls.push(`terminate:${sessionId}`);
+          return { sessionId, token: Symbol('test') };
+        },
+        async commitSessionClose() {
+          calls.push('commit');
+        },
+        rollbackSessionClose() {
+          calls.push('rollback');
+        },
+        resumeSession(sessionId: string) {
+          calls.push(`resume:${sessionId}`);
+        },
+      } as never,
+    });
+    const session = await manager.createSession(makeInput({ permissionMode: 'explore' }));
+    const update = (snapshot: VersionedSessionHeader, permissionMode: PermissionMode) =>
+      manager.transitionSessionConfiguration(session.id, {
+        expectedRevision: snapshot.revision,
+        clearConnectionBlock: false,
+        permissionModeOnly: true,
+        configuration: configurationForHeader(snapshot.header, { permissionMode }),
+      });
+    const turn = manager
+      .sendMessage(session.id, { turnId: 'turn-racing', text: 'keep running' })
+      [Symbol.asyncIterator]();
+    try {
+      await turn.next();
+      const snapshot = await store.readHeaderRecordSnapshot(session.id);
+      let boundaryReads = 0;
+      store.readExecutionBoundary = async (sessionId) => {
+        const boundary = await readExecutionBoundary(sessionId);
+        if (++boundaryReads <= 2) {
+          if (boundaryReads === 2) bothBoundariesRead.release();
+          await releaseBoundaryReads.promise;
+        }
+        return boundary;
+      };
+      // A shared configuration snapshot alone does not fix which fence wins.
+      // Hold both initial boundary reads until each has observed Explore, so
+      // the second commit hits the boundary revision fence before its CAS.
+      const pending = Promise.allSettled([update(snapshot, 'bypass'), update(snapshot, 'ask')]);
+      await bothBoundariesRead.promise;
+      releaseBoundaryReads.release();
+      const results = await pending;
+      store.readExecutionBoundary = readExecutionBoundary;
+      assert.deepStrictEqual(
+        results.map((result) => result.status),
+        ['fulfilled', 'rejected'],
+      );
+      const conflict = results[1];
+      assert.ok(conflict?.status === 'rejected');
+      assert.ok(conflict.reason instanceof SessionConfigurationTransitionError);
+      assert.strictEqual(conflict.reason.code, 'operation_conflict');
+      assert.match(conflict.reason.message, /execution boundary changed/);
+      const committed = await store.readHeaderRecordSnapshot(session.id);
+      assert.strictEqual(committed.revision, snapshot.revision + 1);
+      assert.strictEqual(committed.header.permissionMode, 'bypass');
+      assert.deepStrictEqual(await store.readExecutionBoundary(session.id), {
+        kind: 'bypass',
+        revision: 1,
+      });
+      assert.deepStrictEqual(manager.runningTurnIds(session.id), ['turn-racing']);
+      assert.strictEqual(backend?.stopCalls, 0);
+      assert.deepStrictEqual(calls, []);
+      // A fresh retry sees Bypass and is now correctly classified as narrowing.
+      await assert.rejects(update(committed, 'ask'), (error: unknown) => {
+        assert.ok(error instanceof SessionConfigurationTransitionError);
+        assert.strictEqual(error.code, 'session_busy');
+        return true;
+      });
+      assert.deepStrictEqual(await store.readHeaderRecordSnapshot(session.id), committed);
+    } finally {
+      store.readExecutionBoundary = readExecutionBoundary;
+      releaseBoundaryReads.release();
+      gate.release();
+      while (!(await turn.next()).done) {}
+    }
+    // The conflict released the mutation lane; idle narrowing still revokes shells.
+    await update(await store.readHeaderRecordSnapshot(session.id), 'ask');
+    assert.strictEqual((await store.readHeader(session.id)).permissionMode, 'ask');
+    assert.deepStrictEqual(calls, [`terminate:${session.id}`, 'commit', `resume:${session.id}`]);
+  });
+
+  test('rejects unprotected boundary commits when admission mutation authority is unavailable', async () => {
+    const store = new VersionedConfigurationMemorySessionStore();
+    const kernel = new DelegatingRuntimeKernel();
+    Object.defineProperty(kernel, 'runSessionAdmissionMutation', { value: undefined });
+    const manager = new SessionManager({
+      store,
+      backends: new BackendRegistry(),
+      runtimeKernel: kernel,
+      newId: nextId(),
+      now: nextNow(979),
+    });
+    const session = await manager.createSession(makeInput({ permissionMode: 'explore' }));
+    const current = await store.readHeaderRecordSnapshot(session.id);
+    await assert.rejects(
+      manager.transitionSessionConfiguration(session.id, {
+        expectedRevision: current.revision,
+        clearConnectionBlock: false,
+        permissionModeOnly: true,
+        configuration: configurationForHeader(current.header, { permissionMode: 'bypass' }),
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof SessionConfigurationTransitionError);
+        assert.strictEqual(error.code, 'operation_unavailable');
+        return true;
+      },
+    );
+    assert.strictEqual((await store.readHeader(session.id)).permissionMode, 'explore');
+    assert.strictEqual((await store.readExecutionBoundary(session.id)).kind, 'managed');
+    assert.deepStrictEqual(kernel.disposed, []);
+  });
+
+  for (const checkpoint of [
+    'header',
+    'safety',
+    'admission',
+    'activation_gate',
+    'prepare',
+    'build',
+  ] as const) {
+    test(`retains a permission refresh during backend ${checkpoint} until the admitted turn exits`, {
+      timeout: 10_000,
+    }, async (t) => {
+      const store = new VersionedConfigurationMemorySessionStore();
+      const activationStarted = makeGate();
+      const releaseActivation = makeGate();
+      const sendGate = makeGate();
+      t.after(() => {
+        releaseActivation.release();
+        sendGate.release();
+      });
+      const pause = async () => {
+        activationStarted.release();
+        await releaseActivation.promise;
+      };
+      const builds: PermissionMode[] = [];
+      const dispatched: Array<{ tools: string[]; prompt: string }> = [];
+      const instances: TestBackend[] = [];
+      const backends = new BackendRegistry();
+      backends.register('ai-sdk', {
+        async prepare() {
+          if (checkpoint === 'prepare' && builds.length === 0) {
+            activationStarted.release();
+            await releaseActivation.promise;
+          }
+          return {
+            async build(ctx) {
+              builds.push(ctx.header.permissionMode);
+              if (checkpoint === 'build' && builds.length === 1) {
+                activationStarted.release();
+                await releaseActivation.promise;
+              }
+              const fullAccess = ctx.header.permissionMode === 'bypass';
+              const composition = {
+                tools: selectCollaborationTools({
+                  mode: 'plan',
+                  tools: [testTool('Read'), testTool('Write')],
+                  hasActiveExecution: false,
+                  fullAccess,
+                }).map((tool) => tool.name),
+                prompt: renderPlanModePrompt({ fullAccess }),
+              };
+              const backend = new (class extends TestBackend {
+                override async *send(input: BackendSendInput) {
+                  dispatched.push(composition);
+                  yield* super.send(input);
+                }
+              })(ctx, sendGate);
+              instances.push(backend);
+              return backend;
+            },
+          };
+        },
+      });
+      const manager = new SessionManager({
+        store,
+        backends,
+        newId: nextId(),
+        now: nextNow(980),
+        inspectContinuationSafety: async () => {
+          if (checkpoint === 'safety' && builds.length === 0) await pause();
+          return {
+            workspaceIdentity: 'workspace',
+            workspacePath: '/tmp/cwd',
+            backgroundOperationsSettled: true,
+            availableToolNames: [],
+          };
+        },
+        runBackendActivation: async (operation) => {
+          if (checkpoint === 'activation_gate' && builds.length === 0) await pause();
+          return operation();
+        },
+      });
+      const session = await manager.createSession(
+        makeInput({ permissionMode: 'ask', collaborationMode: 'plan' }),
+      );
+      if (checkpoint === 'header') {
+        const readHeader = store.readHeader.bind(store);
+        let firstRead = true;
+        store.readHeader = async (id) => {
+          const header = await readHeader(id);
+          if (firstRead) {
+            firstRead = false;
+            await pause();
+          }
+          return header;
+        };
+      }
+      const firstTurn = manager
+        .sendMessage(
+          session.id,
+          { turnId: 'turn-building', text: 'plan' },
+          {
+            admitTurn: async () => {
+              if (checkpoint === 'admission') await pause();
+              return 'admitted';
+            },
+          },
+        )
+        [Symbol.asyncIterator]();
+      const firstEvent = firstTurn.next();
+      await activationStarted.promise;
+      try {
+        const current = await store.readHeaderRecordSnapshot(session.id);
+        await manager.transitionSessionConfiguration(session.id, {
+          expectedRevision: current.revision,
+          clearConnectionBlock: false,
+          permissionModeOnly: true,
+          configuration: configurationForHeader(current.header, { permissionMode: 'bypass' }),
+        });
+        assert.strictEqual((await store.readHeader(session.id)).permissionMode, 'bypass');
+        assert.strictEqual(store.disposeCount, 0);
+        if (checkpoint === 'activation_gate') {
+          // A policy mutation owns the gate and refreshes before releasing it.
+          // Waiting for the queued activation here would deadlock that mutation.
+          await manager.refreshIdleBackends();
+        }
+      } finally {
+        releaseActivation.release();
+      }
+      try {
+        await firstEvent;
+        assert.strictEqual(store.disposeCount, 0);
+        assert.strictEqual(instances[0]?.stopCalls, 0);
+      } finally {
+        sendGate.release();
+        while (!(await firstTurn.next()).done) {}
+      }
+      assert.strictEqual(store.disposeCount, 1);
+
+      await drain(manager.sendMessage(session.id, { turnId: 'turn-fresh', text: 'write now' }));
+      assert.deepStrictEqual(builds, ['ask', 'bypass']);
+      assert.deepStrictEqual(
+        dispatched.map((input) => input.tools),
+        [['Read'], ['Read', 'Write']],
+      );
+      assert.strictEqual(dispatched[0]?.prompt, renderPlanModePrompt());
+      assert.strictEqual(dispatched[1]?.prompt, renderPlanModePrompt({ fullAccess: true }));
+    });
+  }
+
+  test('strict refresh marks cold snapshots without waiting for the policy gate', {
+    timeout: 10_000,
+  }, async (t) => {
+    const store = new MemorySessionStore();
+    const queued = makeGate();
+    const releasePolicyMutation = makeGate();
+    t.after(() => releasePolicyMutation.release());
+    let builds = 0;
+    const backends = new BackendRegistry();
+    backends.register('ai-sdk', (ctx) => {
+      builds += 1;
+      return new TestBackend(ctx);
+    });
+    const manager = new SessionManager({
+      store,
+      backends,
+      newId: nextId(),
+      now: nextNow(981),
+      runBackendActivation: async (operation) => {
+        queued.release();
+        await releasePolicyMutation.promise;
+        return operation();
+      },
+    });
+    const session = await manager.createSession(makeInput());
+    const firstTurn = drain(manager.sendMessage(session.id, { turnId: 'queued', text: 'start' }));
+    await queued.promise;
+    // This is the policy mutation's final step before opening its gate again.
+    // There is no cached generation and no previous per-session invalidation.
+    await manager.refreshIdleBackends();
+    assert.strictEqual(builds, 0);
+    releasePolicyMutation.release();
+    await firstTurn;
+    assert.strictEqual(store.disposeCount, 1);
+    await drain(manager.sendMessage(session.id, { turnId: 'next', text: 'fresh' }));
+    assert.strictEqual(builds, 2);
+  });
+
+  for (const outcome of ['cancelled', 'failed'] as const) {
+    test(`a pre-activation refresh does not retain a ${outcome} admission`, async () => {
+      const store = new VersionedConfigurationMemorySessionStore();
+      const admissionStarted = makeGate();
+      const releaseAdmission = makeGate();
+      const builds: PermissionMode[] = [];
+      const backends = new BackendRegistry();
+      backends.register('ai-sdk', (ctx) => {
+        builds.push(ctx.header.permissionMode);
+        return new TestBackend(ctx);
+      });
+      const manager = new SessionManager({ store, backends, newId: nextId(), now: nextNow(981) });
+      const session = await manager.createSession(makeInput());
+      const firstTurn = assert.rejects(
+        drain(
+          manager.sendMessage(
+            session.id,
+            { turnId: 'cancelled', text: 'start' },
+            {
+              admitTurn: async () => {
+                admissionStarted.release();
+                await releaseAdmission.promise;
+                if (outcome === 'failed') throw new Error('injected admission failure');
+                return 'cancelled';
+              },
+            },
+          ),
+        ),
+        /cancelled before runtime admission|injected admission failure/,
+      );
+      await admissionStarted.promise;
+      try {
+        const current = await store.readHeaderRecordSnapshot(session.id);
+        await manager.transitionSessionConfiguration(session.id, {
+          expectedRevision: current.revision,
+          clearConnectionBlock: false,
+          permissionModeOnly: true,
+          configuration: configurationForHeader(current.header, { permissionMode: 'bypass' }),
+        });
+      } finally {
+        releaseAdmission.release();
+      }
+      await firstTurn;
+      await manager.refreshIdleBackends();
+      await drain(manager.sendMessage(session.id, { turnId: 'retry', text: 'retry' }));
+      await drain(manager.sendMessage(session.id, { turnId: 'reuse', text: 'reuse' }));
+      assert.deepStrictEqual(builds, ['bypass']);
+      assert.strictEqual(store.disposeCount, 0);
+    });
+  }
+
+  test('settles a backend refresh when an in-flight build fails', async () => {
+    const store = new VersionedConfigurationMemorySessionStore();
+    const buildStarted = makeGate();
+    const releaseBuild = makeGate();
+    const builds: PermissionMode[] = [];
+    const backends = new BackendRegistry();
+    backends.register('ai-sdk', async (ctx) => {
+      builds.push(ctx.header.permissionMode);
+      if (builds.length === 1) {
+        buildStarted.release();
+        await releaseBuild.promise;
+        throw new Error('injected activation failure');
+      }
+      return new TestBackend(ctx);
+    });
+    const manager = new SessionManager({ store, backends, newId: nextId(), now: nextNow(982) });
+    const session = await manager.createSession(makeInput({ permissionMode: 'ask' }));
+    const firstTurn = assert.rejects(
+      drain(manager.sendMessage(session.id, { turnId: 'turn-failing', text: 'start' })),
+      /injected activation failure/,
+    );
+    await buildStarted.promise;
+    const current = await store.readHeaderRecordSnapshot(session.id);
+    await manager.transitionSessionConfiguration(session.id, {
+      expectedRevision: current.revision,
+      clearConnectionBlock: false,
+      permissionModeOnly: true,
+      configuration: configurationForHeader(current.header, { permissionMode: 'bypass' }),
+    });
+    let refreshed = false;
+    const refresh = manager.refreshIdleBackends().then(() => {
+      refreshed = true;
+    });
+    try {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.strictEqual(refreshed, false);
+    } finally {
+      releaseBuild.release();
+    }
+    await firstTurn;
+    await refresh;
+    await drain(manager.sendMessage(session.id, { turnId: 'turn-retry', text: 'retry' }));
+    assert.deepStrictEqual(builds, ['ask', 'bypass']);
+  });
+
   test('revokes background shell authority before narrowing Auto to Explore', async () => {
-    const store = new AtomicBoundaryMemorySessionStore();
+    const store = new VersionedConfigurationMemorySessionStore();
     const calls: string[] = [];
     const manager = new SessionManager({
       store,
@@ -4240,17 +6177,208 @@ describe('SessionManager permission mode updates', () => {
       } as never,
     });
     const session = await manager.createSession(makeInput({ permissionMode: 'ask' }));
+    const current = await store.readHeaderRecordSnapshot(session.id);
 
-    await manager.setPermissionMode(session.id, 'explore');
+    await manager.transitionSessionConfiguration(session.id, {
+      expectedRevision: current.revision,
+      clearConnectionBlock: false,
+      permissionModeOnly: true,
+      configuration: configurationForHeader(current.header, { permissionMode: 'explore' }),
+    });
 
-    expect(calls).toEqual([`terminate:${session.id}`, 'commit', `resume:${session.id}`]);
+    assert.deepStrictEqual(calls, [`terminate:${session.id}`, 'commit', `resume:${session.id}`]);
     const boundary = await store.readExecutionBoundary(session.id);
-    expect(boundary.kind).toBe('managed');
-    if (boundary.kind === 'managed') expect(boundary.profile.name).toBe('read-only');
+    assert.strictEqual(boundary.kind, 'managed');
+    if (boundary.kind === 'managed') assert.strictEqual(boundary.profile.name, 'read-only');
   });
 
-  test('revokes descendant background shell authority through the direct boundary API', async () => {
-    const store = new AtomicBoundaryMemorySessionStore();
+  test('treats an expanded Explore profile as narrowing before restoring Explore', async () => {
+    const store = new VersionedConfigurationMemorySessionStore();
+    const gate = makeGate();
+    const calls: string[] = [];
+    const backends = new BackendRegistry();
+    const runStore = new MemoryAgentRunStore();
+    backends.register('ai-sdk', (ctx) => new TestBackend(ctx, gate));
+    const manager = new SessionManager({
+      store,
+      runStore,
+      runtimeEventStore: runStore,
+      backends,
+      newId: nextId(),
+      now: nextNow(987),
+      shellRuns: {
+        async terminateSession(sessionId: string) {
+          calls.push(`terminate:${sessionId}`);
+          return { sessionId, token: Symbol('test') };
+        },
+        async commitSessionClose() {
+          calls.push('commit');
+        },
+        rollbackSessionClose() {
+          calls.push('rollback');
+        },
+        resumeSession(sessionId: string) {
+          calls.push(`resume:${sessionId}`);
+        },
+      } as never,
+    });
+    const session = await manager.createSession(makeInput({ permissionMode: 'ask' }));
+    store.forceBoundary(session.id, {
+      kind: 'managed',
+      profile: applySandboxBoundaryExpansion(createReadOnlyPermissionProfile(), {
+        filesystem: {
+          entries: [{ path: '/approved/output', access: 'write', scope: 'subtree' }],
+        },
+      }),
+      revision: 1,
+    });
+    const activeTurn = manager
+      .sendMessage(session.id, { turnId: 'turn-expanded-explore', text: 'keep running' })
+      [Symbol.asyncIterator]();
+    await activeTurn.next();
+
+    const current = await store.readHeaderRecordSnapshot(session.id);
+    const narrowing = {
+      expectedRevision: current.revision,
+      clearConnectionBlock: false,
+      permissionModeOnly: true,
+      configuration: configurationForHeader(current.header, { permissionMode: 'explore' }),
+    } as const;
+    await expectRejects(
+      manager.transitionSessionConfiguration(session.id, narrowing),
+      /linked Turn is active/,
+    );
+    assert.deepStrictEqual(calls, []);
+    assert.strictEqual((await store.readHeader(session.id)).permissionMode, 'ask');
+
+    gate.release();
+    while (!(await activeTurn.next()).done) {}
+
+    await manager.transitionSessionConfiguration(session.id, narrowing);
+    assert.deepStrictEqual(calls, [`terminate:${session.id}`, 'commit', `resume:${session.id}`]);
+    assert.strictEqual((await store.readHeader(session.id)).permissionMode, 'explore');
+  });
+
+  for (const grant of ['read', 'write', 'network'] as const) {
+    test(`restoring Explore revokes an approved ${grant} through configuration authority`, async (t) => {
+      const root = await mkdtemp(join(tmpdir(), 'maka-explore-read-revocation-'));
+      const store = createSessionStore(root);
+      t.after(async () => {
+        await store.close?.();
+        await rm(root, { recursive: true, force: true });
+      });
+      const gate = makeGate();
+      const calls: string[] = [];
+      const backends = new BackendRegistry();
+      const runStore = new MemoryAgentRunStore();
+      backends.register('ai-sdk', (ctx) => new TestBackend(ctx, gate));
+      const manager = new SessionManager({
+        store,
+        runStore,
+        runtimeEventStore: runStore,
+        backends,
+        newId: nextId(),
+        now: nextNow(988),
+        shellRuns: {
+          async terminateSession(sessionId: string) {
+            calls.push(`terminate:${sessionId}`);
+            return { sessionId, token: Symbol('test') };
+          },
+          async commitSessionClose() {
+            calls.push('commit');
+          },
+          rollbackSessionClose() {
+            calls.push('rollback');
+          },
+          resumeSession(sessionId: string) {
+            calls.push(`resume:${sessionId}`);
+          },
+        } as never,
+      });
+      const workspaceRoot = join(root, 'workspace');
+      const outsidePath = join(root, 'approved', 'input.txt');
+      const session = await manager.createSession(
+        makeInput({ permissionMode: 'explore', cwd: workspaceRoot }),
+      );
+      const updatePermissionMode = async (permissionMode: PermissionMode) => {
+        const current = await store.readHeaderRecordSnapshot(session.id);
+        return manager.transitionSessionConfiguration(session.id, {
+          expectedRevision: current.revision,
+          clearConnectionBlock: false,
+          permissionModeOnly: true,
+          configuration: configurationForHeader(current.header, { permissionMode }),
+        });
+      };
+      await store.createSandboxBoundaryRequest({
+        sessionId: session.id,
+        requestId: 'approved-expansion',
+        turnId: 'turn-approval',
+        runId: 'run-approval',
+        expansion:
+          grant === 'network'
+            ? { network: { enabled: true } }
+            : {
+                filesystem: { entries: [{ path: outsidePath, access: grant, scope: 'exact' }] },
+              },
+        justification: 'Approve one specific sandbox expansion.',
+      });
+      const settlement = await store.settleSandboxBoundaryRequest({
+        sessionId: session.id,
+        requestId: 'approved-expansion',
+        decision: 'allow',
+      });
+      assert.strictEqual(settlement.request.status, 'approved');
+      await updatePermissionMode('ask');
+      const restoreExplore = () => updatePermissionMode('explore');
+      const expanded = await store.readExecutionBoundary(session.id);
+      assert.strictEqual(expanded.kind, 'managed');
+      if (expanded.kind !== 'managed') throw new Error('Expected a managed boundary');
+      assert.strictEqual(expanded.profile.name, 'read-only');
+      assert.strictEqual(isReadOnlyPermissionProfile(expanded.profile), grant === 'read');
+      assert.strictEqual(
+        expanded.profile.network.kind,
+        grant === 'network' ? 'enabled' : 'restricted',
+      );
+      assert.strictEqual(
+        canReadPath(expanded.profile, outsidePath, { workspaceRoots: [workspaceRoot] }),
+        grant !== 'network',
+      );
+      assert.deepStrictEqual(calls, []);
+
+      const activeTurn = manager
+        .sendMessage(session.id, { turnId: 'turn-expanded-read', text: 'keep reading' })
+        [Symbol.asyncIterator]();
+      try {
+        await activeTurn.next();
+        await assert.rejects(restoreExplore(), (error: unknown) => {
+          assert.ok(error instanceof SessionConfigurationTransitionError);
+          assert.strictEqual(error.code, 'session_busy');
+          return true;
+        });
+        assert.deepStrictEqual(await store.readExecutionBoundary(session.id), expanded);
+        assert.strictEqual((await store.readHeader(session.id)).permissionMode, 'ask');
+        assert.deepStrictEqual(calls, []);
+      } finally {
+        gate.release();
+        while (!(await activeTurn.next()).done) {}
+      }
+
+      await restoreExplore();
+      assert.deepStrictEqual(calls, [`terminate:${session.id}`, 'commit', `resume:${session.id}`]);
+      const narrowed = await store.readExecutionBoundary(session.id);
+      assert.strictEqual(narrowed.kind, 'managed');
+      if (narrowed.kind !== 'managed') throw new Error('Expected a managed boundary');
+      assert.deepStrictEqual(narrowed.profile, createReadOnlyPermissionProfile());
+      assert.strictEqual(
+        canReadPath(narrowed.profile, outsidePath, { workspaceRoots: [workspaceRoot] }),
+        false,
+      );
+      assert.strictEqual((await store.readHeader(session.id)).permissionMode, 'explore');
+    });
+  }
+
+  test('configuration narrowing revokes descendant background shell authority', async () => {
+    const store = new VersionedConfigurationMemorySessionStore();
     const calls: string[] = [];
     const backends = new BackendRegistry();
     backends.register('ai-sdk', (ctx) => new TestBackend(ctx));
@@ -4346,9 +6474,15 @@ describe('SessionManager permission mode updates', () => {
     );
     store.disposeCount = 0;
 
-    await manager.setExecutionBoundaryKind(session.id, 'managed');
+    const current = await store.readHeaderRecordSnapshot(session.id);
+    await manager.transitionSessionConfiguration(session.id, {
+      expectedRevision: current.revision,
+      clearConnectionBlock: false,
+      permissionModeOnly: true,
+      configuration: configurationForHeader(current.header, { permissionMode: 'ask' }),
+    });
 
-    expect(calls).toEqual([
+    assert.deepStrictEqual(calls, [
       `terminate:${session.id}`,
       `terminate:${child.id}`,
       `terminate:${grandchild.id}`,
@@ -4357,11 +6491,11 @@ describe('SessionManager permission mode updates', () => {
       'commit',
       `resume:${session.id}`,
     ]);
-    expect(store.disposeCount).toBe(3);
+    assert.strictEqual(store.disposeCount, 3);
   });
 
-  test('keeps mode changes blocked until all overlapping turns finish', async () => {
-    const store = new MemorySessionStore();
+  test('keeps narrowing blocked until all overlapping turns finish', async () => {
+    const store = new VersionedConfigurationMemorySessionStore();
     const runStore = new MemoryAgentRunStore();
     const backends = new BackendRegistry();
     const firstGate = makeGate();
@@ -4390,56 +6524,136 @@ describe('SessionManager permission mode updates', () => {
     firstGate.release();
     await first.next();
     await first.next();
-    expect((await store.readHeader(session.id)).status).toBe('running');
-    const afterFirstRuns = await runStore.listSessionRuns(session.id);
-    expect(afterFirstRuns.find((run) => run.turnId === 'turn-1')?.status).toBe('completed');
-    expect(afterFirstRuns.find((run) => run.turnId === 'turn-2')?.status).toBe('running');
+    assert.strictEqual((await store.readHeader(session.id)).status, 'running');
+    const afterFirstRuns = await runStore.listSessionInvocations(session.id);
+    assert.deepStrictEqual(
+      afterFirstRuns.map((run) => [run.turnId, runtimeInvocationOutcome(run)]),
+      [
+        ['turn-1', 'completed'],
+        ['turn-2', undefined],
+      ],
+    );
 
-    await expectRejects(manager.setPermissionMode(session.id, 'bypass'), /当前任务正在运行/);
+    // Widening is a grant, so it commits against the live Turn instead of
+    // making the user wait for it out (#3349).
+    const current = await store.readHeaderRecordSnapshot(session.id);
+    const widened = await manager.transitionSessionConfiguration(session.id, {
+      expectedRevision: current.revision,
+      clearConnectionBlock: false,
+      permissionModeOnly: true,
+      configuration: configurationForHeader(current.header, { permissionMode: 'bypass' }),
+    });
+    assert.strictEqual(widened.header.permissionMode, 'bypass');
+    assert.strictEqual((await manager.readExecutionBoundary(session.id)).kind, 'bypass');
+    // Narrowing still requires quiescence: that is what lets it terminate the
+    // lineage's shells safely.
+    await expectRejects(
+      manager.transitionSessionConfiguration(session.id, {
+        expectedRevision: widened.revision,
+        clearConnectionBlock: false,
+        permissionModeOnly: true,
+        configuration: configurationForHeader(widened.header, { permissionMode: 'explore' }),
+      }),
+      /linked Turn is active/,
+    );
 
     secondGate.release();
     await second.next();
     await second.next();
-    expect((await store.readHeader(session.id)).status).toBe('active');
-    const finalRuns = await runStore.listSessionRuns(session.id);
-    expect(finalRuns.map((run) => [run.turnId, run.status])).toEqual([
-      ['turn-1', 'completed'],
-      ['turn-2', 'completed'],
-    ]);
-    const firstEvents = await runStore.readEvents(session.id, finalRuns[0]!.runId);
-    expect(firstEvents.map((event) => event.type)).toContain('run_created');
-    expect(firstEvents.map((event) => event.type)).toContain('run_started');
-    expect(firstEvents.map((event) => event.type)).toContain('run_completed');
-
-    const summary = await manager.setPermissionMode(session.id, 'bypass');
-    expect(summary.permissionMode).toBe('bypass');
+    assert.strictEqual((await store.readHeader(session.id)).status, 'active');
+    const finalRuns = await runStore.listSessionInvocations(session.id);
+    assert.deepStrictEqual(
+      finalRuns.map((run) => [run.turnId, runtimeInvocationOutcome(run)]),
+      [
+        ['turn-1', 'completed'],
+        ['turn-2', 'completed'],
+      ],
+    );
+    const afterTurns = await store.readHeaderRecordSnapshot(session.id);
+    const unchanged = await manager.transitionSessionConfiguration(session.id, {
+      expectedRevision: afterTurns.revision,
+      clearConnectionBlock: false,
+      permissionModeOnly: true,
+      configuration: configurationForHeader(afterTurns.header, { permissionMode: 'bypass' }),
+    });
+    assert.deepStrictEqual(unchanged, afterTurns);
   });
 
-  test('leaving explore clears the deep research label so visible read-only copy stays truthful', async () => {
-    const store = new MemorySessionStore();
+  test('legacy research Sessions stay read-only after restart until explicitly changed', async () => {
+    const store = new VersionedConfigurationMemorySessionStore();
     const backends = new BackendRegistry();
     backends.register('ai-sdk', (ctx) => new TestBackend(ctx));
-    const manager = new SessionManager({ store, backends, newId: nextId(), now: nextNow(6_000) });
+    const manager = new SessionManager({ store, backends, newId: nextId(), now: nextNow(6_100) });
     const session = await manager.createSession(
       makeInput({
         permissionMode: 'explore',
-        labels: [DEEP_RESEARCH_SESSION_LABEL, 'kept'],
+        labels: ['mode:deep_research', 'kept'],
       }),
     );
 
-    const summary = await manager.setPermissionMode(session.id, 'ask');
-
-    expect(summary.permissionMode).toBe('ask');
-    expect(summary.labels).toEqual(['kept']);
-    expect((await store.readHeader(session.id)).labels).toEqual(['kept']);
-
-    const messages = await store.readMessages(session.id);
-    const modeNote = messages.find(
-      (message) => message.type === 'system_note' && message.kind === 'mode_change',
+    const boundaryBeforeRestart = await manager.readExecutionBoundary(session.id);
+    const restarted = new SessionManager({
+      store,
+      backends,
+      newId: nextId('restarted'),
+      now: nextNow(6_100),
+    });
+    await drain(
+      restarted.sendMessage(session.id, {
+        turnId: 'legacy-follow-up',
+        text: 'Read the existing report',
+      }),
     );
-    if (modeNote?.type !== 'system_note') throw new Error('mode_change note was not written');
-    expect(modeNote.data).toEqual({ from: 'explore', to: 'ask' });
+    assert.equal((await store.readHeader(session.id)).permissionMode, 'explore');
+    assert.deepEqual(await restarted.readExecutionBoundary(session.id), boundaryBeforeRestart);
+    const current = await store.readHeaderRecordSnapshot(session.id);
+    const next = await restarted.transitionSessionConfiguration(session.id, {
+      expectedRevision: current.revision,
+      clearConnectionBlock: false,
+      permissionModeOnly: true,
+      configuration: configurationForHeader(current.header, { permissionMode: 'ask' }),
+    });
+
+    assert.strictEqual(next.header.permissionMode, 'ask');
+    assert.strictEqual(next.revision, current.revision + 1);
+    assert.deepStrictEqual(next.header.labels, ['mode:deep_research', 'kept']);
+    const persisted = await store.readHeaderRecordSnapshot(session.id);
+    assert.deepStrictEqual(persisted.header, next.header);
+    assert.strictEqual(persisted.revision, next.revision);
   });
+
+  for (const missing of ['readHeaderRecordSnapshot', 'updateSessionConfiguration'] as const) {
+    test(`configuration changes require Store capability: ${missing}`, async () => {
+      const store = new VersionedConfigurationMemorySessionStore();
+      const manager = new SessionManager({
+        store,
+        backends: new BackendRegistry(),
+        newId: nextId(),
+        now: nextNow(6_100),
+      });
+      const session = await manager.createSession(makeInput({ permissionMode: 'ask' }));
+      const readSnapshot = store.readHeaderRecordSnapshot.bind(store);
+      const current = await readSnapshot(session.id);
+      const boundary = await store.readExecutionBoundary(session.id);
+      Object.defineProperty(store, missing, { value: undefined });
+
+      await assert.rejects(
+        manager.transitionSessionConfiguration(session.id, {
+          expectedRevision: current.revision,
+          clearConnectionBlock: false,
+          permissionModeOnly: true,
+          configuration: configurationForHeader(current.header, { permissionMode: 'bypass' }),
+        }),
+        (error: unknown) => {
+          assert.ok(error instanceof SessionConfigurationTransitionError);
+          assert.strictEqual(error.code, 'operation_unavailable');
+          return true;
+        },
+      );
+      assert.deepStrictEqual(await readSnapshot(session.id), current);
+      assert.deepStrictEqual(await store.readExecutionBoundary(session.id), boundary);
+    });
+  }
 
   test('starts a new turn without workspace identity when safety inspection fails', async () => {
     const store = new MemorySessionStore();
@@ -4469,17 +6683,22 @@ describe('SessionManager permission mode updates', () => {
       }),
     );
 
-    expect(events.map((event) => event.type)).toEqual(['text_complete', 'complete']);
-    const [run] = await runStore.listSessionRuns(session.id);
-    expect(run?.llmConnectionId).toBe('11111111-1111-4111-8111-111111111111');
-    expect(run?.workspaceIdentity).toBeUndefined();
+    assert.deepStrictEqual(
+      events.map((event) => event.type),
+      ['text_complete', 'complete'],
+    );
+    const [run] = await runStore.listSessionInvocations(session.id);
+    assert.partialDeepStrictEqual(run?.opening.route, {
+      provenance: 'runtime',
+      llmConnectionId: '11111111-1111-4111-8111-111111111111',
+    });
+    assert.strictEqual(run?.opening.configuration.workspaceIdentity, undefined);
   });
 
-  test('does not inspect continuation safety on normal turns while resume is disabled', async () => {
+  test('records handoff workspace identity even while manual resume is disabled', async () => {
     const store = new MemorySessionStore();
     const runStore = new MemoryAgentRunStore();
     const backends = new BackendRegistry();
-    let inspectionCalls = 0;
     backends.register('ai-sdk', (ctx) => new FinalTextTestBackend(ctx));
     const manager = new SessionManager({
       store,
@@ -4487,9 +6706,8 @@ describe('SessionManager permission mode updates', () => {
       runtimeEventStore: runStore,
       backends,
       inspectContinuationSafety: async () => {
-        inspectionCalls += 1;
         return {
-          workspaceIdentity: 'workspace-should-not-be-read',
+          workspaceIdentity: 'workspace-for-handoff',
           backgroundOperationsSettled: true,
           availableToolNames: [],
         };
@@ -4506,9 +6724,12 @@ describe('SessionManager permission mode updates', () => {
       }),
     );
 
-    expect(inspectionCalls).toBe(0);
-    const [run] = await runStore.listSessionRuns(session.id);
-    expect(run?.workspaceIdentity).toBeUndefined();
+    const [run] = await runStore.listSessionInvocations(session.id);
+    assert.strictEqual(run?.opening.configuration.workspaceIdentity, 'workspace-for-handoff');
+    const plan = await manager.planAuthoritativeSafeBoundaryContinuation(session.id, {
+      sourceRunId: run!.runId,
+    });
+    assert.deepEqual(plan.rejectionReasons, ['resume_feature_disabled']);
   });
 
   test('declares the T1 protocol for an AiSdk run when the host wires the durable boundary', async () => {
@@ -4534,10 +6755,10 @@ describe('SessionManager permission mode updates', () => {
       }),
     );
 
-    const [run] = await runStore.listSessionRuns(session.id);
+    const [run] = await runStore.listSessionInvocations(session.id);
     if (!run) throw new Error('expected run');
     const events = await runStore.readRuntimeEvents(session.id, run.runId);
-    expect(events[0]?.actions?.runtimeProtocol).toEqual({
+    assert.deepStrictEqual(events[0]?.actions?.runtimeProtocol, {
       toolBoundary: 't1_after_preflight_v1',
     });
   });
@@ -4546,6 +6767,9 @@ describe('SessionManager permission mode updates', () => {
     const store = new MemorySessionStore();
     const runStore = new MemoryAgentRunStore();
     const backends = new BackendRegistry();
+    backends.register('ai-sdk', () => {
+      throw new Error('continuation planning must not build a backend');
+    });
     const manager = new SessionManager({
       store,
       runStore,
@@ -4607,8 +6831,8 @@ describe('SessionManager permission mode updates', () => {
       sourceRunId,
     });
 
-    expect(plan.disposition).toBe('continue');
-    expect(plan.continuation?.safetySnapshot).toEqual({
+    assert.strictEqual(plan.disposition, 'continue');
+    assert.deepStrictEqual(plan.continuation?.safetySnapshot, {
       workspaceIdentity: 'workspace-authoritative',
       backgroundOperationsSettled: true,
       availableToolNames: [],
@@ -4633,7 +6857,8 @@ describe('SessionManager permission mode updates', () => {
     });
     const session = await manager.createSession(makeInput());
     const header = await store.readHeader(session.id);
-    await runStore.createRun(
+    await seedInvocationFromHeader(
+      runStore,
       makeRunHeader({
         runId: 'source-run-safety-failure',
         sessionId: session.id,
@@ -4650,8 +6875,8 @@ describe('SessionManager permission mode updates', () => {
       sourceRunId: 'source-run-safety-failure',
     });
 
-    expect(plan.disposition).toBe('park');
-    expect(plan.rejectionReasons).toEqual(['safety_observation_unavailable']);
+    assert.strictEqual(plan.disposition, 'park');
+    assert.deepStrictEqual(plan.rejectionReasons, ['safety_observation_unavailable']);
   });
 
   test('keeps the authoritative continuation entry disabled unless the host enables it', async () => {
@@ -4672,9 +6897,9 @@ describe('SessionManager permission mode updates', () => {
       sourceRunId: 'source-run-disabled',
     });
 
-    expect(plan.disposition).toBe('park');
-    expect(plan.rejectionReasons).toEqual(['resume_feature_disabled']);
-    expect(lifecycleEvents).toEqual([
+    assert.strictEqual(plan.disposition, 'park');
+    assert.deepStrictEqual(plan.rejectionReasons, ['resume_feature_disabled']);
+    assert.deepStrictEqual(lifecycleEvents, [
       {
         type: 'plan_parked',
         sessionId: 'session-disabled',
@@ -4688,6 +6913,9 @@ describe('SessionManager permission mode updates', () => {
     const store = new MemorySessionStore();
     const runStore = new MemoryAgentRunStore();
     const backends = new BackendRegistry();
+    backends.register('ai-sdk', () => {
+      throw new Error('continuation planning must not build a backend');
+    });
     const manager = new SessionManager({
       store,
       runStore,
@@ -4745,8 +6973,61 @@ describe('SessionManager permission mode updates', () => {
 
     const plan = await manager.planLatestAuthoritativeSafeBoundaryContinuation(session.id);
 
-    expect(plan.disposition).toBe('continue');
-    expect(plan.continuation?.sourceRunId).toBe('source-run-newer');
+    assert.strictEqual(plan.disposition, 'continue');
+    assert.strictEqual(plan.continuation?.sourceRunId, 'source-run-newer');
+  });
+
+  test('fresh-turn tool policy changes only new runs and preserves Session defaults', async () => {
+    const store = new MemorySessionStore();
+    const runStore = new MemoryAgentRunStore();
+    const backends = new BackendRegistry();
+    const instances = new Map<string, TestBackend>();
+    const gate = makeGate();
+    let mode: ToolMode = 'code_mode';
+    let dynamicSessionId: string | undefined;
+    backends.register('ai-sdk', (ctx) => {
+      const backend = new TestBackend(ctx, gate);
+      instances.set(ctx.sessionId, backend);
+      return backend;
+    });
+    const manager = new SessionManager({
+      store,
+      runStore,
+      runtimeEventStore: runStore,
+      backends,
+      newId: nextId(),
+      now: nextNow(6_450),
+      resolveFreshTurnToolMode: async (header) =>
+        header.id === dynamicSessionId ? mode : undefined,
+    });
+    const dynamic = await manager.createSession({ ...makeInput(), toolMode: 'direct' });
+    const ordinary = await manager.createSession({ ...makeInput(), toolMode: 'code_mode' });
+    dynamicSessionId = dynamic.id;
+    const active = manager
+      .sendMessage(dynamic.id, { turnId: 'dynamic-1', text: 'first' })
+      [Symbol.asyncIterator]();
+    await active.next();
+    mode = 'direct';
+    assert.equal(instances.get(dynamic.id)?.sendInputs[0]?.toolMode, 'code_mode');
+    gate.release();
+    while (!(await active.next()).done) {
+      /* Drain the running turn. */
+    }
+    await drainAll(manager.sendMessage(dynamic.id, { turnId: 'dynamic-2', text: 'second' }));
+    await drainAll(manager.sendMessage(ordinary.id, { turnId: 'ordinary-1', text: 'ordinary' }));
+    assert.deepEqual(
+      instances.get(dynamic.id)?.sendInputs.map((input) => input.toolMode),
+      ['code_mode', 'direct'],
+    );
+    assert.equal(instances.get(ordinary.id)?.sendInputs[0]?.toolMode, 'code_mode');
+    assert.equal((await store.readHeader(dynamic.id)).toolMode, 'direct');
+    assert.equal((await store.readHeader(ordinary.id)).toolMode, 'code_mode');
+    assert.deepEqual(
+      (await runStore.listSessionInvocations(dynamic.id)).map(
+        (run) => run.opening.configuration.toolMode,
+      ),
+      ['code_mode', 'direct'],
+    );
   });
 
   test('RuntimeKernel drives the backend while preserving the SessionEvent stream', async () => {
@@ -4777,25 +7058,137 @@ describe('SessionManager permission mode updates', () => {
       }),
     );
 
-    expect(sessionEvents.map((event) => event.type)).toEqual(['text_complete', 'complete']);
-    expect(sessionEvents.map((event) => event.id)).toEqual(['turn-1-final', 'turn-1-complete']);
-    expect(backend?.sendInputs[0]?.toolMode).toBe('code_mode');
+    assert.deepStrictEqual(
+      sessionEvents.map((event) => event.type),
+      ['text_complete', 'complete'],
+    );
+    assert.deepStrictEqual(
+      sessionEvents.map((event) => event.id),
+      ['turn-1-final', 'turn-1-complete'],
+    );
+    assert.strictEqual(backend?.sendInputs[0]?.toolMode, 'code_mode');
+    assert.strictEqual(backend?.sendInputs[0]?.allowPriorUnknownToolOutcomes, true);
 
-    const [run] = await runStore.listSessionRuns(session.id);
-    if (!run) throw new Error('AgentRunStore run was not created');
+    await collectSessionEvents(
+      manager.sendMessage(session.id, {
+        turnId: 'turn-2',
+        text: 'automated activation',
+        origin: { kind: 'cloud_activation', activationId: 'activation-2' },
+      }),
+    );
+    assert.strictEqual(backend?.sendInputs[1]?.allowPriorUnknownToolOutcomes, undefined);
+
+    const [run] = await runtimeEventStore.listSessionInvocations(session.id);
+    if (!run) throw new Error('the run opened no invocation');
     const runtimeEvents = await runtimeEventStore.readRuntimeEvents(session.id, run.runId);
-    expect(backend?.sendInputs[0]?.headAnchorRuntimeEvent).toEqual(runtimeEvents[0]);
-    expect(runtimeEvents.map((event) => event.runId)).toEqual([run.runId, run.runId, run.runId]);
-    expect(runtimeEvents.map((event) => event.sessionId)).toEqual([
-      session.id,
-      session.id,
-      session.id,
-    ]);
-    expect(runtimeEvents.map((event) => event.turnId)).toEqual(['turn-1', 'turn-1', 'turn-1']);
-    expect(runtimeEvents.map((event) => event.role)).toEqual(['user', 'model', 'system']);
-    expect(runtimeEvents[0]?.content).toEqual({ kind: 'text', text: 'hello' });
-    expect(runtimeEvents[1]?.content).toEqual({ kind: 'text', text: 'ok' });
-    expect(runtimeEvents[2]?.status).toBe('completed');
+    assert.deepStrictEqual(backend?.sendInputs[0]?.headAnchorRuntimeEvent, runtimeEvents[1]);
+    assert.deepStrictEqual(
+      runtimeEvents.map((event) => event.runId),
+      [run.runId, run.runId, run.runId, run.runId],
+    );
+    assert.deepStrictEqual(
+      runtimeEvents.map((event) => event.sessionId),
+      [session.id, session.id, session.id, session.id],
+    );
+    assert.deepStrictEqual(
+      runtimeEvents.map((event) => event.turnId),
+      ['turn-1', 'turn-1', 'turn-1', 'turn-1'],
+    );
+    assert.deepStrictEqual(
+      runtimeEvents.map((event) => event.role),
+      ['system', 'user', 'model', 'system'],
+    );
+    assert.strictEqual(runtimeEvents[0]?.content?.kind, 'invocation_opened');
+    assert.deepStrictEqual(runtimeEvents[1]?.content, { kind: 'text', text: 'hello' });
+    assert.deepStrictEqual(runtimeEvents[2]?.content, { kind: 'text', text: 'ok' });
+    assert.strictEqual(runtimeEvents[3]?.status, 'completed');
+  });
+
+  test('the invocation opening fact is durable before any dispatch', async () => {
+    const store = new MemorySessionStore();
+    const trace: string[] = [];
+    const runStore = new MemoryAgentRunStore({
+      beforeRuntimeEventAppend: (_sessionId, _runId, event, options) => {
+        trace.push(
+          `runtime:${event.content?.kind ?? event.status ?? 'fact'}:durable=${options?.durable === true}`,
+        );
+      },
+      beforeAgentRunEventAppend: (_sessionId, _runId, event) => {
+        trace.push(`ledger:${event.type}`);
+      },
+    });
+    const backends = new BackendRegistry();
+    backends.register('ai-sdk', (ctx) => {
+      trace.push('backend:activated');
+      return new FinalTextTestBackend(ctx);
+    });
+    const manager = new SessionManager({
+      store,
+      runStore,
+      runtimeEventStore: runStore,
+      backends,
+      newId: nextId(),
+      now: nextNow(7_100),
+    });
+    const session = await manager.createSession(makeInput());
+    await collectSessionEvents(
+      manager.sendMessage(session.id, { turnId: 'turn-1', text: 'hello' }),
+    );
+
+    const openingIndex = trace.findIndex((entry) => entry.startsWith('runtime:invocation_opened'));
+    assert.notStrictEqual(openingIndex, -1, 'the invocation must commit an opening fact');
+    assert.strictEqual(
+      trace.slice(0, openingIndex).some((entry) => entry.startsWith('runtime:')),
+      false,
+      'the opening fact must be the first RuntimeEvent of the invocation',
+    );
+    assert.ok(
+      openingIndex < trace.findIndex((entry) => entry.startsWith('runtime:text')),
+      'the opening fact must precede the first model-visible event of the turn',
+    );
+  });
+
+  test('a rejected opening fact stops the turn before the backend can dispatch', async () => {
+    const store = new MemorySessionStore();
+    const sends: string[] = [];
+    const runStore = new MemoryAgentRunStore({
+      beforeRuntimeEventAppend: (_sessionId, _runId, event) => {
+        if (event.content?.kind === 'invocation_opened') {
+          throw new Error('opening fact store is unavailable');
+        }
+      },
+    });
+    const canonicalRuntimeEventStore: RuntimeEventStore = Object.assign(
+      Object.create(Object.getPrototypeOf(runStore) as object) as MemoryAgentRunStore,
+      runStore,
+      { durability: 'canonical' as const },
+    );
+    const backends = new BackendRegistry();
+    let backend: FinalTextTestBackend | undefined;
+    backends.register('ai-sdk', (ctx) => {
+      backend = new FinalTextTestBackend(ctx);
+      return backend;
+    });
+    const manager = new SessionManager({
+      store,
+      runStore,
+      runtimeEventStore: canonicalRuntimeEventStore,
+      backends,
+      newId: nextId(),
+      now: nextNow(7_150),
+    });
+    const session = await manager.createSession(makeInput());
+    await assert.rejects(
+      collectSessionEvents(manager.sendMessage(session.id, { turnId: 'turn-1', text: 'hello' })),
+      /opening fact store is unavailable/,
+    );
+
+    assert.deepStrictEqual(
+      backend?.sendInputs ?? [],
+      [],
+      'no provider dispatch may happen without a durable opening fact',
+    );
+    assert.deepStrictEqual(sends, []);
   });
 
   test('snapshots mutable turn content before durable commit and backend dispatch', async () => {
@@ -4817,7 +7210,12 @@ describe('SessionManager permission mode updates', () => {
       ensureTerminalRuntimeEventDurable: (sessionId, runId, event) =>
         durableEvents.ensureTerminalRuntimeEventDurable(sessionId, runId, event),
       readRuntimeEvents: (sessionId, runId) => durableEvents.readRuntimeEvents(sessionId, runId),
+      readSessionRuntimeEventEntries: (sessionId) =>
+        durableEvents.readSessionRuntimeEventEntries(sessionId),
+      resequenceSessionEventOrdinals: (sessionId) =>
+        durableEvents.resequenceSessionEventOrdinals(sessionId),
       readSessionRuntimeEvents: (sessionId) => durableEvents.readSessionRuntimeEvents(sessionId),
+      listSessionInvocations: (sessionId) => durableEvents.listSessionInvocations(sessionId),
     };
     const backends = new BackendRegistry();
     let providerInput: BackendSendInput | undefined;
@@ -4895,32 +7293,36 @@ describe('SessionManager permission mode updates', () => {
     releaseInitialCommit.release();
     await execution;
 
-    expect(providerAttachmentMutationRejected).toBe(true);
-    expect(headAnchorMutationRejected).toBe(true);
-    expect(providerInput?.attachments?.[0]).toEqual({
+    assert.strictEqual(providerAttachmentMutationRejected, true);
+    assert.strictEqual(headAnchorMutationRejected, true);
+    assert.deepStrictEqual(providerInput?.attachments?.[0], {
       kind: 'code',
       name: 'accepted.ts',
       mimeType: 'text/typescript',
       bytes: 10,
       ref: { kind: 'workspace_file', relativePath: 'accepted.ts' },
     });
-    expect(providerInput?.quotes).toEqual([
+    assert.deepStrictEqual(providerInput?.quotes, [
       { text: 'accepted quote', sourceTurnId: 'source-turn' },
     ]);
-    expect(Object.isFrozen(providerInput?.attachments)).toBe(true);
-    expect(Object.isFrozen(providerInput?.attachments?.[0]?.ref)).toBe(true);
+    assert.strictEqual(Object.isFrozen(providerInput?.attachments), true);
+    assert.strictEqual(Object.isFrozen(providerInput?.attachments?.[0]?.ref), true);
     const headContent = providerInput?.headAnchorRuntimeEvent?.content;
-    expect(headContent?.kind).toBe('text');
+    assert.strictEqual(headContent?.kind, 'text');
     if (headContent?.kind !== 'text') throw new Error('Expected text head anchor');
-    expect(headContent.attachments).toEqual(providerInput?.attachments);
-    expect(headContent.attachments === providerInput?.attachments).toBe(false);
-    expect(Object.isFrozen(providerInput?.headAnchorRuntimeEvent)).toBe(true);
-    expect(Object.isFrozen(headContent)).toBe(true);
+    assert.deepStrictEqual(headContent.attachments, providerInput?.attachments);
+    assert.strictEqual(headContent.attachments === providerInput?.attachments, false);
+    assert.strictEqual(Object.isFrozen(providerInput?.headAnchorRuntimeEvent), true);
+    assert.strictEqual(Object.isFrozen(headContent), true);
 
-    const [run] = await runStore.listSessionRuns(session.id);
-    if (!run) throw new Error('AgentRunStore run was not created');
-    const [storedUserEvent] = await durableEvents.readRuntimeEvents(session.id, run.runId);
-    expect(storedUserEvent?.content).toEqual({
+    const [run] = await runtimeEventStore.listSessionInvocations(session.id);
+    if (!run) throw new Error('the run opened no invocation');
+    const [openingFact, storedUserEvent] = await durableEvents.readRuntimeEvents(
+      session.id,
+      run.runId,
+    );
+    assert.strictEqual(openingFact?.content?.kind, 'invocation_opened');
+    assert.deepStrictEqual(storedUserEvent?.content, {
       kind: 'text',
       text: 'inspect the attachment',
       attachments: [
@@ -4937,10 +7339,11 @@ describe('SessionManager permission mode updates', () => {
         { kind: 'workspace_file', value: '@accepted.ts', label: 'accepted.ts', start: 0 },
       ],
     });
-    const storedUserMessage = (await store.readMessages(session.id)).find(
+    const storedUserMessage = (await manager.getMessages(session.id)).find(
       (message) => message.type === 'user' && message.turnId === 'turn-snapshot',
     );
-    expect(storedUserMessage?.type === 'user' ? storedUserMessage.attachments : undefined).toEqual(
+    assert.deepStrictEqual(
+      storedUserMessage?.type === 'user' ? storedUserMessage.attachments : undefined,
       providerInput?.attachments,
     );
   });
@@ -4982,7 +7385,6 @@ describe('SessionManager permission mode updates', () => {
       createTestAiSdkBackend({
         sessionId: ctx.sessionId,
         header: ctx.header,
-        appendMessage: ctx.appendMessage ?? (async () => {}),
         connection: {
           slug: 'mock-main',
           providerType: 'anthropic',
@@ -5023,12 +7425,125 @@ describe('SessionManager permission mode updates', () => {
       }),
     );
 
-    expect(providerSteps).toBe(1);
-    expect(
+    assert.strictEqual(providerSteps, 1);
+    assert.partialDeepStrictEqual(
       events.find((event) => event.type === 'token_usage' && event.runtimeSteps !== undefined),
-    ).toMatchObject({ type: 'token_usage', runtimeSteps: 1 });
-    expect(events.at(-1)).toMatchObject({ type: 'complete', stopReason: 'step_limit' });
+      { type: 'token_usage', runtimeSteps: 1 },
+    );
+    assert.partialDeepStrictEqual(events.at(-1), { type: 'complete', stopReason: 'step_limit' });
   });
+
+  for (const decision of [
+    'client_denied',
+    'turn_stopped',
+    'turn_terminal',
+    'host_restarted',
+    'missing_reader',
+  ] as const) {
+    test(`manual continuation preserves sandbox denial authority: ${decision}`, async () => {
+      const store = new MemorySessionStore();
+      const runStore = new MemoryAgentRunStore();
+      const backends = new BackendRegistry();
+      let backend: FinalTextTestBackend | undefined;
+      backends.register('ai-sdk', (ctx) => {
+        backend = new FinalTextTestBackend(ctx);
+        return backend;
+      });
+      const manager = new SessionManager({
+        store,
+        runStore,
+        runtimeEventStore: runStore,
+        backends,
+        inspectContinuationSafety: inspectStableContinuationSafety,
+        newId: nextId(),
+        now: nextNow(6_549),
+      });
+      const session = await manager.createSession(makeInput());
+      const source = {
+        sessionId: session.id,
+        runId: 'denied-source-run',
+        turnId: 'denied-source-turn',
+      };
+      await seedRuntimeRun(
+        runStore,
+        makeRunHeader({
+          ...source,
+          status: 'failed',
+          failureClass: 'runtime_interrupted',
+          cwd: session.cwd,
+          createdAt: 1,
+          updatedAt: 2,
+          completedAt: 2,
+        }),
+        [
+          runtimeEvent({
+            ...source,
+            id: 'denied-source-user',
+            ts: 1,
+            role: 'user',
+            author: 'user',
+            content: { kind: 'text', text: 'continue safely' },
+          }),
+          runtimeEvent({
+            ...source,
+            id: 'denied-source-terminal',
+            ts: 2,
+            status: 'failed',
+            actions: { endInvocation: true, stateDelta: { failureClass: 'runtime_interrupted' } },
+          }),
+        ],
+      );
+      // An unrelated Run's explicit answer never belongs to this source.
+      for (const runId of [source.runId, 'unrelated-run']) {
+        await store.createSandboxBoundaryRequest({
+          ...source,
+          runId,
+          requestId: `boundary-${runId}`,
+          expansion: { network: { enabled: true } },
+          justification: 'Fetch a dependency.',
+        });
+        await store.settleSandboxBoundaryRequest({
+          sessionId: source.sessionId,
+          requestId: `boundary-${runId}`,
+          decision: 'deny',
+          ...(runId === source.runId &&
+          decision !== 'client_denied' &&
+          decision !== 'missing_reader'
+            ? { closureReason: decision }
+            : {}),
+        });
+      }
+      const plan = await manager.planSafeBoundaryContinuation(session.id, {
+        sourceRunId: source.runId,
+        currentCwd: session.cwd!,
+        sourceWorkspaceIdentity: 'workspace-1',
+        currentWorkspaceIdentity: 'workspace-1',
+        backgroundOperationsSettled: true,
+        availableToolNames: [],
+      });
+      assert.ok(plan.continuation);
+      if (decision === 'missing_reader') {
+        Object.defineProperty(store, 'hasExplicitSandboxBoundaryDenial', { value: undefined });
+        await assert.rejects(
+          collectSessionEvents(manager.resumeSafeBoundaryContinuation(plan.continuation)),
+          /authoritative sandbox boundary decision lookup/,
+        );
+        assert.equal(backend?.sendInputs.length ?? 0, 0);
+        await assert.rejects(
+          readInvocation(runStore, session.id, plan.continuation.runId),
+          /Unknown run/,
+        );
+      } else {
+        await collectSessionEvents(manager.resumeSafeBoundaryContinuation(plan.continuation));
+        assert.ok(backend);
+        assert.equal(backend.sendInputs.length, 1);
+        assert.equal(
+          backend.sendInputs[0]?.continuation?.sandboxBoundaryDenied,
+          decision === 'client_denied',
+        );
+      }
+    });
+  }
 
   test('executes an approved continuation after a path move without another user message', async () => {
     const store = new MemorySessionStore();
@@ -5036,29 +7551,45 @@ describe('SessionManager permission mode updates', () => {
     const backends = new BackendRegistry();
     const lifecycleEvents: Array<{ type: string }> = [];
     let backend: FinalTextTestBackend | undefined;
-    backends.register('ai-sdk', (ctx) => {
-      backend = new FinalTextTestBackend(ctx);
-      return backend;
+    const providerStateIdentity = `sha256:${'c'.repeat(64)}` as const;
+    backends.register('ai-sdk', {
+      prepare: async () => ({
+        providerStateIdentity,
+        build: (ctx) => {
+          backend = new FinalTextTestBackend(ctx);
+          return backend;
+        },
+      }),
     });
     const manager = new SessionManager({
       store,
       runStore,
       runtimeEventStore: runStore,
       toolBoundaryProtocol: 't1_after_preflight_v1',
+      resolveFreshTurnToolMode: async () => 'direct',
       backends,
-      inspectContinuationSafety: inspectStableContinuationSafety,
+      childTools: [testTool('Read')],
+      inspectContinuationSafety: async () => ({
+        workspaceIdentity: 'workspace-1',
+        backgroundOperationsSettled: true,
+        availableToolNames: ['Read'],
+      }),
       onContinuationLifecycleEvent: (event) => {
         lifecycleEvents.push(event);
       },
       newId: nextId(),
       now: nextNow(6_550),
     });
-    const session = await manager.createSession(makeInput());
+    const session = await manager.createSession(
+      makeInput({ llmConnectionId: 'connection-continuation' }),
+    );
     const header = await store.readHeader(session.id);
     const sourceRunId = 'source-run';
     const sourceTurnId = 'source-turn';
     const sourceInvocationId = 'source-invocation';
-    await runStore.createRun({
+    // The source run states its own terminal event below, so only its opening
+    // is seeded here: a second ending would leave the invocation ambiguous.
+    await seedInvocationOpening(runStore, {
       runId: sourceRunId,
       invocationId: sourceInvocationId,
       sessionId: session.id,
@@ -5066,6 +7597,8 @@ describe('SessionManager permission mode updates', () => {
       status: 'failed',
       failureClass: 'runtime_interrupted',
       backendKind: header.backend,
+      llmConnectionId: header.llmConnectionId,
+      providerStateIdentity,
       llmConnectionSlug: header.llmConnectionSlug,
       modelId: header.model,
       cwd: header.cwd,
@@ -5092,12 +7625,64 @@ describe('SessionManager permission mode updates', () => {
         content: { kind: 'text', text: 'continue safely' },
       },
       {
-        id: 'source-terminal',
+        id: 'source-thinking',
         sessionId: session.id,
         invocationId: sourceInvocationId,
         runId: sourceRunId,
         turnId: sourceTurnId,
         ts: 2,
+        partial: false,
+        author: 'agent',
+        role: 'model',
+        content: {
+          kind: 'thinking',
+          text: 'same-route provider reasoning',
+          signature: 'same-route-signature',
+        },
+        refs: { stepId: 'source-step' },
+      },
+      {
+        id: 'source-tool-call',
+        sessionId: session.id,
+        invocationId: sourceInvocationId,
+        runId: sourceRunId,
+        turnId: sourceTurnId,
+        ts: 3,
+        partial: false,
+        author: 'agent',
+        role: 'model',
+        content: {
+          kind: 'function_call',
+          id: 'source-read',
+          name: 'Read',
+          args: { path: 'package.json' },
+        },
+        refs: { stepId: 'source-step' },
+      },
+      {
+        id: 'source-tool-result',
+        sessionId: session.id,
+        invocationId: sourceInvocationId,
+        runId: sourceRunId,
+        turnId: sourceTurnId,
+        ts: 4,
+        partial: false,
+        author: 'tool',
+        role: 'tool',
+        content: {
+          kind: 'function_response',
+          id: 'source-read',
+          name: 'Read',
+          result: 'package contents',
+        },
+      },
+      {
+        id: 'source-terminal',
+        sessionId: session.id,
+        invocationId: sourceInvocationId,
+        runId: sourceRunId,
+        turnId: sourceTurnId,
+        ts: 5,
         partial: false,
         author: 'system',
         role: 'system',
@@ -5115,9 +7700,9 @@ describe('SessionManager permission mode updates', () => {
       sourceWorkspaceIdentity: 'workspace-1',
       currentWorkspaceIdentity: 'workspace-1',
       backgroundOperationsSettled: true,
-      availableToolNames: [],
+      availableToolNames: ['Read'],
     });
-    expect(plan.disposition).toBe('continue');
+    assert.strictEqual(plan.disposition, 'continue');
     if (!plan.continuation) throw new Error('expected continuation');
 
     const movedCwd = '/fresh-sandbox/repo';
@@ -5126,26 +7711,52 @@ describe('SessionManager permission mode updates', () => {
       manager.resumeSafeBoundaryContinuation(plan.continuation),
     );
 
-    expect(sessionEvents.map((event) => event.type)).toEqual(['text_complete', 'complete']);
-    const continuationRun = await runStore.readRun(session.id, plan.continuation.runId);
-    expect(continuationRun.invocationId).toBe(plan.continuation.invocationId);
-    expect(continuationRun.turnId).toBe(plan.continuation.turnId);
-    expect(continuationRun.parentRunId).toBe(sourceRunId);
-    expect(continuationRun.parentTurnId).toBe(sourceTurnId);
-    expect(continuationRun.cwd).toBe(movedCwd);
-    expect(continuationRun.status).toBe('completed');
-    expect(continuationRun).toMatchObject({
+    assert.deepStrictEqual(
+      sessionEvents.map((event) => event.type),
+      ['text_complete', 'complete'],
+    );
+    const continuationRun = await readInvocation(runStore, session.id, plan.continuation.runId);
+    assert.strictEqual(continuationRun.invocationId, plan.continuation.invocationId);
+    assert.strictEqual(continuationRun.turnId, plan.continuation.turnId);
+    assert.strictEqual(continuationRun.opening.lineage?.parentRunId, sourceRunId);
+    assert.strictEqual(continuationRun.opening.lineage?.parentTurnId, sourceTurnId);
+    assert.strictEqual(continuationRun.opening.configuration.cwd, movedCwd);
+    assert.strictEqual(runtimeInvocationOutcome(continuationRun), 'completed');
+    assert.partialDeepStrictEqual(continuationRun.opening.route, {
+      provenance: 'runtime',
+      providerStateIdentity,
+    });
+    assert.partialDeepStrictEqual(continuationRun.opening.configuration, {
       orchestrationMode: 'swarm',
       orchestrationSource: 'turn_override',
       agentSwarmAuthorization: 'turn_override',
       toolMode: 'code_mode',
     });
-    expect(backend?.sendInputs[0]?.toolMode).toBe('code_mode');
+    assert.strictEqual(backend?.sendInputs[0]?.toolMode, 'code_mode');
+    assert.deepStrictEqual(
+      backend?.sendInputs[0]?.runtimeContextInvocations?.map((invocation) => ({
+        runId: invocation.runId,
+        route: invocation.opening.route,
+      })),
+      [
+        {
+          runId: sourceRunId,
+          route: {
+            provenance: 'runtime',
+            backendKind: 'ai-sdk',
+            llmConnectionId: header.llmConnectionId,
+            llmConnectionSlug: header.llmConnectionSlug,
+            modelId: header.model,
+            providerStateIdentity,
+          },
+        },
+      ],
+    );
     const continuationEvents = await runStore.readRuntimeEvents(
       session.id,
       plan.continuation.runId,
     );
-    expect(continuationEvents[0]?.actions?.continuationStart).toMatchObject({
+    assert.partialDeepStrictEqual(continuationEvents[0]?.actions?.continuationStart, {
       protocol: 'continuation_start_v2',
       claimId: plan.continuation.claimId,
       boundaryDigest: plan.continuation.boundary?.manifestDigest,
@@ -5154,27 +7765,30 @@ describe('SessionManager permission mode updates', () => {
         invocationId: sourceInvocationId,
         runId: sourceRunId,
         turnId: sourceTurnId,
-        highWater: sourceEvents.length,
+        // The opening fact is event 1 of the source invocation.
+        highWater: sourceEvents.length + 1,
         prefixDigest: plan.continuation.boundary?.segments.at(-1)?.prefixDigest,
       },
       replayManifestDigest: plan.continuation.boundary?.manifestDigest,
-      providerProjectionVersion: 1,
+      providerProjectionVersion: 2,
       providerReplayDigest: plan.continuation.providerReplayDigest,
     });
-    expect(continuationEvents[0]?.actions?.runtimeProtocol).toEqual({
+    assert.deepStrictEqual(continuationEvents[0]?.actions?.runtimeProtocol, {
       toolBoundary: 't1_after_preflight_v1',
     });
-    expect(continuationEvents[0]?.refs).toBe(undefined);
-    expect(continuationEvents.some((event) => event.role === 'user')).toBe(false);
-    expect((await store.readMessages(session.id)).some((message) => message.type === 'user')).toBe(
+    assert.strictEqual(continuationEvents[0]?.refs, undefined);
+    assert.strictEqual(
+      continuationEvents.some((event) => event.role === 'user'),
       false,
     );
-    expect(await runStore.readRuntimeEvents(session.id, sourceRunId)).toEqual(sourceEvents);
-    expect(lifecycleEvents.map((event) => event.type)).toEqual([
-      'plan_approved',
-      'execution_started',
-      'execution_completed',
-    ]);
+    assert.deepStrictEqual(
+      (await runStore.readRuntimeEvents(session.id, sourceRunId)).slice(1),
+      sourceEvents,
+    );
+    assert.deepStrictEqual(
+      lifecycleEvents.map((event) => event.type),
+      ['plan_approved', 'execution_started', 'execution_completed'],
+    );
 
     await collectSessionEvents(
       manager.sendMessage(session.id, {
@@ -5183,7 +7797,281 @@ describe('SessionManager permission mode updates', () => {
       }),
     );
     const followUpContext = backend?.sendInputs.at(-1)?.runtimeContext ?? [];
-    expect(followUpContext.some((event) => event.runId === plan.continuation?.runId)).toBe(true);
+    assert.strictEqual(
+      followUpContext.some((event) => event.runId === plan.continuation?.runId),
+      true,
+    );
+    const followUpRun = (await runStore.listSessionInvocations(session.id)).find(
+      (runHeader) => runHeader.turnId === 'turn-after-continuation',
+    );
+    assert.partialDeepStrictEqual(followUpRun?.opening.route, {
+      provenance: 'runtime',
+      providerStateIdentity,
+    });
+    assert.equal(followUpRun?.opening.configuration.toolMode, 'direct');
+    assert.equal(backend?.sendInputs.at(-1)?.toolMode, 'direct');
+  });
+
+  test('authenticates the exact target-aware continuation projection that reaches the provider', async () => {
+    const store = new MemorySessionStore();
+    const runStore = new MemoryAgentRunStore();
+    const backends = new BackendRegistry();
+    let providerRequest: unknown;
+    const model = new MockLanguageModelV4({
+      doStream: async (request) => {
+        providerRequest = request;
+        return {
+          stream: simulateReadableStream({
+            chunks: [
+              { type: 'stream-start', warnings: [] },
+              { type: 'text-start', id: 'text-1' },
+              { type: 'text-delta', id: 'text-1', delta: 'continued' },
+              { type: 'text-end', id: 'text-1' },
+              {
+                type: 'finish',
+                finishReason: { unified: 'stop', raw: 'stop' },
+                usage: {
+                  inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+                  outputTokens: { total: 1, text: 1, reasoning: 0 },
+                },
+              },
+            ] as LanguageModelV4StreamPart[],
+            initialDelayInMs: null,
+            chunkDelayInMs: null,
+          }),
+        };
+      },
+    });
+    backends.register('ai-sdk', (ctx) =>
+      createTestAiSdkBackend({
+        sessionId: ctx.sessionId,
+        header: ctx.header,
+        connection: {
+          slug: ctx.header.llmConnectionSlug,
+          providerType: 'anthropic',
+          defaultModel: ctx.header.model,
+        },
+        apiKey: 'sk-test',
+        modelId: ctx.header.model,
+        modelFactory: () => model,
+        tools: [
+          {
+            name: 'Read',
+            description: 'Read a file',
+            parameters: z.object({ path: z.string() }),
+            impl: async () => ({ ok: true }),
+          },
+        ],
+        ...(ctx.loadTurnRuntimeEvents ? { loadTurnRuntimeEvents: ctx.loadTurnRuntimeEvents } : {}),
+        newId: (() => {
+          let id = 0;
+          return () => `cross-route-backend-${++id}`;
+        })(),
+        now: nextNow(1),
+      }),
+    );
+    const manager = new SessionManager({
+      store,
+      runStore,
+      runtimeEventStore: runStore,
+      toolBoundaryProtocol: 't1_after_preflight_v1',
+      backends,
+      childTools: [testTool('Read')],
+      inspectContinuationSafety: async () => ({
+        workspaceIdentity: 'workspace-1',
+        backgroundOperationsSettled: true,
+        availableToolNames: ['Read'],
+      }),
+      newId: nextId(),
+      now: nextNow(6_575),
+    });
+    const session = await manager.createSession(
+      makeInput({
+        llmConnectionId: 'connection-a',
+        llmConnectionSlug: 'anthropic-a',
+        model: 'claude-a',
+        permissionMode: 'bypass',
+      }),
+    );
+    const sourceRunId = 'source-run-cross-route';
+    const sourceInvocationId = 'source-invocation-cross-route';
+    const sourceTurnId = 'source-turn-cross-route';
+    // The source run states its own terminal event below.
+    await seedInvocationOpening(runStore, {
+      runId: sourceRunId,
+      invocationId: sourceInvocationId,
+      sessionId: session.id,
+      turnId: sourceTurnId,
+      status: 'failed',
+      failureClass: 'runtime_interrupted',
+      backendKind: 'ai-sdk',
+      llmConnectionId: 'connection-a',
+      llmConnectionSlug: 'anthropic-a',
+      modelId: 'claude-a',
+      cwd: '/tmp/cwd',
+      workspaceIdentity: 'workspace-1',
+      permissionMode: 'bypass',
+      orchestrationMode: 'default',
+      orchestrationSource: 'session',
+      toolMode: 'code_mode',
+      createdAt: 1,
+      updatedAt: 5,
+      completedAt: 5,
+    });
+    const sourceEvents: RuntimeEvent[] = [
+      {
+        id: 'cross-route-user',
+        sessionId: session.id,
+        invocationId: sourceInvocationId,
+        runId: sourceRunId,
+        turnId: sourceTurnId,
+        ts: 1,
+        partial: false,
+        author: 'user',
+        role: 'user',
+        content: { kind: 'text', text: 'continue across routes' },
+      },
+      {
+        id: 'cross-route-thinking',
+        sessionId: session.id,
+        invocationId: sourceInvocationId,
+        runId: sourceRunId,
+        turnId: sourceTurnId,
+        ts: 2,
+        partial: false,
+        author: 'agent',
+        role: 'model',
+        content: {
+          kind: 'thinking',
+          text: 'source-only reasoning',
+          signature: 'source-only-signature',
+        },
+        refs: { stepId: 'cross-route-step' },
+      },
+      {
+        id: 'cross-route-tool-call',
+        sessionId: session.id,
+        invocationId: sourceInvocationId,
+        runId: sourceRunId,
+        turnId: sourceTurnId,
+        ts: 3,
+        partial: false,
+        author: 'agent',
+        role: 'model',
+        content: {
+          kind: 'function_call',
+          id: 'cross-route-read',
+          name: 'Read',
+          args: { path: 'package.json' },
+        },
+        refs: { stepId: 'cross-route-step' },
+      },
+      {
+        id: 'cross-route-tool-result',
+        sessionId: session.id,
+        invocationId: sourceInvocationId,
+        runId: sourceRunId,
+        turnId: sourceTurnId,
+        ts: 4,
+        partial: false,
+        author: 'tool',
+        role: 'tool',
+        content: {
+          kind: 'function_response',
+          id: 'cross-route-read',
+          name: 'Read',
+          result: 'package contents',
+        },
+      },
+      {
+        id: 'cross-route-terminal',
+        sessionId: session.id,
+        invocationId: sourceInvocationId,
+        runId: sourceRunId,
+        turnId: sourceTurnId,
+        ts: 5,
+        partial: false,
+        author: 'system',
+        role: 'system',
+        status: 'failed',
+        actions: { endInvocation: true, stateDelta: { failureClass: 'runtime_interrupted' } },
+      },
+    ];
+    for (const event of sourceEvents) {
+      await runStore.appendRuntimeEvent(session.id, sourceRunId, event);
+    }
+    const planInput = {
+      sourceRunId,
+      currentCwd: '/tmp/cwd',
+      sourceWorkspaceIdentity: 'workspace-1',
+      currentWorkspaceIdentity: 'workspace-1',
+      backgroundOperationsSettled: true as const,
+      availableToolNames: ['Read'],
+    };
+    const stalePlan = await manager.planSafeBoundaryContinuation(session.id, planInput);
+    assert.strictEqual(stalePlan.disposition, 'continue');
+    if (!stalePlan.continuation) throw new Error('expected stale continuation');
+    const staleContinuation = stalePlan.continuation;
+    await store.updateHeader(session.id, {
+      llmConnectionId: 'connection-b',
+      llmConnectionSlug: 'anthropic-b',
+      model: 'claude-b',
+    });
+    await assert.rejects(
+      () => collectSessionEvents(manager.resumeSafeBoundaryContinuation(staleContinuation)),
+      /replay changed after planning/,
+    );
+    assert.strictEqual(providerRequest, undefined);
+
+    const sameProjectionStalePlan = await manager.planSafeBoundaryContinuation(
+      session.id,
+      planInput,
+    );
+    assert.strictEqual(sameProjectionStalePlan.disposition, 'continue');
+    if (!sameProjectionStalePlan.continuation) {
+      throw new Error('expected same-projection stale continuation');
+    }
+    await store.updateHeader(session.id, {
+      llmConnectionId: 'connection-c',
+      llmConnectionSlug: 'anthropic-c',
+      model: 'claude-c',
+    });
+    await assert.rejects(
+      () =>
+        collectSessionEvents(
+          manager.resumeSafeBoundaryContinuation(sameProjectionStalePlan.continuation!),
+        ),
+      /replay changed after planning/,
+    );
+    assert.strictEqual(providerRequest, undefined);
+
+    const plan = await manager.planSafeBoundaryContinuation(session.id, planInput);
+    assert.strictEqual(plan.disposition, 'continue');
+    if (!plan.continuation) throw new Error('expected continuation');
+
+    const sessionEvents = await collectSessionEvents(
+      manager.resumeSafeBoundaryContinuation(plan.continuation),
+    );
+
+    assert.ok(providerRequest, JSON.stringify(sessionEvents));
+    const promptJson = JSON.stringify(providerRequest);
+    assert.doesNotMatch(promptJson, /source-only reasoning/);
+    assert.doesNotMatch(promptJson, /source-only-signature/);
+    assert.match(promptJson, /continue across routes/, promptJson);
+    assert.match(promptJson, /cross-route-read/);
+    assert.match(promptJson, /package contents/);
+    assert.notEqual(
+      plan.continuation.providerReplayDigest,
+      sameProjectionStalePlan.continuation.providerReplayDigest,
+    );
+    const continuationEvents = await runStore.readRuntimeEvents(
+      session.id,
+      plan.continuation.runId,
+    );
+    assert.strictEqual(
+      continuationEvents[0]?.actions?.continuationStart?.providerReplayDigest,
+      plan.continuation.providerReplayDigest,
+    );
   });
 
   test('strict backend refresh settles after an active continuation finalizes', async () => {
@@ -5273,27 +8161,28 @@ describe('SessionManager permission mode updates', () => {
       refreshSettled = true;
     });
     await Promise.resolve();
-    expect(refreshSettled).toBe(false);
+    assert.strictEqual(refreshSettled, false);
     await manager.stopSession(session.id, { source: 'stop_button' });
     sendGate.release();
     await execution;
     await refresh;
-    expect(store.disposeCount).toBe(1);
+    assert.strictEqual(store.disposeCount, 1);
 
-    const cachedMessages = await store.readMessages(session.id);
-    expect(
+    const cachedMessages = await manager.getMessages(session.id);
+    assert.partialDeepStrictEqual(
       cachedMessages
         .filter(
           (message) =>
             message.type === 'turn_state' && message.turnId === plan.continuation?.turnId,
         )
         .at(-1),
-    ).toMatchObject({
-      type: 'turn_state',
-      status: 'aborted',
-      abortSource: 'renderer.stop_button',
-      parentTurnId: sourceTurnId,
-    });
+      {
+        type: 'turn_state',
+        status: 'aborted',
+        abortSource: 'renderer.stop_button',
+        parentTurnId: sourceTurnId,
+      },
+    );
   });
 
   test('parks repeated planning after the source run already produced a continuation', async () => {
@@ -5373,57 +8262,21 @@ describe('SessionManager permission mode updates', () => {
       availableToolNames: [],
     });
 
-    expect(repeatedPlan.disposition).toBe('park');
-    expect(repeatedPlan.rejectionReasons).toEqual(['continuation_already_exists']);
+    assert.strictEqual(repeatedPlan.disposition, 'park');
+    assert.deepStrictEqual(repeatedPlan.rejectionReasons, ['continuation_already_exists']);
 
     const targetRunId = firstPlan.continuation.runId;
-    const targetRun = await runStore.readRun(session.id, targetRunId);
-    await runStore.updateRun(session.id, targetRunId, {
-      modelId: 'tampered-model',
-      updatedAt: targetRun.updatedAt + 1,
-    });
-    const targetIdentityMismatch = await manager.planSafeBoundaryContinuation(session.id, {
-      sourceRunId,
-      currentCwd: header.cwd,
-      sourceWorkspaceIdentity: 'workspace-1',
-      currentWorkspaceIdentity: 'workspace-1',
-      backgroundOperationsSettled: true,
-      availableToolNames: [],
-    });
-    expect(targetIdentityMismatch.rejectionReasons).toEqual(['continuation_claim_repair_required']);
-
-    await runStore.updateRun(session.id, targetRunId, {
-      modelId: targetRun.modelId,
-      status: 'failed',
-      failureClass: 'tampered_terminal_state',
-      updatedAt: targetRun.updatedAt + 2,
-    });
-    const targetTerminalMismatch = await manager.planSafeBoundaryContinuation(session.id, {
-      sourceRunId,
-      currentCwd: header.cwd,
-      sourceWorkspaceIdentity: 'workspace-1',
-      currentWorkspaceIdentity: 'workspace-1',
-      backgroundOperationsSettled: true,
-      availableToolNames: [],
-    });
-    expect(targetTerminalMismatch.rejectionReasons).toEqual(['continuation_claim_repair_required']);
-
-    await runStore.updateRun(session.id, targetRunId, {
-      status: targetRun.status,
-      failureClass: targetRun.failureClass,
-      completedAt: targetRun.completedAt,
-      updatedAt: targetRun.updatedAt,
-    });
-    await runStore.appendRuntimeEvent(
+    const targetRun = await readInvocation(runStore, session.id, targetRunId);
+    runStore.seedRuntimeEvent(
       session.id,
       targetRunId,
       runtimeEvent({
         id: 'post-terminal-continuation-output',
-        invocationId: targetRun.invocationId ?? targetRun.runId,
+        invocationId: targetRun.invocationId,
         runId: targetRun.runId,
         sessionId: targetRun.sessionId,
         turnId: targetRun.turnId,
-        ts: targetRun.updatedAt + 1,
+        ts: (targetRun.terminalEvent?.ts ?? targetRun.openedAt) + 1,
         role: 'model',
         author: 'agent',
         content: { kind: 'text', text: 'must not follow a terminal fact' },
@@ -5437,7 +8290,9 @@ describe('SessionManager permission mode updates', () => {
       backgroundOperationsSettled: true,
       availableToolNames: [],
     });
-    expect(postTerminalMismatch.rejectionReasons).toEqual(['continuation_claim_repair_required']);
+    assert.deepStrictEqual(postTerminalMismatch.rejectionReasons, [
+      'continuation_claim_repair_required',
+    ]);
   });
 
   test('rejects continuation while a normal turn is still registering', async () => {
@@ -5634,7 +8489,7 @@ describe('SessionManager permission mode updates', () => {
       /boundary is already claimed/i,
     );
 
-    expect(backendCalls).toBe(1);
+    assert.strictEqual(backendCalls, 1);
   });
 
   test('serializes concurrent continuation claims for the same source boundary', async () => {
@@ -5726,14 +8581,16 @@ describe('SessionManager permission mode updates', () => {
     const firstResult = await Promise.allSettled([firstExecution]);
     const results = [...firstResult, ...secondResult];
 
-    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
-    expect(results.filter((result) => result.status === 'rejected')).toHaveLength(1);
-    expect(backendCalls).toBe(1);
+    assert.strictEqual(results.filter((result) => result.status === 'fulfilled').length, 1);
+    assert.strictEqual(results.filter((result) => result.status === 'rejected').length, 1);
+    assert.strictEqual(backendCalls, 1);
   });
 
   test('does not call the backend and claim recovery closes a continuation-start persistence failure', async () => {
     const store = new MemorySessionStore();
-    const runStore = new MemoryAgentRunStore({ failRuntimeEventAppendAfter: 2 });
+    // The source invocation's opening and its two events are the three appends
+    // that must succeed; the continuation-start is the one that fails.
+    const runStore = new MemoryAgentRunStore({ failRuntimeEventAppendAfter: 3 });
     const backends = new BackendRegistry();
     let backendCalls = 0;
     backends.register(
@@ -5757,7 +8614,9 @@ describe('SessionManager permission mode updates', () => {
     const sourceRunId = 'source-run-write-failure';
     const sourceTurnId = 'source-turn-write-failure';
     const sourceInvocationId = 'source-invocation-write-failure';
-    await runStore.createRun({
+    // The source states its own terminal event below.
+    await seedInvocationOpening(runStore, {
+      invocationId: sourceInvocationId,
       runId: sourceRunId,
       sessionId: session.id,
       turnId: sourceTurnId,
@@ -5817,22 +8676,31 @@ describe('SessionManager permission mode updates', () => {
       /runtime event append failed/,
     );
 
-    expect(backendCalls).toBe(0);
-    const targetRun = await runStore.readRun(session.id, plan.continuation.runId);
-    expect(['created', 'running'].includes(targetRun.status)).toBe(true);
-    expect(targetRun.completedAt).toBeUndefined();
-    expect(await runStore.readRuntimeEvents(session.id, plan.continuation.runId)).toEqual([]);
+    assert.strictEqual(backendCalls, 0);
+    // The continuation-start never reached the ledger, so nothing opened the
+    // target invocation and the inventory does not know it.
+    await assert.rejects(readInvocation(runStore, session.id, plan.continuation.runId));
+    assert.deepStrictEqual(
+      await runStore.readRuntimeEvents(session.id, plan.continuation.runId),
+      [],
+    );
 
     await manager.recoverInterruptedSessions();
 
-    const recoveredRun = await runStore.readRun(session.id, plan.continuation.runId);
+    const recoveredRun = await readInvocation(runStore, session.id, plan.continuation.runId);
     const recoveredEvents = await runStore.readRuntimeEvents(session.id, plan.continuation.runId);
-    expect(recoveredRun.status).toBe('failed');
-    expect(recoveredRun.failureClass).toBe('continuation_abandoned_before_provider_dispatch');
-    expect(recoveredEvents).toHaveLength(2);
-    expect(recoveredEvents[0]?.actions?.continuationStart?.claimId).toBe(plan.continuation.claimId);
-    expect(recoveredEvents.filter(isTerminalRuntimeEvent)).toHaveLength(1);
-    expect(recoveredEvents.at(-1)?.actions?.stateDelta).toMatchObject({
+    assert.strictEqual(runtimeInvocationOutcome(recoveredRun), 'failed');
+    assert.strictEqual(
+      runtimeInvocationFailureClass(recoveredRun),
+      'continuation_abandoned_before_provider_dispatch',
+    );
+    assert.strictEqual(recoveredEvents.length, 2);
+    assert.strictEqual(
+      recoveredEvents[0]?.actions?.continuationStart?.claimId,
+      plan.continuation.claimId,
+    );
+    assert.strictEqual(recoveredEvents.filter(isTerminalRuntimeEvent).length, 1);
+    assert.partialDeepStrictEqual(recoveredEvents.at(-1)?.actions?.stateDelta, {
       recovered: true,
       recoveryReason: 'continuation_abandoned_before_provider_dispatch',
       failureClass: 'continuation_abandoned_before_provider_dispatch',
@@ -5928,14 +8796,15 @@ describe('SessionManager permission mode updates', () => {
     await stop;
     await execution.catch(() => []);
 
-    expect(backendCalls).toBe(0);
-    const targetRun = await runStore.readRun(session.id, plan.continuation.runId);
-    expect(targetRun.status).toBe('cancelled');
+    assert.strictEqual(backendCalls, 0);
+    const targetRun = await readInvocation(runStore, session.id, plan.continuation.runId);
+    assert.strictEqual(runtimeInvocationOutcome(targetRun), 'cancelled');
     const targetEvents = await runStore.readRuntimeEvents(session.id, plan.continuation.runId);
-    expect(
-      targetEvents.filter((event) => event.actions?.continuationStart !== undefined),
-    ).toHaveLength(1);
-    expect(targetEvents.filter(isTerminalRuntimeEvent)).toHaveLength(1);
+    assert.strictEqual(
+      targetEvents.filter((event) => event.actions?.continuationStart !== undefined).length,
+      1,
+    );
+    assert.strictEqual(targetEvents.filter(isTerminalRuntimeEvent).length, 1);
   });
 
   test('does not call the backend when the durable continuation claim cannot be created', async () => {
@@ -6015,11 +8884,14 @@ describe('SessionManager permission mode updates', () => {
       /continuation claim create failed/,
     );
 
-    expect(backendCalls).toBe(0);
-    await expectRejects(runStore.readRun(session.id, plan.continuation.runId), /unknown run/i);
+    assert.strictEqual(backendCalls, 0);
+    await expectRejects(
+      readInvocation(runStore, session.id, plan.continuation.runId),
+      /unknown run/i,
+    );
   });
 
-  test('revalidates terminal ledger consistency before executing a planned continuation', async () => {
+  test('refuses a planned continuation whose source ledger changed after planning', async () => {
     const store = new MemorySessionStore();
     const runStore = new MemoryAgentRunStore();
     const backends = new BackendRegistry();
@@ -6092,22 +8964,33 @@ describe('SessionManager permission mode updates', () => {
     });
     if (!plan.continuation) throw new Error('expected continuation');
 
-    await runStore.updateRun(session.id, sourceRunId, {
-      status: 'completed',
-      updatedAt: 3,
-      completedAt: 3,
-    });
+    runStore.seedRuntimeEvent(
+      session.id,
+      sourceRunId,
+      runtimeEvent({
+        id: 'source-second-terminal-race',
+        invocationId: sourceInvocationId,
+        runId: sourceRunId,
+        sessionId: session.id,
+        turnId: sourceTurnId,
+        ts: 3,
+        status: 'completed',
+        actions: { endInvocation: true },
+      }),
+    );
 
+    // The second ending moved the source boundary the plan was cut against, so
+    // the plan no longer describes the ledger it would continue from.
     await expectRejects(
       collectSessionEvents(manager.resumeSafeBoundaryContinuation(plan.continuation)),
-      /terminal/i,
+      /continuation boundary changed/i,
     );
-    expect(backendCalls).toBe(0);
+    assert.strictEqual(backendCalls, 0);
   });
 
   test('startup recovery retries claim-only terminal projection without dispatching the provider', async () => {
     const store = new MemorySessionStore();
-    const runStore = new MemoryAgentRunStore({ failUpdateRunStatusOnce: 'failed' });
+    const runStore = new MemoryAgentRunStore();
     const backends = new BackendRegistry();
     let backendCalls = 0;
     let failOnce = true;
@@ -6191,50 +9074,49 @@ describe('SessionManager permission mode updates', () => {
       collectSessionEvents(manager.resumeSafeBoundaryContinuation(plan.continuation)),
       /simulated claim-only crash/,
     );
-    await expectRejects(runStore.readRun(session.id, plan.continuation.runId), /unknown run/i);
-    expect(backendCalls).toBe(0);
-
-    expect(await manager.recoverInterruptedSessions()).not.toContain(session.id);
-    const durableRepairEvents = await runStore.readRuntimeEvents(
-      session.id,
-      plan.continuation.runId,
+    await expectRejects(
+      readInvocation(runStore, session.id, plan.continuation.runId),
+      /unknown run/i,
     );
-    expect(durableRepairEvents).toHaveLength(2);
-    expect(durableRepairEvents.filter(isTerminalRuntimeEvent)).toHaveLength(1);
-    expect((await runStore.readRun(session.id, plan.continuation.runId)).status).toBe('created');
+    assert.strictEqual(backendCalls, 0);
 
-    expect(await manager.recoverInterruptedSessions()).toContain(session.id);
-    const repairedRun = await runStore.readRun(session.id, plan.continuation.runId);
-    expect(repairedRun.status).toBe('failed');
-    expect(repairedRun.failureClass).toBe('continuation_abandoned_before_provider_dispatch');
-    expect(
-      repairedRun.continuationSource && 'protocol' in repairedRun.continuationSource
-        ? repairedRun.continuationSource.protocol
-        : undefined,
-    ).toBe('continuation_source_v2');
-    expect(
-      repairedRun.continuationSource && 'claimId' in repairedRun.continuationSource
-        ? repairedRun.continuationSource.claimId
-        : undefined,
-    ).toBe(plan.continuation.claimId);
+    // One pass finishes the claim: the continuation-start the crash never
+    // committed, and the terminal event that ends a run nothing will dispatch.
+    // There is no second record left to settle afterwards.
+    assert.ok((await manager.recoverInterruptedSessions()).includes(session.id));
+    const repairedRun = await readInvocation(runStore, session.id, plan.continuation.runId);
+    assert.strictEqual(runtimeInvocationOutcome(repairedRun), 'failed');
+    assert.strictEqual(
+      runtimeInvocationFailureClass(repairedRun),
+      'continuation_abandoned_before_provider_dispatch',
+    );
+    assert.partialDeepStrictEqual(repairedRun.opening.source, {
+      kind: 'continuation',
+      sourceRunId,
+      claimId: plan.continuation.claimId,
+    });
     const repairedEvents = await runStore.readRuntimeEvents(session.id, plan.continuation.runId);
-    expect(repairedEvents).toHaveLength(2);
-    expect(repairedEvents[0]?.actions?.continuationStart?.claimId).toBe(plan.continuation.claimId);
-    expect(repairedEvents[1]?.status).toBe('failed');
-    expect(backendCalls).toBe(0);
+    assert.strictEqual(repairedEvents.length, 2);
+    assert.strictEqual(
+      repairedEvents[0]?.actions?.continuationStart?.claimId,
+      plan.continuation.claimId,
+    );
+    assert.strictEqual(repairedEvents[1]?.status, 'failed');
+    assert.strictEqual(backendCalls, 0);
 
     const snapshot = JSON.stringify({
       run: repairedRun,
       events: repairedEvents,
     });
     await manager.recoverInterruptedSessions();
-    expect(
+    assert.strictEqual(
       JSON.stringify({
-        run: await runStore.readRun(session.id, plan.continuation.runId),
+        run: await readInvocation(runStore, session.id, plan.continuation.runId),
         events: await runStore.readRuntimeEvents(session.id, plan.continuation.runId),
       }),
-    ).toBe(snapshot);
-    expect(backendCalls).toBe(0);
+      snapshot,
+    );
+    assert.strictEqual(backendCalls, 0);
 
     const nextPlan = await manager.planSafeBoundaryContinuation(session.id, {
       sourceRunId: plan.continuation.runId,
@@ -6244,7 +9126,7 @@ describe('SessionManager permission mode updates', () => {
       backgroundOperationsSettled: true,
       availableToolNames: [],
     });
-    expect(nextPlan.disposition).toBe('continue');
+    assert.strictEqual(nextPlan.disposition, 'continue');
   });
 
   test('rejects continuation when the authoritative workspace identity changes after planning', async () => {
@@ -6334,8 +9216,8 @@ describe('SessionManager permission mode updates', () => {
       collectSessionEvents(manager.resumeSafeBoundaryContinuation(plan.continuation)),
       /workspace identity changed/i,
     );
-    expect(backendCalls).toBe(0);
-    expect(lifecycleEvents.at(-1)).toEqual({
+    assert.strictEqual(backendCalls, 0);
+    assert.deepStrictEqual(lifecycleEvents.at(-1), {
       type: 'execution_failed',
       sessionId: session.id,
       sourceRunId,
@@ -6434,7 +9316,7 @@ describe('SessionManager permission mode updates', () => {
         collectSessionEvents(manager.resumeSafeBoundaryContinuation(plan.continuation)),
         /tool catalog changed/i,
       );
-      expect(backendCalls).toBe(0);
+      assert.strictEqual(backendCalls, 0);
     }
   });
 
@@ -6541,8 +9423,11 @@ describe('SessionManager permission mode updates', () => {
       /tool catalog changed/i,
     );
 
-    expect(backendCalls).toBe(0);
-    await expectRejects(runStore.readRun(session.id, plan.continuation.runId), /Unknown run/);
+    assert.strictEqual(backendCalls, 0);
+    await expectRejects(
+      readInvocation(runStore, session.id, plan.continuation.runId),
+      /Unknown run/,
+    );
   });
 
   test('fails closed when continuation execution has no authoritative safety inspector', async () => {
@@ -6620,115 +9505,7 @@ describe('SessionManager permission mode updates', () => {
       collectSessionEvents(manager.resumeSafeBoundaryContinuation(plan.continuation)),
       /safety inspector/i,
     );
-    expect(backendCalls).toBe(0);
-  });
-
-  test('sendMessage preserves token usage fields while resuming from an empty prior runtime ledger', async () => {
-    const store = new MemorySessionStore();
-    const runStore = new MemoryAgentRunStore();
-    const backends = new BackendRegistry();
-    let backend: TestBackend | undefined;
-    backends.register('ai-sdk', (ctx) => {
-      backend = new TestBackend(ctx);
-      return backend;
-    });
-    const newId = nextId();
-    const now = nextNow(7_000);
-    const manager = new SessionManager({
-      store,
-      runStore,
-      runtimeEventStore: runStore,
-      backends,
-      newId,
-      now,
-    });
-    const session = await manager.createSession(makeInput());
-    await store.appendMessages(session.id, [
-      { type: 'user', id: 'legacy-user', turnId: 'turn-1', ts: 101, text: 'prior question' },
-      {
-        type: 'assistant',
-        id: 'legacy-assistant',
-        turnId: 'turn-1',
-        ts: 102,
-        text: 'prior answer',
-        modelId: 'fake-model',
-      },
-      {
-        type: 'token_usage',
-        id: 'legacy-usage',
-        turnId: 'turn-1',
-        ts: 103,
-        input: 100,
-        output: 25,
-        runtimeSteps: 3,
-        contextRemaining: 9000,
-        providerRequestTraceId: 'provider-trace-1',
-      },
-      {
-        type: 'turn_state',
-        id: 'legacy-state',
-        turnId: 'turn-1',
-        ts: 104,
-        status: 'completed',
-        partialOutputRetained: true,
-      },
-    ]);
-    await runStore.createRun(
-      makeRunHeader({
-        sessionId: session.id,
-        runId: 'run-1',
-        turnId: 'turn-1',
-        status: 'completed',
-        createdAt: 100,
-        updatedAt: 104,
-        completedAt: 104,
-      }),
-    );
-
-    const restarted = new SessionManager({
-      store,
-      runStore,
-      runtimeEventStore: runStore,
-      backends,
-      newId,
-      now,
-    });
-    const sessionEvents = await collectSessionEvents(
-      restarted.sendMessage(session.id, { turnId: 'turn-2', text: 'follow up' }),
-    );
-
-    expect(sessionEvents.map((event) => event.type)).toEqual(['text_delta', 'complete']);
-    expect(backend?.sendInputs[0]?.context.map((message) => message.type)).toEqual([
-      'user',
-      'assistant',
-      'token_usage',
-      'turn_state',
-    ]);
-    expect(
-      backend?.sendInputs[0]?.context.map((message) =>
-        'text' in message ? message.text : message.type,
-      ),
-    ).toEqual(['prior question', 'prior answer', 'token_usage', 'turn_state']);
-    expect(backend?.sendInputs[0]?.runtimeContext?.map((event) => event.runId)).toEqual([
-      'run-1',
-      'run-1',
-      'run-1',
-      'run-1',
-    ]);
-    const resumedUsage = backend?.sendInputs[0]?.runtimeContext?.find(
-      (event) => event.actions?.tokenUsage,
-    );
-    expect(resumedUsage?.actions?.tokenUsage?.runtimeSteps).toBe(3);
-    expect(resumedUsage?.actions?.tokenUsage?.contextRemaining).toBe(9000);
-    expect(resumedUsage?.refs?.providerRequestTraceId).toBe('provider-trace-1');
-    const repairedRuntimeEvents = await runStore.readRuntimeEvents(session.id, 'run-1');
-    expect(repairedRuntimeEvents.map((event) => event.refs?.storedMessageId)).toEqual([
-      'legacy-user',
-      'legacy-assistant',
-      'legacy-usage',
-      'legacy-state',
-    ]);
-    expect(repairedRuntimeEvents.at(-1)?.status).toBe('completed');
+    assert.strictEqual(backendCalls, 0);
   });
 
   test('sendMessage completes interrupted imported history beside native runs', async () => {
@@ -6749,6 +9526,7 @@ describe('SessionManager permission mode updates', () => {
       now: nextNow(7_025),
     });
     const session = await manager.createSession(makeInput());
+    await store.updateHeader(session.id, { transcriptLedgerVersion: 0 });
     await store.appendMessages(session.id, [
       { type: 'user', id: 'imported-user-1', turnId: 'turn-1', ts: 101, text: 'First question' },
       {
@@ -6765,7 +9543,6 @@ describe('SessionManager permission mode updates', () => {
         turnId: 'turn-1',
         ts: 103,
         status: 'completed',
-        partialOutputRetained: true,
       },
       { type: 'user', id: 'imported-user-2', turnId: 'turn-2', ts: 104, text: 'Second question' },
       {
@@ -6782,14 +9559,22 @@ describe('SessionManager permission mode updates', () => {
         turnId: 'turn-2',
         ts: 106,
         status: 'completed',
-        partialOutputRetained: true,
       },
     ]);
 
+    // The first conversion dies partway through. A staged import stays staged
+    // until one whole conversion lands, so the retry is another import — a live
+    // Turn is refused meanwhile, and the second pass re-derives the same event
+    // ids and appends only what the interrupted one never wrote.
     await expectRejects(
       manager.prepareImportedSessionHistory(session.id),
       /runtime event append failed/,
     );
+    await expectRejects(
+      drain(manager.sendMessage(session.id, { turnId: 'turn-early', text: 'Too early' })),
+      /history is still being prepared/,
+    );
+    await manager.prepareImportedSessionHistory(session.id);
     await seedRuntimeRun(
       runStore,
       makeRunHeader({
@@ -6840,22 +9625,146 @@ describe('SessionManager permission mode updates', () => {
 
     await drain(manager.sendMessage(session.id, { turnId: 'turn-4', text: 'Continue' }));
 
-    expect(
+    assert.deepStrictEqual(
       backend?.sendInputs[0]?.runtimeContext?.flatMap((event) =>
         event.content?.kind === 'text' ? [event.content.text] : [],
       ),
-    ).toEqual([
-      'First question',
-      'First answer',
-      'Second question',
-      'Second answer',
-      'Native question',
-      'Native answer',
-    ]);
-    expect((await store.readHeader(session.id)).transcriptLedgerVersion).toBe(1);
-    const repairedRuns = await runStore.listSessionRuns(session.id);
-    expect(repairedRuns.filter((run) => run.turnId === 'turn-1')).toHaveLength(1);
-    expect(repairedRuns.filter((run) => run.turnId === 'turn-2')).toHaveLength(1);
+      [
+        'First question',
+        'First answer',
+        'Second question',
+        'Second answer',
+        'Native question',
+        'Native answer',
+      ],
+    );
+    assert.strictEqual((await store.readHeader(session.id)).transcriptLedgerVersion, 1);
+    const repairedRuns = await runStore.listSessionInvocations(session.id);
+    assert.strictEqual(repairedRuns.filter((run) => run.turnId === 'turn-1').length, 1);
+    assert.strictEqual(repairedRuns.filter((run) => run.turnId === 'turn-2').length, 1);
+  });
+
+  test('sendMessage admits assistant-first repaired history at a user boundary', async () => {
+    {
+      const externalOrigin = { adapterId: 'opencode', sourceSessionId: 'assistant-first' };
+      const store = new MemorySessionStore();
+      const runStore = new MemoryAgentRunStore();
+      const backends = new BackendRegistry();
+      const model = new MockLanguageModelV4({
+        doStream: async () => ({
+          stream: simulateReadableStream({
+            chunks: [
+              { type: 'stream-start', warnings: [] },
+              { type: 'text-start', id: 'text-1' },
+              { type: 'text-delta', id: 'text-1', delta: 'continued' },
+              { type: 'text-end', id: 'text-1' },
+              {
+                type: 'finish',
+                finishReason: { unified: 'stop', raw: 'stop' },
+                usage: {
+                  inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+                  outputTokens: { total: 1, text: 1, reasoning: 0 },
+                },
+              },
+            ] as LanguageModelV4StreamPart[],
+            initialDelayInMs: null,
+            chunkDelayInMs: null,
+          }),
+        }),
+      });
+      backends.register('ai-sdk', (ctx) =>
+        createTestAiSdkBackend({
+          sessionId: ctx.sessionId,
+          header: ctx.header,
+          connection: {
+            slug: 'anthropic',
+            providerType: 'anthropic',
+            defaultModel: 'claude-test',
+          },
+          apiKey: 'sk-test',
+          modelId: 'claude-test',
+          modelFactory: () => model,
+          tools: [],
+          loadTurnRuntimeEvents: ctx.loadTurnRuntimeEvents,
+          newId: nextId(),
+          now: nextNow(1),
+        }),
+      );
+      const manager = new SessionManager({
+        store,
+        runStore,
+        runtimeEventStore: runStore,
+        backends,
+        newId: nextId(),
+        now: nextNow(7_035),
+      });
+      const session = await manager.createSession(
+        makeInput({
+          llmConnectionSlug: 'anthropic',
+          model: 'claude-test',
+          permissionMode: 'bypass',
+        }),
+      );
+      await store.updateHeader(session.id, {
+        createdAt: 100,
+        transcriptLedgerVersion: 0,
+        ...(externalOrigin ? { externalOrigin } : {}),
+      });
+      await store.appendMessages(session.id, [
+        {
+          type: 'assistant',
+          id: 'imported-assistant',
+          turnId: 'imported-turn',
+          ts: 1,
+          text: 'Imported opening reply',
+          modelId: 'external-model',
+        },
+        {
+          type: 'turn_state',
+          id: 'imported-state',
+          turnId: 'imported-turn',
+          ts: 2,
+          status: 'completed',
+        },
+        {
+          type: 'user',
+          id: 'imported-user',
+          turnId: 'imported-user-turn',
+          ts: 3,
+          text: 'Imported question',
+        },
+        {
+          type: 'assistant',
+          id: 'imported-answer',
+          turnId: 'imported-user-turn',
+          ts: 4,
+          text: 'Imported answer',
+          modelId: 'external-model',
+        },
+        {
+          type: 'turn_state',
+          id: 'imported-user-state',
+          turnId: 'imported-user-turn',
+          ts: 5,
+          status: 'completed',
+        },
+      ]);
+      await manager.prepareImportedSessionHistory(session.id);
+
+      await drain(manager.sendMessage(session.id, { turnId: 'continued-turn', text: 'Continue' }));
+
+      assert.deepStrictEqual(
+        model.doStreamCalls[0]?.prompt.map((message) => message.role),
+        ['user', 'assistant', 'user'],
+      );
+      assert.doesNotMatch(JSON.stringify(model.doStreamCalls[0]?.prompt), /Imported opening reply/);
+      assert.strictEqual(
+        (await manager.getMessages(session.id)).some(
+          (message) => message.type === 'assistant' && message.text === 'Imported opening reply',
+        ),
+        true,
+      );
+    }
   });
 
   test('sendMessage rejects an imported Session while its history is staging', async () => {
@@ -6879,99 +9788,7 @@ describe('SessionManager permission mode updates', () => {
       /history is still being prepared/,
     );
 
-    expect(await runStore.listSessionRuns(session.id)).toHaveLength(0);
-  });
-
-  test('sendMessage rejects prior runtime context without a valid terminal fact', async () => {
-    const store = new MemorySessionStore();
-    const runStore = new MemoryAgentRunStore();
-    const backends = new BackendRegistry();
-    let backend: TestBackend | undefined;
-    backends.register('ai-sdk', (ctx) => {
-      backend = new TestBackend(ctx);
-      return backend;
-    });
-    const manager = new SessionManager({
-      store,
-      runStore,
-      runtimeEventStore: runStore,
-      backends,
-      newId: nextId(),
-      now: nextNow(7_050),
-    });
-    const session = await manager.createSession(makeInput());
-    await seedRuntimeRun(
-      runStore,
-      makeRunHeader({
-        sessionId: session.id,
-        runId: 'run-1',
-        turnId: 'turn-1',
-        status: 'completed',
-        createdAt: 100,
-        updatedAt: 103,
-        completedAt: 103,
-      }),
-      [
-        runtimeEvent({
-          id: 'rt-user',
-          sessionId: session.id,
-          runId: 'run-1',
-          turnId: 'turn-1',
-          ts: 101,
-          role: 'user',
-          author: 'user',
-          content: { kind: 'text', text: 'prior question' },
-        }),
-        runtimeEvent({
-          id: 'rt-assistant',
-          sessionId: session.id,
-          runId: 'run-1',
-          turnId: 'turn-1',
-          ts: 102,
-          role: 'model',
-          author: 'agent',
-          content: { kind: 'text', text: 'prior answer' },
-        }),
-        runtimeEvent({
-          id: 'rt-completed-a',
-          sessionId: session.id,
-          runId: 'run-1',
-          turnId: 'turn-1',
-          ts: 103,
-          status: 'completed',
-          actions: { endInvocation: true },
-        }),
-        runtimeEvent({
-          id: 'rt-completed-b',
-          sessionId: session.id,
-          runId: 'run-1',
-          turnId: 'turn-1',
-          ts: 104,
-          status: 'completed',
-          actions: { endInvocation: true },
-        }),
-      ],
-    );
-
-    await expectRejects(
-      drain(manager.sendMessage(session.id, { turnId: 'turn-2', text: 'follow up' })),
-      /valid terminal fact/,
-    );
-    expect(backend?.sendInputs.length ?? 0).toBe(0);
-    const currentRun = (await runStore.listSessionRuns(session.id)).find(
-      (run) => run.turnId === 'turn-2',
-    );
-    if (!currentRun) throw new Error('current AgentRunStore run was not created');
-    expect(currentRun.status).toBe('failed');
-    expect(currentRun.failureClass).toBe('missing_terminal_event');
-    const currentTerminalEvents = (
-      await runStore.readRuntimeEvents(session.id, currentRun.runId)
-    ).filter(isTerminalRuntimeEvent);
-    expect(currentTerminalEvents).toHaveLength(1);
-    expect(currentTerminalEvents[0]?.status).toBe('failed');
-    expect(currentTerminalEvents[0]?.actions?.stateDelta?.failureClass).toBe(
-      'missing_terminal_event',
-    );
+    assert.strictEqual((await runStore.listSessionInvocations(session.id)).length, 0);
   });
 
   test('sendMessage replays a prior run left non-terminal by an unanswered interaction', async () => {
@@ -7031,13 +9848,13 @@ describe('SessionManager permission mode updates', () => {
 
     await drain(manager.sendMessage(session.id, { turnId: 'turn-2', text: 'follow up' }));
 
-    expect(backend?.sendInputs[0]?.runtimeContext?.map((event) => event.id)).toEqual([
-      'rt-user',
-      'rt-assistant',
-    ]);
+    assert.deepStrictEqual(
+      backend?.sendInputs[0]?.runtimeContext?.map((event) => event.id),
+      ['run-1-invocation-opened', 'rt-user', 'rt-assistant'],
+    );
   });
 
-  test('RuntimeReadModel projects messages turns replay and terminal facts without SessionStore messages', async () => {
+  test('RuntimeReadModel projects messages turns and terminal facts without SessionStore messages', async () => {
     const store = new MemorySessionStore();
     const runStore = new MemoryAgentRunStore();
     const session = await store.create(makeInput());
@@ -7054,24 +9871,21 @@ describe('SessionManager permission mode updates', () => {
     store.failReadMessagesFor.add(session.id);
 
     const view = await new RuntimeReadModel({
-      runStore,
       runtimeEventStore: runStore,
     }).getSessionView(session.id);
 
-    expect(view.messages).toEqual(seeded.projectedMessages);
-    expect(view.turns).toEqual([
+    assert.deepStrictEqual(view.messages, seeded.projectedMessages);
+    assert.deepStrictEqual(view.turns, [
       {
         turnId: 'turn-1',
         status: 'completed',
         statusSource: 'recorded',
-        partialOutputRetained: true,
       },
     ]);
-    expect(view.terminalFacts.map((fact) => fact.runStatus)).toEqual(['completed']);
-    expect(view.replayPlan.textMessages.map((message) => message.content)).toEqual([
-      'runtime question',
-      'runtime answer',
-    ]);
+    assert.deepStrictEqual(
+      view.terminalFacts.map((fact) => fact.runStatus),
+      ['completed'],
+    );
   });
 
   test('SessionManager projects hosted permission details from the canonical outcome', async () => {
@@ -7114,32 +9928,23 @@ describe('SessionManager permission mode updates', () => {
 
     const messages = await manager.getMessages(header.sessionId);
 
-    expect(messages.find((message) => message.type === 'permission_decision')).toEqual({
-      type: 'permission_decision',
-      id: 'request-canonical',
-      turnId: header.turnId,
-      ts: 125,
-      toolUseId: 'tool-canonical',
-      toolName: 'Write',
-      decision: 'allow',
-      rememberForTurn: true,
-      reviewer: 'auto_review',
-      rationale: 'The requested write is limited to the reviewed path.',
-      riskLevel: 'medium',
-      hint: 'write approval',
-    });
-
-    const cachedView = await new RuntimeReadModel({
-      runStore,
-      runtimeEventStore: runStore,
-      projectionCache: {
-        readMessages: async () =>
-          messages.filter((message) => message.type !== 'permission_decision'),
+    assert.deepStrictEqual(
+      messages.find((message) => message.type === 'permission_decision'),
+      {
+        type: 'permission_decision',
+        id: 'request-canonical',
+        turnId: header.turnId,
+        ts: 125,
+        toolUseId: 'tool-canonical',
+        toolName: 'Write',
+        decision: 'allow',
+        rememberForTurn: true,
+        reviewer: 'auto_review',
+        rationale: 'The requested write is limited to the reviewed path.',
+        riskLevel: 'medium',
+        hint: 'write approval',
       },
-      canonicalPermissionOutcomes,
-    }).getSessionView(header.sessionId);
-
-    expect(cachedView.diagnostics).toEqual([]);
+    );
   });
 
   test('SessionManager joins a canonical hosted permission without a ledger request', async () => {
@@ -7178,17 +9983,20 @@ describe('SessionManager permission mode updates', () => {
 
     const messages = await manager.getMessages(header.sessionId);
 
-    expect(messages.find((message) => message.type === 'permission_decision')).toEqual({
-      type: 'permission_decision',
-      id: 'request-canonical',
-      turnId: header.turnId,
-      ts: 125,
-      toolUseId: 'tool-canonical',
-      toolName: 'Write',
-      decision: 'allow',
-      rememberForTurn: true,
-      reviewer: 'auto_review',
-    });
+    assert.deepStrictEqual(
+      messages.find((message) => message.type === 'permission_decision'),
+      {
+        type: 'permission_decision',
+        id: 'request-canonical',
+        turnId: header.turnId,
+        ts: 125,
+        toolUseId: 'tool-canonical',
+        toolName: 'Write',
+        decision: 'allow',
+        rememberForTurn: true,
+        reviewer: 'auto_review',
+      },
+    );
   });
 
   test('RuntimeReadModel fails closed for a missing or mismatched hosted permission outcome', async () => {
@@ -7213,7 +10021,6 @@ describe('SessionManager permission mode updates', () => {
       await seedCanonicalPermissionRun(runStore, header);
       await assert.rejects(
         new RuntimeReadModel({
-          runStore,
           runtimeEventStore: runStore,
           canonicalPermissionOutcomes: {
             readPermissionOutcome: async () => outcome,
@@ -7279,7 +10086,6 @@ describe('SessionManager permission mode updates', () => {
       initialWorkersStarted = resolve;
     });
     const viewPromise = new RuntimeReadModel({
-      runStore,
       runtimeEventStore: runStore,
       canonicalPermissionOutcomes: {
         readPermissionOutcome: async (requestId) => {
@@ -7303,14 +10109,15 @@ describe('SessionManager permission mode updates', () => {
     }).getSessionView(header.sessionId);
 
     await initialWorkers;
-    expect(startedReads).toBe(8);
-    expect(maxActiveReads).toBe(8);
+    assert.strictEqual(startedReads, 8);
+    assert.strictEqual(maxActiveReads, 8);
     releaseReads();
     const view = await viewPromise;
 
-    expect(startedReads).toBe(requestIds.length);
-    expect(maxActiveReads).toBe(8);
-    expect(view.messages.filter((message) => message.type === 'permission_decision').length).toBe(
+    assert.strictEqual(startedReads, requestIds.length);
+    assert.strictEqual(maxActiveReads, 8);
+    assert.strictEqual(
+      view.messages.filter((message) => message.type === 'permission_decision').length,
       requestIds.length,
     );
   });
@@ -7345,20 +10152,17 @@ describe('SessionManager permission mode updates', () => {
     });
 
     const view = await new RuntimeReadModel({
-      runStore,
       runtimeEventStore: runStore,
     }).getSessionView(session.id);
 
-    expect(view.runs.map((run) => run.runId)).toEqual(['parent-run']);
-    expect(view.messages.map((message) => message.turnId)).toEqual([
-      'parent-turn',
-      'parent-turn',
-      'parent-turn',
-    ]);
-    expect(view.replayPlan.textMessages.map((message) => message.content)).toEqual([
-      'parent question',
-      'parent answer',
-    ]);
+    assert.deepStrictEqual(
+      view.invocations.map((run) => run.runId),
+      ['parent-run'],
+    );
+    assert.deepStrictEqual(
+      view.messages.map((message) => message.turnId),
+      ['parent-turn', 'parent-turn', 'parent-turn'],
+    );
   });
 
   test('projection/cache mismatch does not override RuntimeEvent read output', async () => {
@@ -7382,7 +10186,6 @@ describe('SessionManager permission mode updates', () => {
         turnId: 'turn-1',
         ts: 103,
         status: 'completed',
-        partialOutputRetained: true,
       },
     ];
     await store.appendMessages(session.id, legacyMessages);
@@ -7422,7 +10225,7 @@ describe('SessionManager permission mode updates', () => {
       ],
     );
 
-    expect(await manager.getMessages(session.id)).toEqual([
+    assert.deepStrictEqual(await manager.getMessages(session.id), [
       { type: 'user', id: 'rt-user', turnId: 'turn-1', ts: 101, text: 'question' },
       {
         type: 'turn_state',
@@ -7430,230 +10233,8 @@ describe('SessionManager permission mode updates', () => {
         turnId: 'turn-1',
         ts: 103,
         status: 'completed',
-        partialOutputRetained: false,
       },
     ]);
-  });
-
-  test('getMessages repairs a non-empty RuntimeEvent ledger that is missing only the terminal fact', async () => {
-    const store = new MemorySessionStore();
-    const runStore = new MemoryAgentRunStore();
-    const manager = makeManagerForReadCutover(store, runStore);
-    const session = await manager.createSession(makeInput());
-    await store.appendMessages(session.id, [
-      { type: 'user', id: 'legacy-user', turnId: 'turn-1', ts: 101, text: 'question' },
-      {
-        type: 'assistant',
-        id: 'legacy-assistant',
-        turnId: 'turn-1',
-        ts: 102,
-        text: 'answer',
-        modelId: 'fake-model',
-      },
-      {
-        type: 'turn_state',
-        id: 'legacy-state',
-        turnId: 'turn-1',
-        ts: 103,
-        status: 'completed',
-        partialOutputRetained: true,
-      },
-    ]);
-    await seedRuntimeRun(
-      runStore,
-      makeRunHeader({
-        sessionId: session.id,
-        runId: 'run-1',
-        turnId: 'turn-1',
-        status: 'completed',
-        createdAt: 100,
-        updatedAt: 103,
-        completedAt: 103,
-      }),
-      [
-        runtimeEvent({
-          id: 'rt-user',
-          sessionId: session.id,
-          runId: 'run-1',
-          turnId: 'turn-1',
-          ts: 101,
-          role: 'user',
-          author: 'user',
-          content: { kind: 'text', text: 'question' },
-        }),
-        runtimeEvent({
-          id: 'rt-assistant',
-          sessionId: session.id,
-          runId: 'run-1',
-          turnId: 'turn-1',
-          ts: 102,
-          role: 'model',
-          author: 'agent',
-          content: { kind: 'text', text: 'answer' },
-        }),
-      ],
-    );
-
-    const messages = await manager.getMessages(session.id);
-    const runtimeEvents = await runStore.readRuntimeEvents(session.id, 'run-1');
-
-    expect(messages.map((message) => message.type)).toEqual(['user', 'assistant', 'turn_state']);
-    expect(messages.at(-1)).toEqual({
-      type: 'turn_state',
-      id: 'legacy-state',
-      turnId: 'turn-1',
-      ts: 103,
-      status: 'completed',
-      partialOutputRetained: true,
-    });
-    expect(runtimeEvents.slice(0, 2).map((event) => event.id)).toEqual(['rt-user', 'rt-assistant']);
-    expect(runtimeEvents.at(-1)?.status).toBe('completed');
-    expect(runtimeEvents.at(-1)?.refs?.storedMessageId).toBe('legacy-state');
-  });
-
-  test('getMessages repair writes terminal turn_state for a continuation run', async () => {
-    const store = new MemorySessionStore();
-    const runStore = new MemoryAgentRunStore();
-    const manager = makeManagerForReadCutover(store, runStore);
-    const session = await manager.createSession(makeInput());
-    const sourceRunId = 'repair-source-run';
-    const sourceTurnId = 'repair-source-turn';
-    const sourceInvocationId = 'repair-source-invocation';
-    await seedRuntimeRun(
-      runStore,
-      makeRunHeader({
-        sessionId: session.id,
-        runId: sourceRunId,
-        turnId: sourceTurnId,
-        status: 'completed',
-        createdAt: 100,
-        updatedAt: 101,
-        completedAt: 101,
-      }),
-      [
-        runtimeEvent({
-          id: 'repair-source-complete',
-          invocationId: sourceInvocationId,
-          sessionId: session.id,
-          runId: sourceRunId,
-          turnId: sourceTurnId,
-          ts: 101,
-          status: 'completed',
-          actions: { endInvocation: true },
-        }),
-      ],
-    );
-    await seedRuntimeRun(
-      runStore,
-      makeRunHeader({
-        sessionId: session.id,
-        runId: 'repair-continuation-run',
-        turnId: 'repair-continuation-turn',
-        status: 'completed',
-        parentRunId: sourceRunId,
-        parentTurnId: sourceTurnId,
-        continuationSource: {
-          sourceInvocationId,
-          sourceRunId,
-          sourceTurnId,
-          sourceRuntimeEventHighWater: 1,
-        },
-        createdAt: 102,
-        updatedAt: 104,
-        completedAt: 104,
-      }),
-      [
-        runtimeEvent({
-          id: 'repair-continuation-text',
-          invocationId: 'repair-continuation-invocation',
-          sessionId: session.id,
-          runId: 'repair-continuation-run',
-          turnId: 'repair-continuation-turn',
-          ts: 103,
-          role: 'model',
-          author: 'agent',
-          content: { kind: 'text', text: 'retained continuation output' },
-        }),
-      ],
-    );
-
-    await manager.getMessages(session.id);
-
-    const cachedMessages = await store.readMessages(session.id);
-    expect(
-      cachedMessages.find(
-        (message) => message.type === 'turn_state' && message.turnId === 'repair-continuation-turn',
-      ),
-    ).toMatchObject({
-      type: 'turn_state',
-      status: 'failed',
-      errorClass: 'missing_terminal_event',
-      parentTurnId: sourceTurnId,
-      partialOutputRetained: false,
-    });
-  });
-
-  test('getMessages can retry repair when the failed header update is interrupted', async () => {
-    const store = new MemorySessionStore();
-    const runStore = new MemoryAgentRunStore({ failUpdateRunOnce: true });
-    const manager = makeManagerForReadCutover(store, runStore);
-    const session = await manager.createSession(makeInput());
-    await store.appendMessages(session.id, [
-      { type: 'user', id: 'legacy-user', turnId: 'turn-1', ts: 101, text: 'question' },
-      {
-        type: 'assistant',
-        id: 'legacy-assistant',
-        turnId: 'turn-1',
-        ts: 102,
-        text: 'answer',
-        modelId: 'fake-model',
-      },
-    ]);
-    await seedRuntimeRun(
-      runStore,
-      makeRunHeader({
-        sessionId: session.id,
-        runId: 'run-1',
-        turnId: 'turn-1',
-        status: 'completed',
-        createdAt: 100,
-        updatedAt: 103,
-        completedAt: 103,
-      }),
-      [
-        runtimeEvent({
-          id: 'rt-user',
-          sessionId: session.id,
-          runId: 'run-1',
-          turnId: 'turn-1',
-          ts: 101,
-          role: 'user',
-          author: 'user',
-          content: { kind: 'text', text: 'question' },
-        }),
-        runtimeEvent({
-          id: 'rt-assistant',
-          sessionId: session.id,
-          runId: 'run-1',
-          turnId: 'turn-1',
-          ts: 102,
-          role: 'model',
-          author: 'agent',
-          content: { kind: 'text', text: 'answer' },
-        }),
-      ],
-    );
-
-    await expectRejects(manager.getMessages(session.id), /update run failed/);
-
-    const messages = await manager.getMessages(session.id);
-    const repairedRun = await runStore.readRun(session.id, 'run-1');
-    const runtimeEvents = await runStore.readRuntimeEvents(session.id, 'run-1');
-
-    expect(repairedRun.status).toBe('failed');
-    expect(repairedRun.failureClass).toBe('missing_terminal_event');
-    expect(messages.at(-1)?.type).toBe('turn_state');
-    expect(runtimeEvents.filter((event) => event.status === 'failed')).toHaveLength(1);
   });
 
   test('getMessages repairs missing failed header class from an existing terminal RuntimeEvent', async () => {
@@ -7727,23 +10308,23 @@ describe('SessionManager permission mode updates', () => {
 
     const messages = await manager.getMessages(session.id);
     await manager.getMessages(session.id);
-    const repairedRun = await runStore.readRun(session.id, 'run-1');
+    const repairedRun = await readInvocation(runStore, session.id, 'run-1');
     const runtimeEvents = await runStore.readRuntimeEvents(session.id, 'run-1');
 
-    expect(repairedRun.failureClass).toBe('tool_failed');
-    expect(messages.at(-1)).toEqual({
+    assert.strictEqual(runtimeInvocationFailureClass(repairedRun), 'tool_failed');
+    assert.deepStrictEqual(messages.at(-1), {
       type: 'turn_state',
       id: 'rt-failed',
       turnId: 'turn-1',
       ts: 103,
       status: 'failed',
       errorClass: 'tool_failed',
-      partialOutputRetained: true,
+      failureMessage: 'tool failed',
     });
-    expect(runtimeEvents.filter((event) => event.status === 'failed')).toHaveLength(1);
+    assert.strictEqual(runtimeEvents.filter((event) => event.status === 'failed').length, 1);
   });
 
-  test('getMessages uses fallback failed header class when an existing terminal RuntimeEvent has no class', async () => {
+  test('getMessages leaves a failed terminal RuntimeEvent that states no class alone', async () => {
     const store = new MemorySessionStore();
     const runStore = new MemoryAgentRunStore();
     const manager = makeManagerForReadCutover(store, runStore);
@@ -7807,76 +10388,16 @@ describe('SessionManager permission mode updates', () => {
     );
 
     await manager.getMessages(session.id);
-    await manager.getMessages(session.id);
-    const repairedRun = await runStore.readRun(session.id, 'run-1');
+    const messages = await manager.getMessages(session.id);
+    const repairedRun = await readInvocation(runStore, session.id, 'run-1');
     const runtimeEvents = await runStore.readRuntimeEvents(session.id, 'run-1');
 
-    expect(repairedRun.failureClass).toBe('missing_terminal_event');
-    expect(runtimeEvents.filter((event) => event.status === 'failed')).toHaveLength(1);
-  });
-
-  test('getMessages serializes concurrent terminal repairs for the same run', async () => {
-    const store = new MemorySessionStore();
-    let repairReads = 0;
-    const runStore = new MemoryAgentRunStore({
-      beforeRuntimeEventRead: async (_sessionId, runId) => {
-        if (runId !== 'run-1' || repairReads >= 2) return;
-        repairReads += 1;
-        await Promise.resolve();
-      },
-    });
-    const manager = makeManagerForReadCutover(store, runStore);
-    const session = await manager.createSession(makeInput());
-    await store.appendMessages(session.id, [
-      { type: 'user', id: 'legacy-user', turnId: 'turn-1', ts: 101, text: 'question' },
-      {
-        type: 'assistant',
-        id: 'legacy-assistant',
-        turnId: 'turn-1',
-        ts: 102,
-        text: 'answer',
-        modelId: 'fake-model',
-      },
-    ]);
-    await seedRuntimeRun(
-      runStore,
-      makeRunHeader({
-        sessionId: session.id,
-        runId: 'run-1',
-        turnId: 'turn-1',
-        status: 'completed',
-        createdAt: 100,
-        updatedAt: 103,
-        completedAt: 103,
-      }),
-      [
-        runtimeEvent({
-          id: 'rt-user',
-          sessionId: session.id,
-          runId: 'run-1',
-          turnId: 'turn-1',
-          ts: 101,
-          role: 'user',
-          author: 'user',
-          content: { kind: 'text', text: 'question' },
-        }),
-        runtimeEvent({
-          id: 'rt-assistant',
-          sessionId: session.id,
-          runId: 'run-1',
-          turnId: 'turn-1',
-          ts: 102,
-          role: 'model',
-          author: 'agent',
-          content: { kind: 'text', text: 'answer' },
-        }),
-      ],
-    );
-
-    await Promise.all([manager.getMessages(session.id), manager.getMessages(session.id)]);
-
-    const runtimeEvents = await runStore.readRuntimeEvents(session.id, 'run-1');
-    expect(runtimeEvents.filter((event) => event.status === 'failed')).toHaveLength(1);
+    // The run already ended. Its ending is immutable, so the class it never
+    // stated stays unstated, and no read appends a second ending to supply one.
+    assert.strictEqual(runtimeInvocationFailureClass(repairedRun), undefined);
+    assert.strictEqual(runtimeEvents.filter((event) => event.status === 'failed').length, 1);
+    const [turnState] = messages.filter((message) => message.type === 'turn_state');
+    assert.partialDeepStrictEqual(turnState, { status: 'failed', errorClass: 'unknown' });
   });
 
   test('getMessages includes continuation output without inlining child agent output', async () => {
@@ -8031,12 +10552,15 @@ describe('SessionManager permission mode updates', () => {
       message.type === 'assistant' ? [message.text] : [],
     );
 
-    expect(assistantTexts).toContain('the resumed article');
-    expect(assistantTexts).not.toContain('private child output');
-    expect(messages.some((message) => message.id === 'continuation-start')).toBe(false);
+    assert.ok(assistantTexts.includes('the resumed article'));
+    assert.ok(!assistantTexts.some((text) => text.includes('private child output')));
+    assert.strictEqual(
+      messages.some((message) => message.id === 'continuation-start'),
+      false,
+    );
   });
 
-  test('getMessages includes in-flight projection cache rows for an active RuntimeEvent run', async () => {
+  test('getMessages reads an active run from its own ledger', async () => {
     const store = new MemorySessionStore();
     const runStore = new MemoryAgentRunStore();
     const manager = makeManagerForReadCutover(store, runStore);
@@ -8051,7 +10575,51 @@ describe('SessionManager permission mode updates', () => {
       assistantText: 'completed answer',
       legacyIdPrefix: 'legacy',
     });
-    const activeMessages: StoredMessage[] = [
+    const activeHeader = makeRunHeader({
+      sessionId: session.id,
+      runId: 'run-2',
+      turnId: 'turn-2',
+      status: 'running',
+      createdAt: 200,
+      updatedAt: 203,
+    });
+    await seedInvocationFromHeader(runStore, activeHeader);
+    await runStore.appendRuntimeEvent(
+      session.id,
+      'run-2',
+      runtimeEvent({
+        id: 'active-user-event',
+        sessionId: session.id,
+        runId: 'run-2',
+        turnId: 'turn-2',
+        ts: 201,
+        role: 'user',
+        author: 'user',
+        content: { kind: 'text', text: 'active question' },
+        refs: { storedMessageId: 'active-user' },
+      }),
+    );
+    // Still arriving: the row a reader sees now, with more of it to come.
+    await runStore.appendRuntimeEvent(
+      session.id,
+      'run-2',
+      runtimeEvent({
+        id: 'active-assistant-event',
+        sessionId: session.id,
+        runId: 'run-2',
+        turnId: 'turn-2',
+        ts: 202,
+        partial: true,
+        role: 'model',
+        author: 'agent',
+        content: { kind: 'text', text: 'partial active answer' },
+        refs: { storedMessageId: 'active-assistant' },
+      }),
+    );
+
+    const messages = await manager.getMessages(session.id);
+    assert.deepStrictEqual(messages, [
+      ...completed.projectedMessages,
       { type: 'user', id: 'active-user', turnId: 'turn-2', ts: 201, text: 'active question' },
       {
         type: 'assistant',
@@ -8061,56 +10629,19 @@ describe('SessionManager permission mode updates', () => {
         text: 'partial active answer',
         modelId: 'fake-model',
       },
-      {
-        type: 'turn_state',
-        id: 'active-state',
-        turnId: 'turn-2',
-        ts: 203,
-        status: 'running',
-        partialOutputRetained: true,
-      },
-    ];
-    await store.appendMessages(session.id, activeMessages);
-    await runStore.createRun(
-      makeRunHeader({
-        sessionId: session.id,
-        runId: 'run-2',
-        turnId: 'turn-2',
-        status: 'running',
-        createdAt: 200,
-        updatedAt: 203,
-      }),
-    );
-
-    const messages = await manager.getMessages(session.id);
-    expect(messages).toEqual([...completed.projectedMessages, ...activeMessages]);
-    expect(await manager.listTurns(session.id)).toEqual([
+    ]);
+    assert.deepStrictEqual(await manager.listTurns(session.id), [
       {
         turnId: 'turn-1',
         status: 'completed',
         statusSource: 'recorded',
-        partialOutputRetained: true,
       },
       {
         turnId: 'turn-2',
         status: 'running',
         statusSource: 'recorded',
-        partialOutputRetained: true,
       },
     ]);
-
-    const view = await new RuntimeReadModel({
-      runStore,
-      runtimeEventStore: runStore,
-      projectionCache: store,
-    }).getSessionView(session.id);
-    expect(
-      view.diagnostics.some(
-        (diagnostic) =>
-          diagnostic.code === 'incomplete_event' &&
-          diagnostic.message.includes('in-flight projection cache'),
-      ),
-    ).toBe(true);
   });
 
   test('getMessages overlays a canonical permission acceptance from a running ledger', async () => {
@@ -8125,7 +10656,7 @@ describe('SessionManager permission mode updates', () => {
       createdAt: 100,
       updatedAt: 125,
     });
-    await runStore.createRun(header);
+    await seedInvocationFromHeader(runStore, header);
     await store.appendMessages(session.id, [
       {
         type: 'user',
@@ -8140,7 +10671,6 @@ describe('SessionManager permission mode updates', () => {
         turnId: header.turnId,
         ts: 101,
         status: 'running',
-        partialOutputRetained: false,
       },
     ]);
     await runStore.appendRuntimeEvent(
@@ -8207,18 +10737,19 @@ describe('SessionManager permission mode updates', () => {
       },
     });
 
-    expect(
+    assert.partialDeepStrictEqual(
       (await manager.getMessages(session.id)).find(
         (message) => message.type === 'permission_decision',
       ),
-    ).toMatchObject({
-      type: 'permission_decision',
-      id: 'request-canonical',
-      turnId: header.turnId,
-      toolUseId: 'tool-canonical',
-      decision: 'allow',
-      reviewer: 'auto_review',
-    });
+      {
+        type: 'permission_decision',
+        id: 'request-canonical',
+        turnId: header.turnId,
+        toolUseId: 'tool-canonical',
+        decision: 'allow',
+        reviewer: 'auto_review',
+      },
+    );
   });
 
   test('the in-flight overlay keeps a pending sandbox boundary request visible in the view', async () => {
@@ -8233,7 +10764,7 @@ describe('SessionManager permission mode updates', () => {
       createdAt: 100,
       updatedAt: 125,
     });
-    await runStore.createRun(header);
+    await seedInvocationFromHeader(runStore, header);
     await store.appendMessages(session.id, [
       { type: 'user', id: 'active-user', turnId: header.turnId, ts: 100, text: 'build it' },
       {
@@ -8242,7 +10773,6 @@ describe('SessionManager permission mode updates', () => {
         turnId: header.turnId,
         ts: 101,
         status: 'running',
-        partialOutputRetained: false,
       },
     ]);
     await runStore.appendRuntimeEvent(
@@ -8292,9 +10822,7 @@ describe('SessionManager permission mode updates', () => {
     );
 
     const view = await new RuntimeReadModel({
-      runStore,
       runtimeEventStore: runStore,
-      projectionCache: store,
     }).getSessionView(session.id);
 
     const readRequestId = (value: unknown): string[] =>
@@ -8303,16 +10831,18 @@ describe('SessionManager permission mode updates', () => {
         : [];
     // Both halves of the interaction survive: without the decision the view
     // would show a request that never resolves.
-    expect(
+    assert.deepStrictEqual(
       view.events.flatMap((event) =>
         readRequestId(event.actions?.stateDelta?.sandboxBoundaryRequest),
       ),
-    ).toEqual(['boundary-pending']);
-    expect(
+      ['boundary-pending'],
+    );
+    assert.deepStrictEqual(
       view.events.flatMap((event) =>
         readRequestId(event.actions?.stateDelta?.sandboxBoundaryDecision),
       ),
-    ).toEqual(['boundary-pending']);
+      ['boundary-pending'],
+    );
   });
 
   test('mixed projection-cache-only system notes do not override RuntimeEvent projection', async () => {
@@ -8341,10 +10871,10 @@ describe('SessionManager permission mode updates', () => {
 
     const messages = await manager.getMessages(session.id);
 
-    expect(messages).toEqual(seeded.projectedMessages);
+    assert.deepStrictEqual(messages, seeded.projectedMessages);
   });
 
-  test('getMessages orders RuntimeEvent-primary reads by session event chronology across runs', async () => {
+  test('getMessages orders RuntimeEvent-primary reads by durable session chronology', async () => {
     const store = new MemorySessionStore();
     const runStore = new MemoryAgentRunStore();
     const manager = makeManagerForReadCutover(store, runStore);
@@ -8447,460 +10977,20 @@ describe('SessionManager permission mode updates', () => {
 
     const messages = await manager.getMessages(session.id);
 
-    expect(
+    assert.deepStrictEqual(
       messages.map(
         (message) =>
           `${message.type}:${'turnId' in message ? message.turnId : 'none'}:${message.ts}`,
       ),
-    ).toEqual([
-      'user:slow:101',
-      'user:fast:103',
-      'assistant:fast:104',
-      'turn_state:fast:105',
-      'assistant:slow:106',
-      'turn_state:slow:107',
-    ]);
-  });
-
-  test('regenerate finds completed source turns through the RuntimeEvent-primary view', async () => {
-    const store = new MemorySessionStore();
-    const runStore = new MemoryAgentRunStore();
-    const backends = new BackendRegistry();
-    backends.register(
-      'ai-sdk',
-      (ctx) => new EventBackend(ctx, [{ type: 'complete', stopReason: 'end_turn' }]),
-    );
-    const manager = new SessionManager({
-      store,
-      runStore,
-      runtimeEventStore: runStore,
-      backends,
-      newId: nextId(),
-      now: nextNow(6_770),
-    });
-    const session = await manager.createSession(makeInput());
-    await seedRuntimeReadTurn({
-      store,
-      runStore,
-      sessionId: session.id,
-      turnId: 'source',
-      runId: 'source-run',
-      userText: 'runtime regenerate text',
-      assistantText: 'runtime answer',
-      legacyIdPrefix: 'legacy',
-    });
-    store.failNextReadMessagesFor.set(session.id, 1);
-
-    await drain(manager.regenerateTurn(session.id, { sourceTurnId: 'source', turnId: 'regen-1' }));
-
-    const messages = await store.readMessages(session.id);
-    const regenUser = messages.find(
-      (message) => message.type === 'user' && message.turnId === 'regen-1',
-    );
-    expect(regenUser?.type === 'user' ? regenUser.text : undefined).toBe('runtime regenerate text');
-    const regenState = deriveTurnRecords(messages).find((turn) => turn.turnId === 'regen-1');
-    expect(regenState?.regeneratedFromTurnId).toBe('source');
-  });
-
-  test('regenerate is stop-visible during its first source-ledger preflight', async () => {
-    const preflightStarted = makeGate();
-    const releasePreflight = makeGate();
-    let gatePreflight = false;
-    const store = new MemorySessionStore();
-    const runStore = new MemoryAgentRunStore({
-      beforeListSessionRuns: async () => {
-        if (!gatePreflight) return;
-        gatePreflight = false;
-        preflightStarted.release();
-        await releasePreflight.promise;
-      },
-    });
-    const backends = new BackendRegistry();
-    let backend: TestBackend | undefined;
-    backends.register('ai-sdk', (ctx) => {
-      backend = new TestBackend(ctx);
-      return backend;
-    });
-    const manager = new SessionManager({
-      store,
-      runStore,
-      runtimeEventStore: runStore,
-      backends,
-      newId: nextId(),
-      now: nextNow(6_775),
-    });
-    const session = await manager.createSession(makeInput());
-    await seedRuntimeReadTurn({
-      store,
-      runStore,
-      sessionId: session.id,
-      turnId: 'source',
-      runId: 'source-run',
-      userText: 'do not regenerate after stop',
-      assistantText: 'source answer',
-      legacyIdPrefix: 'legacy-stop',
-    });
-
-    gatePreflight = true;
-    const regenerating = manager
-      .regenerateTurn(session.id, {
-        sourceTurnId: 'source',
-        turnId: 'regen-stopped-preflight',
-      })
-      [Symbol.asyncIterator]();
-    const firstEvent = regenerating.next();
-    await preflightStarted.promise;
-    let stopSettled = false;
-    const stopping = manager.stopSession(session.id, { source: 'stop_button' }).finally(() => {
-      stopSettled = true;
-    });
-    await Promise.resolve();
-    expect(stopSettled).toBe(false);
-
-    releasePreflight.release();
-    await stopping;
-    expect((await firstEvent).done).toBe(true);
-    expect(backend?.sendInputs).toEqual([]);
-    const regenerated = (await runStore.listSessionRuns(session.id)).find(
-      (run) => run.turnId === 'regen-stopped-preflight',
-    );
-    expect(regenerated?.status).toBe('cancelled');
-    expect((await store.readHeader(session.id)).status === 'blocked').toBe(false);
-  });
-
-  test('regenerate accepts an aborted source turn (retry semantics merged into regenerate)', async () => {
-    const store = new MemorySessionStore();
-    const runStore = new MemoryAgentRunStore();
-    const backends = new BackendRegistry();
-    backends.register(
-      'ai-sdk',
-      (ctx) => new EventBackend(ctx, [{ type: 'complete', stopReason: 'end_turn' }]),
-    );
-    const manager = new SessionManager({
-      store,
-      runStore,
-      runtimeEventStore: runStore,
-      backends,
-      newId: nextId(),
-      now: nextNow(6_780),
-    });
-    const session = await manager.createSession(makeInput());
-    await seedRuntimeRun(
-      runStore,
-      makeRunHeader({
-        sessionId: session.id,
-        runId: 'source-run',
-        turnId: 'source',
-        status: 'cancelled',
-        createdAt: 100,
-        updatedAt: 102,
-        completedAt: 102,
-      }),
       [
-        runtimeEvent({
-          id: 'source-user',
-          sessionId: session.id,
-          runId: 'source-run',
-          turnId: 'source',
-          ts: 101,
-          role: 'user',
-          author: 'user',
-          content: { kind: 'text', text: 'aborted turn text' },
-        }),
-        runtimeEvent({
-          id: 'source-abort',
-          sessionId: session.id,
-          runId: 'source-run',
-          turnId: 'source',
-          ts: 102,
-          role: 'system',
-          author: 'system',
-          status: 'aborted',
-          actions: { endInvocation: true, stateDelta: { abortSource: 'renderer.stop_button' } },
-        }),
+        'user:slow:101',
+        'assistant:slow:106',
+        'turn_state:slow:107',
+        'user:fast:103',
+        'assistant:fast:104',
+        'turn_state:fast:105',
       ],
     );
-    store.failNextReadMessagesFor.set(session.id, 1);
-
-    await drain(
-      manager.regenerateTurn(session.id, { sourceTurnId: 'source', turnId: 'regen-aborted' }),
-    );
-
-    const regenUser = (await store.readMessages(session.id)).find(
-      (message) => message.type === 'user' && message.turnId === 'regen-aborted',
-    );
-    expect(regenUser?.type === 'user' ? regenUser.text : undefined).toBe('aborted turn text');
-  });
-
-  test('branchFromTurn copies through the RuntimeEvent-primary message boundary', async () => {
-    const store = new MemorySessionStore();
-    const runStore = new MemoryAgentRunStore();
-    const manager = makeManagerForReadCutover(store, runStore);
-    const session = await manager.createSession(makeInput({ name: 'Parent' }));
-    await seedRuntimeReadTurn({
-      store,
-      runStore,
-      sessionId: session.id,
-      turnId: 'source',
-      runId: 'source-run',
-      userText: 'runtime branch context',
-      assistantText: 'runtime branch answer',
-      legacyIdPrefix: 'legacy',
-    });
-    store.failNextReadMessagesFor.set(session.id, 1);
-
-    const child = await manager.branchFromTurn(session.id, {
-      sourceTurnId: 'source',
-      name: 'Child',
-    });
-
-    const childMessages = await store.readMessages(child.id);
-    expect(childMessages[0]).toMatchObject({
-      type: 'user',
-      turnId: 'source',
-      text: 'runtime branch context',
-    });
-    expect(childMessages[1]).toMatchObject({
-      type: 'assistant',
-      turnId: 'source',
-      text: 'runtime branch answer',
-    });
-    expect(childMessages[2]).toMatchObject({ type: 'system_note', kind: 'session_start' });
-    expect(childMessages.some((message) => message.type === 'turn_state')).toBe(false);
-
-    const runtimeMessages = await manager.getMessages(child.id);
-    expect(runtimeMessages[0]).toMatchObject({
-      type: 'user',
-      turnId: 'source',
-      text: 'runtime branch context',
-    });
-    expect(runtimeMessages[1]).toMatchObject({
-      type: 'assistant',
-      turnId: 'source',
-      text: 'runtime branch answer',
-    });
-  });
-
-  test('conversation copies materialize requestless hosted permission history', async () => {
-    const store = new MemorySessionStore();
-    const runStore = new MemoryAgentRunStore();
-    const backends = new BackendRegistry();
-    const backendInstances: TestBackend[] = [];
-    backends.register('ai-sdk', (ctx) => {
-      const backend = new TestBackend(ctx);
-      backendInstances.push(backend);
-      return backend;
-    });
-    const session = await store.create(makeInput({ name: 'Parent' }));
-    const header = makeRunHeader({
-      sessionId: session.id,
-      runId: 'source-run',
-      turnId: 'source',
-      status: 'completed',
-      createdAt: 100,
-      updatedAt: 130,
-      completedAt: 130,
-    });
-    await seedCanonicalPermissionRun(runStore, header, false);
-    const sourcePermissionEvents = await runStore.readRuntimeEvents(session.id, header.runId);
-    expect(sourcePermissionEvents.some((event) => event.actions?.permissionRequest)).toBe(false);
-    expect(sourcePermissionEvents.some((event) => event.content?.kind === 'function_call')).toBe(
-      false,
-    );
-    await seedRuntimeRun(
-      runStore,
-      makeRunHeader({
-        sessionId: session.id,
-        runId: 'later-run',
-        turnId: 'later',
-        status: 'completed',
-        createdAt: 140,
-        updatedAt: 141,
-        completedAt: 141,
-      }),
-      [
-        runtimeEvent({
-          id: 'later-user',
-          sessionId: session.id,
-          runId: 'later-run',
-          turnId: 'later',
-          ts: 140,
-          role: 'user',
-          author: 'user',
-          content: { kind: 'text', text: 'replace this turn' },
-        }),
-        runtimeEvent({
-          id: 'later-terminal',
-          sessionId: session.id,
-          runId: 'later-run',
-          turnId: 'later',
-          ts: 141,
-          status: 'completed',
-          actions: { endInvocation: true },
-        }),
-      ],
-    );
-    let sourceInteractionAvailable = true;
-    const manager = new SessionManager({
-      store,
-      runStore,
-      runtimeEventStore: runStore,
-      backends,
-      newId: nextId(),
-      now: nextNow(6_755),
-      interactionAuthority: testInteractionAuthority(),
-      canonicalPermissionOutcomes: {
-        readPermissionOutcome: async () =>
-          sourceInteractionAvailable ? canonicalPermissionRecord(header) : undefined,
-      },
-    });
-
-    const child = await manager.branchFromTurn(session.id, {
-      sourceTurnId: header.turnId,
-      name: 'Child',
-    });
-    const revision = await manager.reviseBeforeTurn(session.id, { sourceTurnId: 'later' });
-    sourceInteractionAvailable = false;
-
-    const [childSourceRun] = await runStore.listSessionRuns(child.id);
-    const childSourceEvents = childSourceRun
-      ? await runStore.readRuntimeEvents(child.id, childSourceRun.runId)
-      : [];
-    expect(
-      childSourceEvents.find((event) => event.actions?.permissionDecision)?.actions
-        ?.permissionDecision,
-    ).toMatchObject({
-      requestId: 'request-canonical',
-      toolName: 'Write',
-      decision: 'deny',
-    });
-    expect(childSourceEvents.some((event) => event.actions?.permissionRequest)).toBe(false);
-    expect(childSourceEvents.some((event) => event.actions?.permissionAnswerAccepted)).toBe(false);
-
-    for (const copiedSession of [child, revision]) {
-      expect(
-        (await manager.getMessages(copiedSession.id)).find(
-          (message) => message.type === 'permission_decision',
-        ),
-      ).toMatchObject({
-        type: 'permission_decision',
-        id: 'request-canonical',
-        turnId: header.turnId,
-        toolUseId: 'tool-canonical',
-        toolName: 'Write',
-        decision: 'deny',
-        reviewer: 'user',
-      });
-    }
-
-    await drain(manager.sendMessage(child.id, { turnId: 'child-next', text: 'continue' }));
-    expect(
-      backendInstances
-        .find((backend) => backend.sessionId === child.id)
-        ?.sendInputs[0]?.context.find((message) => message.type === 'permission_decision'),
-    ).toMatchObject({
-      id: 'request-canonical',
-      toolUseId: 'tool-canonical',
-      toolName: 'Write',
-      decision: 'deny',
-    });
-  });
-
-  test('branch child next turn receives cloned RuntimeEvent context', async () => {
-    const store = new MemorySessionStore();
-    const runStore = new MemoryAgentRunStore();
-    const backends = new BackendRegistry();
-    const backendInstances: TestBackend[] = [];
-    backends.register('ai-sdk', (ctx) => {
-      const backend = new TestBackend(ctx);
-      backendInstances.push(backend);
-      return backend;
-    });
-    const manager = new SessionManager({
-      store,
-      runStore,
-      runtimeEventStore: runStore,
-      backends,
-      newId: nextId(),
-      now: nextNow(6_870),
-    });
-    const session = await manager.createSession(makeInput({ name: 'Parent' }));
-
-    await drain(manager.sendMessage(session.id, { turnId: 'source', text: 'branch seed' }));
-    const child = await manager.branchFromTurn(session.id, {
-      sourceTurnId: 'source',
-      name: 'Child',
-    });
-    await store.appendMessage(child.id, {
-      type: 'assistant',
-      id: 'child-cache-only',
-      turnId: 'cache-only',
-      ts: 6_999,
-      text: 'cache-only child context',
-      modelId: 'fake-model',
-    });
-
-    await drain(manager.sendMessage(child.id, { turnId: 'child-next', text: 'child follow-up' }));
-
-    const childInput = backendInstances[1]?.sendInputs[0];
-    if (!childInput) throw new Error('child backend input was not recorded');
-    expect(
-      childInput.context.some(
-        (message) =>
-          message.type === 'user' && message.turnId === 'source' && message.text === 'branch seed',
-      ),
-    ).toBe(true);
-    expect(
-      childInput.context.some(
-        (message) => message.type === 'assistant' && message.id === 'child-cache-only',
-      ),
-    ).toBe(false);
-    expect(childInput.runtimeContext?.map((event) => event.turnId)).toEqual([
-      'source',
-      'source',
-      'source',
-    ]);
-    expect(childInput.runtimeContext?.[0]?.sessionId).toBe(child.id);
-  });
-
-  test('branchFromTurn removes an incomplete target when Runtime ledger copy fails', async () => {
-    const store = new MemorySessionStore();
-    const runStore = new MemoryAgentRunStore({ failRuntimeEventAppendAfter: 5 });
-    const manager = makeManagerForReadCutover(store, runStore);
-    const session = await manager.createSession(makeInput({ name: 'Parent' }));
-    await seedRuntimeReadTurn({
-      store,
-      runStore,
-      sessionId: session.id,
-      turnId: 'source',
-      runId: 'source-run',
-      userText: 'runtime branch context',
-      assistantText: 'runtime branch answer',
-      legacyIdPrefix: 'legacy',
-    });
-
-    let branchError: unknown;
-    try {
-      await manager.branchFromTurn(session.id, { sourceTurnId: 'source', name: 'Child' });
-    } catch (error) {
-      branchError = error;
-    }
-    expect(branchError instanceof Error ? branchError.message : String(branchError)).toContain(
-      'runtime event append failed',
-    );
-
-    const child = (await store.list()).find((summary) => summary.parentSessionId === session.id);
-    expect(child).toBeUndefined();
-    const childRuns = await runStore.listSessionRuns('session-2');
-    for (const run of childRuns) {
-      const runtimeEvents = await runStore.readRuntimeEvents('session-2', run.runId);
-      const hasTerminalFact = runtimeEvents.some(isTerminalRuntimeEvent);
-      expect(
-        run.status === 'completed' || run.status === 'failed' || run.status === 'cancelled'
-          ? hasTerminalFact
-          : true,
-      ).toBe(true);
-    }
   });
 
   test('multi-run RuntimeEvent projection preserves retry regenerate and branch lineage on turns', async () => {
@@ -8958,21 +11048,30 @@ describe('SessionManager permission mode updates', () => {
 
     const turns = await manager.listTurns(session.id);
 
-    expect(turns.find((turn) => turn.turnId === 'retry')).toMatchObject({
-      status: 'completed',
-      parentTurnId: 'root',
-      retriedFromTurnId: 'root',
-    });
-    expect(turns.find((turn) => turn.turnId === 'regen')).toMatchObject({
-      status: 'completed',
-      parentTurnId: 'root',
-      regeneratedFromTurnId: 'root',
-    });
-    expect(turns.find((turn) => turn.turnId === 'branch')).toMatchObject({
-      status: 'completed',
-      parentSessionId: 'parent-session',
-      branchOfTurnId: 'root',
-    });
+    assert.partialDeepStrictEqual(
+      turns.find((turn) => turn.turnId === 'retry'),
+      {
+        status: 'completed',
+        parentTurnId: 'root',
+        retriedFromTurnId: 'root',
+      },
+    );
+    assert.partialDeepStrictEqual(
+      turns.find((turn) => turn.turnId === 'regen'),
+      {
+        status: 'completed',
+        parentTurnId: 'root',
+        regeneratedFromTurnId: 'root',
+      },
+    );
+    assert.partialDeepStrictEqual(
+      turns.find((turn) => turn.turnId === 'branch'),
+      {
+        status: 'completed',
+        parentSessionId: 'parent-session',
+        branchOfTurnId: 'root',
+      },
+    );
   });
 
   test('next turn projects failed prior RuntimeEvents with the terminal fact failure class', async () => {
@@ -9043,71 +11142,14 @@ describe('SessionManager permission mode updates', () => {
 
     const secondInput = backendInstances[0]?.sendInputs[0];
     if (!secondInput) throw new Error('backend input was not recorded');
-    expect(secondInput.runtimeContext?.map((event) => event.turnId)).toEqual([
-      'turn-1',
-      'turn-1',
-      'turn-1',
-    ]);
-    const turnState = secondInput.context.find(
-      (message) => message.type === 'turn_state' && message.turnId === 'turn-1',
+    assert.deepStrictEqual(
+      // The opening fact rides the same context as the three events it opened.
+      secondInput.runtimeContext?.map((event) => event.turnId),
+      ['turn-1', 'turn-1', 'turn-1', 'turn-1'],
     );
-    if (turnState?.type !== 'turn_state')
-      throw new Error('prior failed turn_state was not projected');
-    expect(turnState.status).toBe('failed');
-    expect(turnState.errorClass).toBe('tool_failed');
-  });
-
-  test('next turn uses failed terminal RuntimeEvents when failed header commit was interrupted', async () => {
-    const store = new MemorySessionStore();
-    const runStore = new MemoryAgentRunStore({ failUpdateRunStatusOnce: 'failed' });
-    const backends = new BackendRegistry();
-    let backend: TurnScriptBackend | undefined;
-    backends.register('ai-sdk', (ctx) => {
-      backend = new TurnScriptBackend(ctx, [
-        [{ type: 'complete', stopReason: 'error' }],
-        [
-          { type: 'text_delta', messageId: 'm2', text: 'second ok' },
-          { type: 'complete', stopReason: 'end_turn' },
-        ],
-      ]);
-      return backend;
-    });
-    const manager = new SessionManager({
-      store,
-      runStore,
-      runtimeEventStore: runStore,
-      backends,
-      newId: nextId(),
-      now: nextNow(6_812),
-    });
-    const session = await manager.createSession(makeInput());
-
-    await drain(manager.sendMessage(session.id, { turnId: 'turn-1', text: 'first' }));
-    const [firstRun] = await runStore.listSessionRuns(session.id);
-    if (!firstRun) throw new Error('first run was not recorded');
-    expect(firstRun.status).toBe('running');
-    const firstRuntimeEvents = await runStore.readRuntimeEvents(session.id, firstRun.runId);
-    const firstTerminalEvents = firstRuntimeEvents.filter(isTerminalRuntimeEvent);
-    expect(firstTerminalEvents).toHaveLength(1);
-    expect(firstTerminalEvents[0]?.status).toBe('failed');
-    expect(firstTerminalEvents[0]?.actions?.stateDelta?.failureClass).toBe('runtime_error');
-
-    await drain(manager.sendMessage(session.id, { turnId: 'turn-2', text: 'second' }));
-
-    const secondInput = backend?.sendInputs[1];
-    if (!secondInput) throw new Error('second backend input was not recorded');
-    expect(secondInput.runtimeContext?.map((event) => event.turnId)).toEqual(['turn-1', 'turn-1']);
-    const turnState = secondInput.context.find(
-      (message) => message.type === 'turn_state' && message.turnId === 'turn-1',
-    );
-    if (turnState?.type !== 'turn_state')
-      throw new Error('prior failed turn_state was not projected');
-    expect(turnState.status).toBe('failed');
-    expect(turnState.errorClass).toBe('runtime_error');
-    const terminalEventsAfterSecondTurn = (
-      await runStore.readRuntimeEvents(session.id, firstRun.runId)
-    ).filter(isTerminalRuntimeEvent);
-    expect(terminalEventsAfterSecondTurn).toHaveLength(1);
+    const failed = secondInput.runtimeContext?.find((event) => event.status === 'failed');
+    assert.strictEqual(failed?.actions?.stateDelta?.failureClass, 'tool_failed');
+    assert.strictEqual(secondInput.context, undefined);
   });
 
   test('next parent turn excludes child run RuntimeEvents from model context', async () => {
@@ -9131,8 +11173,9 @@ describe('SessionManager permission mode updates', () => {
     const session = await manager.createSession(makeInput());
 
     await drain(manager.sendMessage(session.id, { turnId: 'turn-1', text: 'first' }));
-    const [parentRun] = await runStore.listSessionRuns(session.id);
+    const [parentRun] = await runStore.listSessionInvocations(session.id);
     if (!parentRun) throw new Error('parent run was not recorded');
+    const parentRunEndedAt = parentRun.terminalEvent?.ts ?? parentRun.openedAt;
     await seedRuntimeRun(
       runStore,
       makeRunHeader({
@@ -9140,9 +11183,9 @@ describe('SessionManager permission mode updates', () => {
         runId: 'child-run',
         turnId: 'child-turn',
         status: 'completed',
-        createdAt: parentRun.updatedAt + 1,
-        updatedAt: parentRun.updatedAt + 4,
-        completedAt: parentRun.updatedAt + 4,
+        createdAt: parentRunEndedAt + 1,
+        updatedAt: parentRunEndedAt + 4,
+        completedAt: parentRunEndedAt + 4,
         parentRunId: parentRun.runId,
         agentName: 'Researcher',
       }),
@@ -9152,7 +11195,7 @@ describe('SessionManager permission mode updates', () => {
           sessionId: session.id,
           runId: 'child-run',
           turnId: 'child-turn',
-          ts: parentRun.updatedAt + 2,
+          ts: parentRunEndedAt + 2,
           role: 'user',
           author: 'user',
           content: { kind: 'text', text: 'child prompt' },
@@ -9162,7 +11205,7 @@ describe('SessionManager permission mode updates', () => {
           sessionId: session.id,
           runId: 'child-run',
           turnId: 'child-turn',
-          ts: parentRun.updatedAt + 3,
+          ts: parentRunEndedAt + 3,
           role: 'model',
           author: 'agent',
           content: { kind: 'text', text: 'child private answer' },
@@ -9172,7 +11215,7 @@ describe('SessionManager permission mode updates', () => {
           sessionId: session.id,
           runId: 'child-run',
           turnId: 'child-turn',
-          ts: parentRun.updatedAt + 4,
+          ts: parentRunEndedAt + 4,
           role: 'system',
           author: 'system',
           status: 'completed',
@@ -9185,17 +11228,15 @@ describe('SessionManager permission mode updates', () => {
 
     const secondInput = backendInstances[0]?.sendInputs[1];
     if (!secondInput) throw new Error('second backend input was not recorded');
-    expect(secondInput.runtimeContext?.map((event) => event.turnId)).toEqual([
-      'turn-1',
-      'turn-1',
-      'turn-1',
-    ]);
-    expect(secondInput.runtimeContext?.some((event) => event.turnId === 'child-turn')).toBe(false);
-    expect(
-      secondInput.context.some(
-        (message) => message.type === 'user' && message.turnId === 'child-turn',
-      ),
-    ).toBe(false);
+    assert.deepStrictEqual(
+      secondInput.runtimeContext?.map((event) => event.turnId),
+      ['turn-1', 'turn-1', 'turn-1', 'turn-1'],
+    );
+    assert.strictEqual(
+      secondInput.runtimeContext?.some((event) => event.turnId === 'child-turn'),
+      false,
+    );
+    assert.strictEqual(secondInput.context, undefined);
   });
 
   test('stopSession owns an active Run and a parent turn admitted before reservation', async () => {
@@ -9220,7 +11261,7 @@ describe('SessionManager permission mode updates', () => {
     const active = manager
       .sendMessage(session.id, { turnId: 'active-parent-turn', text: 'hold active' })
       [Symbol.asyncIterator]();
-    expect((await active.next()).value?.type).toBe('text_delta');
+    assert.strictEqual((await active.next()).value?.type, 'text_delta');
 
     const readStarted = makeGate();
     const releaseRead = makeGate();
@@ -9239,18 +11280,28 @@ describe('SessionManager permission mode updates', () => {
       stopSettled = true;
     });
     await Promise.resolve();
-    expect(stopSettled).toBe(false);
+    assert.strictEqual(stopSettled, false);
 
     releaseRead.release();
     activeGate.release();
     await stopping;
-    expect((await pendingEvent).done).toBe(true);
+    assert.strictEqual((await pendingEvent).done, true);
     while (!(await active.next()).done) {}
-    expect(backend?.sendInputs.map((input) => input.turnId)).toEqual(['active-parent-turn']);
-    const runs = await runStore.listSessionRuns(session.id);
-    expect(runs.find((run) => run.turnId === 'active-parent-turn')?.status).toBe('cancelled');
-    expect(runs.find((run) => run.turnId === 'pending-parent-turn')?.status).toBe('cancelled');
-    expect((await store.readHeader(session.id)).status).toBe('aborted');
+    assert.deepStrictEqual(
+      backend?.sendInputs.map((input) => input.turnId),
+      ['active-parent-turn'],
+    );
+    const runs = await runStore.listSessionInvocations(session.id);
+    assert.deepStrictEqual(
+      runs
+        .filter((run) => run.turnId.endsWith('-parent-turn'))
+        .map((run) => [run.turnId, runtimeInvocationOutcome(run)]),
+      [
+        ['active-parent-turn', 'cancelled'],
+        ['pending-parent-turn', 'cancelled'],
+      ],
+    );
+    assert.strictEqual((await store.readHeader(session.id)).status, 'aborted');
   });
 
   test('a factory AbortError is not normalized as execution cancellation', async () => {
@@ -9289,18 +11340,15 @@ describe('SessionManager permission mode updates', () => {
       stopSettled = true;
     });
     await Promise.resolve();
-    expect(stopSettled).toBe(false);
+    assert.strictEqual(stopSettled, false);
 
     releaseBuild.release();
     await expectRejects(firstEvent, /backend activation timed out/);
     await stopping;
-    const run = await runStore.readRun(
-      session.id,
-      (await runStore.listSessionRuns(session.id))[0]!.runId,
-    );
-    expect(run.status).toBe('cancelled');
-    expect(run.failureClass).toBe(undefined);
-    expect((await store.readHeader(session.id)).status).toBe('aborted');
+    const run = (await runStore.listSessionInvocations(session.id))[0]!;
+    assert.strictEqual(runtimeInvocationOutcome(run), 'cancelled');
+    assert.strictEqual(runtimeInvocationFailureClass(run), undefined);
+    assert.strictEqual((await store.readHeader(session.id)).status, 'aborted');
   });
 
   test('stop signal cooperatively releases a blocked backend factory', async () => {
@@ -9342,11 +11390,11 @@ describe('SessionManager permission mode updates', () => {
 
     await manager.stopSession(session.id, { source: 'stop_button' });
 
-    expect(factorySignal?.aborted).toBe(true);
-    expect((await firstEvent).done).toBe(true);
-    expect(dispatches).toBe(0);
-    const [run] = await runStore.listSessionRuns(session.id);
-    expect(run?.status).toBe('cancelled');
+    assert.strictEqual(factorySignal?.aborted, true);
+    assert.strictEqual((await firstEvent).done, true);
+    assert.strictEqual(dispatches, 0);
+    const [run] = await runStore.listSessionInvocations(session.id);
+    assert.strictEqual(run && runtimeInvocationOutcome(run), 'cancelled');
   });
 
   test('node timers AbortError is cancellation only when its cause is this execution stop', async () => {
@@ -9380,10 +11428,10 @@ describe('SessionManager permission mode updates', () => {
 
     await manager.stopSession(session.id, { source: 'stop_button' });
 
-    expect((await firstEvent).done).toBe(true);
-    const [run] = await runStore.listSessionRuns(session.id);
-    expect(run?.status).toBe('cancelled');
-    expect(run?.failureClass).toBe(undefined);
+    assert.strictEqual((await firstEvent).done, true);
+    const [run] = await runStore.listSessionInvocations(session.id);
+    assert.strictEqual(run && runtimeInvocationOutcome(run), 'cancelled');
+    assert.strictEqual(run && runtimeInvocationFailureClass(run), undefined);
   });
 
   test('late ignored-signal backend is disposed once and never cached or dispatched', async () => {
@@ -9437,11 +11485,11 @@ describe('SessionManager permission mode updates', () => {
     releaseBuild.release();
     await stopping;
 
-    expect((await firstEvent).done).toBe(true);
-    expect(firstDisposeCalls).toBe(1);
-    expect(firstDispatches).toBe(0);
-    const [stoppedRun] = await runStore.listSessionRuns(session.id);
-    expect(stoppedRun?.status).toBe('cancelled');
+    assert.strictEqual((await firstEvent).done, true);
+    assert.strictEqual(firstDisposeCalls, 1);
+    assert.strictEqual(firstDispatches, 0);
+    const [stoppedRun] = await runStore.listSessionInvocations(session.id);
+    assert.strictEqual(stoppedRun && runtimeInvocationOutcome(stoppedRun), 'cancelled');
 
     await drain(
       manager.sendMessage(session.id, {
@@ -9449,8 +11497,8 @@ describe('SessionManager permission mode updates', () => {
         text: 'must build a fresh backend',
       }),
     );
-    expect(builds).toBe(2);
-    expect(firstDisposeCalls).toBe(1);
+    assert.strictEqual(builds, 2);
+    assert.strictEqual(firstDisposeCalls, 1);
   });
 
   test('late cancelled backend disposal failure propagates as an AggregateError', async () => {
@@ -9511,9 +11559,9 @@ describe('SessionManager permission mode updates', () => {
     releaseBuild.release();
 
     await Promise.all([streamRejection, stopping]);
-    expect(disposeCalls).toBe(1);
-    const [run] = await runStore.listSessionRuns(session.id);
-    expect(run?.status).toBe('cancelled');
+    assert.strictEqual(disposeCalls, 1);
+    const [run] = await runStore.listSessionInvocations(session.id);
+    assert.strictEqual(run && runtimeInvocationOutcome(run), 'cancelled');
 
     await expectRejects(
       drain(
@@ -9524,8 +11572,8 @@ describe('SessionManager permission mode updates', () => {
       ),
       /permanently quarantined/,
     );
-    expect(builds).toBe(1);
-    expect(disposeCalls).toBe(1);
+    assert.strictEqual(builds, 1);
+    assert.strictEqual(disposeCalls, 1);
   });
 
   test('concurrent stopSession calls share one stop attempt', async () => {
@@ -9561,24 +11609,22 @@ describe('SessionManager permission mode updates', () => {
     });
     await Promise.resolve();
     await Promise.resolve();
-    expect(secondStopSettled).toBe(false);
+    assert.strictEqual(secondStopSettled, false);
     releaseStop.release();
     await Promise.all([firstStop, secondStop]);
     while (!(await turn.next()).done) {}
 
-    expect(backend?.stopCalls).toBe(1);
-    const messages = await store.readMessages(session.id);
-    expect(
-      messages.filter((message) => message.type === 'system_note' && message.kind === 'abort'),
-    ).toHaveLength(1);
-    expect(
+    assert.strictEqual(backend?.stopCalls, 1);
+    const messages = await manager.getMessages(session.id);
+    assert.strictEqual(
       messages.filter(
         (message) =>
           message.type === 'turn_state' &&
           message.turnId === 'turn-1' &&
           message.status === 'aborted',
-      ),
-    ).toHaveLength(1);
+      ).length,
+      1,
+    );
   });
 
   test('stopSession waits for a registering turn and fences it before backend send', async () => {
@@ -9619,23 +11665,27 @@ describe('SessionManager permission mode updates', () => {
         stopSettled = true;
       });
     await Promise.resolve();
-    expect(stopSettled).toBe(false);
+    assert.strictEqual(stopSettled, false);
     releaseRead.release();
     await stop;
-    expect((await firstEvent).done).toBe(true);
+    assert.strictEqual((await firstEvent).done, true);
 
-    expect(backend?.stopCalls).toBe(1);
-    expect(backend?.stopModes).toEqual(['after_step']);
-    expect(backend?.sendInputs.map((input) => input.turnId)).toEqual(['turn-warm-cache']);
-    const registeringRun = (await runStore.listSessionRuns(session.id)).find(
+    assert.strictEqual(backend?.stopCalls, 1);
+    assert.deepStrictEqual(backend?.stopModes, ['after_step']);
+    assert.deepStrictEqual(
+      backend?.sendInputs.map((input) => input.turnId),
+      ['turn-warm-cache'],
+    );
+    const registeringRun = (await runStore.listSessionInvocations(session.id)).find(
       (run) => run.turnId === 'turn-registering',
     );
-    expect(registeringRun?.status).toBe('cancelled');
-    expect(
+    assert.strictEqual(registeringRun && runtimeInvocationOutcome(registeringRun), 'cancelled');
+    assert.strictEqual(
       (await runStore.readRuntimeEvents(session.id, registeringRun!.runId)).filter(
         isTerminalRuntimeEvent,
-      ),
-    ).toHaveLength(1);
+      ).length,
+      1,
+    );
   });
 
   test('stopSession fences dispatch after the public onRunStarted hook', async () => {
@@ -9675,12 +11725,12 @@ describe('SessionManager permission mode updates', () => {
 
     await manager.stopSession(session.id, { source: 'stop_button' });
     releaseHook.release();
-    expect((await firstEvent).done).toBe(true);
-    expect(backend?.sendInputs).toEqual([]);
-    const stoppedRun = (await runStore.listSessionRuns(session.id)).find(
+    assert.strictEqual((await firstEvent).done, true);
+    assert.deepStrictEqual(backend?.sendInputs, []);
+    const stoppedRun = (await runStore.listSessionInvocations(session.id)).find(
       (run) => run.turnId === 'turn-post-start-hook-stop',
     );
-    expect(stoppedRun?.status).toBe('cancelled');
+    assert.strictEqual(stoppedRun && runtimeInvocationOutcome(stoppedRun), 'cancelled');
   });
 
   test('concurrent cold turns share one backend generation without accepting an ownerless response', async () => {
@@ -9719,11 +11769,11 @@ describe('SessionManager permission mode updates', () => {
     const secondEvent = second.next();
     await Promise.resolve();
     await Promise.resolve();
-    expect(builds).toBe(1);
+    assert.strictEqual(builds, 1);
 
     releaseBuild.release();
-    expect((await firstEvent).value?.type).toBe('text_delta');
-    expect((await secondEvent).value?.type).toBe('text_delta');
+    assert.strictEqual((await firstEvent).value?.type, 'text_delta');
+    assert.strictEqual((await secondEvent).value?.type, 'text_delta');
     await expectRejects(
       manager.respondToSandboxBoundary(session.id, {
         requestId: 'control-broadcast',
@@ -9731,18 +11781,28 @@ describe('SessionManager permission mode updates', () => {
       }),
       /No pending sandbox boundary request/,
     );
-    expect(backend?.permissionResponses).toBe(0);
-    expect(builds).toBe(1);
+    assert.strictEqual(backend?.permissionResponses, 0);
+    assert.strictEqual(builds, 1);
 
     releaseSend.release();
     while (!(await first.next()).done) {}
     while (!(await second.next()).done) {}
-    expect(backend?.sendInputs).toHaveLength(2);
+    assert.strictEqual(backend?.sendInputs?.length, 2);
   });
 
-  test('stopSession retries only unfinished projections', async () => {
+  test('stopSession retries an unsettled abort without a second backend stop', async () => {
     const store = new MemorySessionStore();
-    const runStore = new MemoryAgentRunStore();
+    // The stop's own terminal fact fails once. Nothing else records the abort,
+    // so the retry has to settle the ledger — and must not reach the backend a
+    // second time to do it.
+    let failAbortAppend = false;
+    const runStore = new MemoryAgentRunStore({
+      beforeRuntimeEventAppend: (_sessionId, _runId, event) => {
+        if (!failAbortAppend || event.status !== 'aborted') return;
+        failAbortAppend = false;
+        throw new Error('append runtime event failed');
+      },
+    });
     const backends = new BackendRegistry();
     const sendGate = makeGate();
     let backend: CountingStopBackend | undefined;
@@ -9763,28 +11823,25 @@ describe('SessionManager permission mode updates', () => {
       .sendMessage(session.id, { turnId: 'turn-1', text: 'hello' })
       [Symbol.asyncIterator]();
     await turn.next();
-    store.failAfterNextAppendMessage = (message) =>
-      message.type === 'system_note' && message.kind === 'abort';
+    failAbortAppend = true;
 
     await expectRejects(
       manager.stopSession(session.id, { source: 'stop_button' }),
-      /append message failed/,
+      /append runtime event failed/,
     );
     await manager.stopSession(session.id, { source: 'stop_button' });
 
-    expect(backend?.stopCalls).toBe(1);
-    const messages = await store.readMessages(session.id);
-    expect(
+    assert.strictEqual(backend?.stopCalls, 1);
+    const messages = await manager.getMessages(session.id);
+    assert.strictEqual(
       messages.filter(
         (message) =>
           message.type === 'turn_state' &&
           message.turnId === 'turn-1' &&
           message.status === 'aborted',
-      ),
-    ).toHaveLength(1);
-    expect(
-      messages.filter((message) => message.type === 'system_note' && message.kind === 'abort'),
-    ).toHaveLength(1);
+      ).length,
+      1,
+    );
     sendGate.release();
     while (!(await turn.next()).done) {}
   });
@@ -9824,19 +11881,17 @@ describe('SessionManager permission mode updates', () => {
 
     await manager.stopSession(session.id, { source: 'stop_button' });
 
-    expect(backend?.stopCalls).toBe(1);
-    const messages = await store.readMessages(session.id);
-    expect(
+    assert.strictEqual(backend?.stopCalls, 1);
+    const messages = await manager.getMessages(session.id);
+    assert.strictEqual(
       messages.filter(
         (message) =>
           message.type === 'turn_state' &&
           message.turnId === 'turn-retained-stop' &&
           message.status === 'aborted',
-      ),
-    ).toHaveLength(1);
-    expect(
-      messages.filter((message) => message.type === 'system_note' && message.kind === 'abort'),
-    ).toHaveLength(1);
+      ).length,
+      1,
+    );
   });
 
   test('agent projections list catalog definitions separately from child runs and read output artifacts by child turn', async () => {
@@ -9862,7 +11917,7 @@ describe('SessionManager permission mode updates', () => {
                 kind: 'file',
                 relativePath: 'artifacts/notes.md',
                 sizeBytes: 12,
-                status: 'live',
+                source: 'tool_result',
               },
             ]
           : [],
@@ -9999,45 +12054,52 @@ describe('SessionManager permission mode updates', () => {
     );
 
     const list = await manager.listChildAgents(session.id);
-    expect(list.definitions.map((agent) => agent.id)).toEqual([
-      LOCAL_READ_AGENT_ID,
-      WEB_RESEARCH_AGENT_ID,
-      IMPLEMENTATION_AGENT_ID,
-    ]);
-    expect(list.definitions[0]?.availability).toEqual({ status: 'available' });
-    expect(list.definitions[0]?.contract.defaultWriteBack).toBe('summary');
-    expect(list.definitions[0]?.contract.workspace).toBe('same_workspace');
-    expect(list.definitions[1]?.availability).toEqual({
+    assert.deepStrictEqual(
+      list.definitions.map((agent) => agent.id),
+      [LOCAL_READ_AGENT_ID, WEB_RESEARCH_AGENT_ID, IMPLEMENTATION_AGENT_ID],
+    );
+    assert.deepStrictEqual(list.definitions[0]?.availability, { status: 'available' });
+    assert.strictEqual(list.definitions[0]?.contract.defaultWriteBack, 'summary');
+    assert.strictEqual(list.definitions[0]?.contract.workspace, 'same_workspace');
+    assert.deepStrictEqual(list.definitions[1]?.availability, {
       status: 'unavailable',
       reason: 'missing_tools',
       missingTools: ['WebSearch'],
     });
-    expect(list.definitions[2]?.availability).toEqual({
+    assert.deepStrictEqual(list.definitions[2]?.availability, {
       status: 'unavailable',
       reason: 'workspace_isolation_unavailable',
       workspace: AGENT_WORKSPACE_WORKTREE,
       requiredRuntime: 'worktree_child_executor',
     });
-    expect(list.runs.map((agent) => agent.runId)).toEqual(['child-run']);
-    expect(list.executions.map((agent) => agent.execution)).toEqual([
-      {
-        kind: 'legacy_child_run',
-        sessionId: session.id,
-        runId: 'child-run',
-      },
-    ]);
-    expect(list.runs[0]?.agentId).toBe(LOCAL_READ_AGENT_ID);
-    expect(list.runs[0]?.agentName).toBe('Researcher');
-    expect(list.runs[0]?.durationMs).toBe(10);
+    assert.deepStrictEqual(
+      list.runs.map((agent) => agent.runId),
+      ['child-run'],
+    );
+    assert.deepStrictEqual(
+      list.executions.map((agent) => agent.execution),
+      [
+        {
+          kind: 'legacy_child_run',
+          sessionId: session.id,
+          runId: 'child-run',
+        },
+      ],
+    );
+    assert.strictEqual(list.runs[0]?.agentId, LOCAL_READ_AGENT_ID);
+    assert.strictEqual(list.runs[0]?.agentName, 'Researcher');
+    assert.strictEqual(list.runs[0]?.durationMs, 10);
 
     const output = await manager.readChildAgentOutput(session.id, { runId: 'child-run' });
-    expect(output.header.runId).toBe('child-run');
-    expect(output.runtimeEvents.map((event) => event.id)).toEqual([
-      'child-user',
-      'child-answer',
-      'child-complete',
-    ]);
-    expect(output.artifacts.map((artifact) => artifact.id)).toEqual(['artifact-1']);
+    assert.strictEqual(output.invocation.runId, 'child-run');
+    assert.deepStrictEqual(
+      output.runtimeEvents.map((event) => event.id),
+      ['child-run-invocation-opened', 'child-user', 'child-answer', 'child-complete'],
+    );
+    assert.deepStrictEqual(
+      output.artifacts.map((artifact) => artifact.id),
+      ['artifact-1'],
+    );
   });
 
   test('child agent projections use the terminal RuntimeEvent fact when the child header is stale', async () => {
@@ -10117,14 +12179,14 @@ describe('SessionManager permission mode updates', () => {
     );
 
     const list = await manager.listChildAgents(session.id);
-    expect(list.runs[0]?.runId).toBe('child-run');
-    expect(list.runs[0]?.status).toBe('completed');
-    expect(list.runs[0]?.completedAt).toBe(140);
-    expect(list.runs[0]?.durationMs).toBe(10);
+    assert.strictEqual(list.runs[0]?.runId, 'child-run');
+    assert.strictEqual(list.runs[0]?.status, 'completed');
+    assert.strictEqual(list.runs[0]?.completedAt, 140);
+    assert.strictEqual(list.runs[0]?.durationMs, 10);
 
     const output = await manager.readChildAgentOutput(session.id, { runId: 'child-run' });
-    expect(output.header.status).toBe('completed');
-    expect(output.header.completedAt).toBe(140);
+    assert.strictEqual(runtimeInvocationOutcome(output.invocation), 'completed');
+    assert.strictEqual(output.invocation.terminalEvent?.ts, 140);
   });
 
   test('agent output returns a bounded child inspection instead of full replay internals', async () => {
@@ -10154,7 +12216,7 @@ describe('SessionManager permission mode updates', () => {
       agentName: 'Researcher',
       permissionMode: 'explore',
     });
-    await runStore.createRun(header);
+    await seedInvocationFromHeader(runStore, header);
     for (let index = 0; index < 25; index += 1) {
       await runStore.appendEvent(
         session.id,
@@ -10168,7 +12230,7 @@ describe('SessionManager permission mode updates', () => {
           ts: 120 + index,
         }),
       );
-      await runStore.appendRuntimeEvent(
+      runStore.seedRuntimeEvent(
         session.id,
         'child-run',
         runtimeEvent({
@@ -10190,27 +12252,21 @@ describe('SessionManager permission mode updates', () => {
       view: 'all',
     });
 
-    expect(output.header.runId).toBe('child-run');
-    expect(output.events.map((event) => event.id)).toEqual([
-      'op-20',
-      'op-21',
-      'op-22',
-      'op-23',
-      'op-24',
-    ]);
-    expect(output.runtimeEvents.map((event) => event.id)).toEqual([
-      'rt-20',
-      'rt-21',
-      'rt-22',
-      'rt-23',
-      'rt-24',
-    ]);
-    expect(output.truncated.events).toBe(true);
-    expect(output.truncated.runtimeEvents).toBe(true);
-    expect(output.budget.view).toBe('all');
-    expect(output.budget.projectedBytes <= output.budget.maxBytes).toBe(true);
-    expect('modelReplay' in output).toBe(false);
-    expect('projection' in output).toBe(false);
+    assert.strictEqual(output.invocation.runId, 'child-run');
+    assert.deepStrictEqual(
+      output.events.map((event) => event.id),
+      ['op-20', 'op-21', 'op-22', 'op-23', 'op-24'],
+    );
+    assert.deepStrictEqual(
+      output.runtimeEvents.map((event) => event.id),
+      ['rt-20', 'rt-21', 'rt-22', 'rt-23', 'rt-24'],
+    );
+    assert.strictEqual(output.truncated.events, true);
+    assert.strictEqual(output.truncated.runtimeEvents, true);
+    assert.strictEqual(output.budget.view, 'all');
+    assert.strictEqual(output.budget.projectedBytes <= output.budget.maxBytes, true);
+    assert.strictEqual('modelReplay' in output, false);
+    assert.strictEqual('projection' in output, false);
   });
 
   test('agent output bounds oversized runtime events by serialized bytes', async () => {
@@ -10227,7 +12283,8 @@ describe('SessionManager permission mode updates', () => {
       now: nextNow(6_849),
     });
     const session = await manager.createSession(makeInput());
-    await runStore.createRun(
+    await seedInvocationFromHeader(
+      runStore,
       makeRunHeader({
         sessionId: session.id,
         runId: 'child-run',
@@ -10242,7 +12299,7 @@ describe('SessionManager permission mode updates', () => {
         permissionMode: 'explore',
       }),
     );
-    await runStore.appendRuntimeEvent(
+    runStore.seedRuntimeEvent(
       session.id,
       'child-run',
       runtimeEvent({
@@ -10256,7 +12313,7 @@ describe('SessionManager permission mode updates', () => {
         content: { kind: 'text', text: 'x'.repeat(64 * 1024) },
       }),
     );
-    await runStore.appendRuntimeEvent(
+    runStore.seedRuntimeEvent(
       session.id,
       'child-run',
       runtimeEvent({
@@ -10277,16 +12334,19 @@ describe('SessionManager permission mode updates', () => {
       maxBytes: 1024,
     });
 
-    expect(output.events).toEqual([]);
-    expect(output.runtimeEvents.map((event) => event.id)).toEqual(['final']);
-    expect(output.truncated.events).toBe(true);
-    expect(output.truncated.runtimeEvents).toBe(true);
-    expect(output.truncated.bytes).toBe(true);
-    expect(output.budget).toMatchObject({
+    assert.deepStrictEqual(output.events, []);
+    assert.deepStrictEqual(
+      output.runtimeEvents.map((event) => event.id),
+      ['final'],
+    );
+    assert.strictEqual(output.truncated.events, true);
+    assert.strictEqual(output.truncated.runtimeEvents, true);
+    assert.strictEqual(output.truncated.bytes, true);
+    assert.partialDeepStrictEqual(output.budget, {
       view: 'runtime_events',
       maxBytes: 1024,
     });
-    expect(output.budget.projectedBytes <= output.budget.maxBytes).toBe(true);
+    assert.strictEqual(output.budget.projectedBytes <= output.budget.maxBytes, true);
   });
 
   test('backend build failure after user append writes a failed terminal run fact', async () => {
@@ -10312,33 +12372,38 @@ describe('SessionManager permission mode updates', () => {
     );
 
     const header = await store.readHeader(session.id);
-    expect(header.status).toBe('blocked');
-    expect(header.blockedReason).toBe('unknown');
-    const messages = await store.readMessages(session.id);
-    expect(messages.some((message) => message.type === 'user' && message.turnId === 'turn-1')).toBe(
+    assert.strictEqual(header.status, 'blocked');
+    assert.strictEqual(header.blockedReason, 'unknown');
+    const messages = await manager.getMessages(session.id);
+    assert.strictEqual(
+      messages.some((message) => message.type === 'user' && message.turnId === 'turn-1'),
       true,
     );
-    const turn = (await store.listTurns(session.id)).find(
+    const turn = (await manager.listTurns(session.id)).find(
       (candidate) => candidate.turnId === 'turn-1',
     );
-    expect(turn?.status).toBe('failed');
-    const [run] = await runStore.listSessionRuns(session.id);
+    assert.strictEqual(turn?.status, 'failed');
+    const [run] = await runStore.listSessionInvocations(session.id);
     if (!run) throw new Error('AgentRunStore run was not created');
-    expect(run.status).toBe('failed');
-    expect(run.failureClass).toBe('missing_terminal_event');
+    assert.strictEqual(runtimeInvocationOutcome(run), 'failed');
+    assert.strictEqual(runtimeInvocationFailureClass(run), 'missing_terminal_event');
     const terminalEvents = (await runStore.readRuntimeEvents(session.id, run.runId)).filter(
       isTerminalRuntimeEvent,
     );
-    expect(terminalEvents).toHaveLength(1);
-    expect(terminalEvents[0]?.status).toBe('failed');
-    expect(terminalEvents[0]?.actions?.stateDelta?.failureClass).toBe('missing_terminal_event');
-    expect((await manager.getMessages(session.id)).some((message) => message.type === 'user')).toBe(
+    assert.strictEqual(terminalEvents.length, 1);
+    assert.strictEqual(terminalEvents[0]?.status, 'failed');
+    assert.strictEqual(
+      terminalEvents[0]?.actions?.stateDelta?.failureClass,
+      'missing_terminal_event',
+    );
+    assert.strictEqual(
+      (await manager.getMessages(session.id)).some((message) => message.type === 'user'),
       true,
     );
   });
 
   test('marks a sandbox boundary request waiting and blocks boundary mode changes', async () => {
-    const store = new MemorySessionStore();
+    const store = new VersionedConfigurationMemorySessionStore();
     const runStore = new MemoryAgentRunStore();
     const backends = new BackendRegistry();
     let backend: SandboxBoundaryWaitBackend | undefined;
@@ -10359,30 +12424,46 @@ describe('SessionManager permission mode updates', () => {
     const iterator = manager
       .sendMessage(session.id, { turnId: 'turn-1', text: 'hello' })
       [Symbol.asyncIterator]();
-    expect((await iterator.next()).value?.type).toBe('sandbox_boundary_request');
+    assert.strictEqual((await iterator.next()).value?.type, 'sandbox_boundary_request');
     const [activeBoundaryRequest] = await manager.listActiveInteractions(session.id);
-    expect(activeBoundaryRequest).toMatchObject({
+    assert.partialDeepStrictEqual(activeBoundaryRequest, {
       type: 'sandbox_boundary_request',
       requestId: 'boundary-1',
       toolUseId: 'tool-1',
       turnId: 'turn-1',
     });
 
-    expect((await store.readHeader(session.id)).status).toBe('waiting_for_user');
-    const [run] = await runStore.listSessionRuns(session.id);
-    expect(run?.status).toBe('waiting_for_user');
-    await expectRejects(manager.setPermissionMode(session.id, 'bypass'), /当前任务正在运行/);
-    expect((await store.readHeader(session.id)).permissionMode).toBe('ask');
+    assert.strictEqual((await store.readHeader(session.id)).status, 'waiting_for_user');
+    const [run] = await runStore.listSessionInvocations(session.id);
+    assert.strictEqual(run?.terminalEvent, undefined);
+    const current = await store.readHeaderRecordSnapshot(session.id);
+    const boundary = await store.readExecutionBoundary(session.id);
+    await assert.rejects(
+      manager.transitionSessionConfiguration(session.id, {
+        expectedRevision: current.revision,
+        clearConnectionBlock: false,
+        permissionModeOnly: true,
+        configuration: configurationForHeader(current.header, { permissionMode: 'bypass' }),
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof SessionConfigurationTransitionError);
+        assert.strictEqual(error.code, 'session_busy');
+        assert.match(error.message, /pending Interaction/);
+        return true;
+      },
+    );
+    assert.deepStrictEqual(await store.readHeaderRecordSnapshot(session.id), current);
+    assert.deepStrictEqual(await store.readExecutionBoundary(session.id), boundary);
 
     await manager.respondToSandboxBoundary(session.id, {
       requestId: 'boundary-1',
       decision: 'deny',
     });
-    expect(backend?.responses).toEqual([{ requestId: 'boundary-1', decision: 'deny' }]);
-    expect((await iterator.next()).value?.type).toBe('sandbox_boundary_decision_ack');
-    expect(await manager.listActiveInteractions(session.id)).toEqual([]);
+    assert.deepStrictEqual(backend?.responses, [{ requestId: 'boundary-1', decision: 'deny' }]);
+    assert.strictEqual((await iterator.next()).value?.type, 'sandbox_boundary_decision_ack');
+    assert.deepStrictEqual(await manager.listActiveInteractions(session.id), []);
     while (!(await iterator.next()).done) {}
-    expect((await store.readHeader(session.id)).status).toBe('active');
+    assert.strictEqual((await store.readHeader(session.id)).status, 'active');
   });
 
   test('lists an unanswered user question until its answer ack lands', async () => {
@@ -10409,12 +12490,12 @@ describe('SessionManager permission mode updates', () => {
       if (next.done) break;
       request = next.value;
     }
-    expect(request?.type).toBe('user_question_request');
+    assert.strictEqual(request?.type, 'user_question_request');
 
     // The surface that raised this request may never have been mounted, so the
     // request has to be readable back from the kernel (#2072).
     const active = await manager.listActiveInteractions(session.id);
-    expect(active).toEqual([request]);
+    assert.deepStrictEqual(active, [request]);
 
     const requestId = (request as Extract<SessionEvent, { type: 'user_question_request' }>)
       .requestId;
@@ -10424,7 +12505,7 @@ describe('SessionManager permission mode updates', () => {
       manager.respondToSandboxBoundary(session.id, { requestId, decision: 'deny' }),
       /No pending sandbox boundary request/,
     );
-    expect(await manager.listActiveInteractions(session.id)).toEqual([request]);
+    assert.deepStrictEqual(await manager.listActiveInteractions(session.id), [request]);
 
     await manager.respondToUserQuestion(session.id, {
       requestId,
@@ -10436,8 +12517,8 @@ describe('SessionManager permission mode updates', () => {
       if (next.done) break;
       ack = next.value;
     }
-    expect(ack?.type).toBe('user_question_answer_ack');
-    expect(await manager.listActiveInteractions(session.id)).toEqual([]);
+    assert.strictEqual(ack?.type, 'user_question_answer_ack');
+    assert.deepStrictEqual(await manager.listActiveInteractions(session.id), []);
     while (!(await iterator.next()).done) {}
   });
 
@@ -10465,14 +12546,14 @@ describe('SessionManager permission mode updates', () => {
       if (next.done) break;
       request = next.value;
     }
-    expect(request?.type).toBe('user_question_request');
+    assert.strictEqual(request?.type, 'user_question_request');
 
     // A stop settles no answer, so this question never gets its ack. Only the
     // turn-end release keeps it from being read back as a prompt for a dead
     // run — one nothing could answer, since the backend generation is gone.
     await manager.stopSession(session.id, { source: 'stop_button' });
     while (!(await iterator.next()).done) {}
-    expect(await manager.listActiveInteractions(session.id)).toEqual([]);
+    assert.deepStrictEqual(await manager.listActiveInteractions(session.id), []);
   });
 
   test('reads a completed session back after a sandbox boundary allow', async () => {
@@ -10493,7 +12574,7 @@ describe('SessionManager permission mode updates', () => {
     const iterator = manager
       .sendMessage(session.id, { turnId: 'turn-1', text: 'hello' })
       [Symbol.asyncIterator]();
-    expect((await iterator.next()).value?.type).toBe('sandbox_boundary_request');
+    assert.strictEqual((await iterator.next()).value?.type, 'sandbox_boundary_request');
     await manager.respondToSandboxBoundary(session.id, {
       requestId: 'boundary-1',
       decision: 'allow',
@@ -10501,9 +12582,12 @@ describe('SessionManager permission mode updates', () => {
     while (!(await iterator.next()).done) {}
 
     const messages = await manager.getMessages(session.id);
-    expect(messages.some((message) => message.type === 'user')).toBe(true);
+    assert.strictEqual(
+      messages.some((message) => message.type === 'user'),
+      true,
+    );
     const turns = await manager.listTurns(session.id);
-    expect(turns.find((turn) => turn.turnId === 'turn-1')?.status).toBe('completed');
+    assert.strictEqual(turns.find((turn) => turn.turnId === 'turn-1')?.status, 'completed');
   });
 
   // The next unclaimed control fact must not repeat #1607. A complete ledger
@@ -10533,20 +12617,21 @@ describe('SessionManager permission mode updates', () => {
     }
 
     const messages = await manager.getMessages(session.id);
-    expect(messages.filter((message) => message.type === 'user').length).toBe(1);
-    expect(
+    assert.strictEqual(messages.filter((message) => message.type === 'user').length, 1);
+    assert.strictEqual(
       messages.some((message) => message.type === 'assistant' && message.text === 'hi back'),
-    ).toBe(true);
+      true,
+    );
     const turns = await manager.listTurns(session.id);
-    expect(turns.find((turn) => turn.turnId === 'turn-1')?.status).toBe('completed');
+    assert.strictEqual(turns.find((turn) => turn.turnId === 'turn-1')?.status, 'completed');
 
     const view = await new RuntimeReadModel({
-      runStore,
       runtimeEventStore: runStore,
     }).getSessionView(session.id);
-    expect(
+    assert.strictEqual(
       view.diagnostics.filter((diagnostic) => diagnostic.code === 'unclaimed_control_fact').length,
-    ).toBe(1);
+      1,
+    );
   });
 
   // The counterpart of the soft case, at the caller that enforces the policy:
@@ -10574,8 +12659,8 @@ describe('SessionManager permission mode updates', () => {
       // drain
     }
 
-    const [run] = await runStore.listSessionRuns(session.id);
-    await runStore.appendRuntimeEvent(
+    const [run] = await runStore.listSessionInvocations(session.id);
+    runStore.seedRuntimeEvent(
       session.id,
       run!.runId,
       runtimeEvent({
@@ -10591,7 +12676,7 @@ describe('SessionManager permission mode updates', () => {
     );
 
     await assert.rejects(
-      new RuntimeReadModel({ runStore, runtimeEventStore: runStore }).getSessionView(session.id),
+      new RuntimeReadModel({ runtimeEventStore: runStore }).getSessionView(session.id),
       (error: unknown) =>
         error instanceof RuntimeReadModelError &&
         error.diagnostics.some((diagnostic) => diagnostic.code === 'unsupported_event'),
@@ -10622,11 +12707,11 @@ describe('SessionManager permission mode updates', () => {
 
     await drain(manager.sendMessage(session.id, { turnId: 'turn-1', text: 'hello' }));
 
-    const [turn] = await store.listTurns(session.id);
-    expect(turn?.status).toBe('failed');
-    expect(turn?.errorClass).toBe('runtime_error');
-    const [run] = await runStore.listSessionRuns(session.id);
-    expect(run?.failureClass).toBe('runtime_error');
+    const [turn] = await manager.listTurns(session.id);
+    assert.strictEqual(turn?.status, 'failed');
+    assert.strictEqual(turn?.errorClass, 'runtime_error');
+    const [run] = await runStore.listSessionInvocations(session.id);
+    assert.strictEqual(run && runtimeInvocationFailureClass(run), 'runtime_error');
   });
 
   test('marks an explicit step limit incomplete without blocking the session', async () => {
@@ -10649,18 +12734,18 @@ describe('SessionManager permission mode updates', () => {
 
     await drain(manager.sendMessage(session.id, { turnId: 'turn-1', text: 'hello' }));
 
-    expect((await store.readHeader(session.id)).status).toBe('active');
-    const [turn] = await store.listTurns(session.id);
-    expect(turn?.status).toBe('failed');
-    expect(turn?.errorClass).toBe('tool_step_cap_reached');
-    const [run] = await runStore.listSessionRuns(session.id);
-    expect(run?.status).toBe('failed');
-    expect(run?.failureClass).toBe('tool_step_cap_reached');
+    assert.strictEqual((await store.readHeader(session.id)).status, 'active');
+    const [turn] = await manager.listTurns(session.id);
+    assert.strictEqual(turn?.status, 'failed');
+    assert.strictEqual(turn?.errorClass, 'tool_step_cap_reached');
+    const [run] = await runStore.listSessionInvocations(session.id);
+    assert.strictEqual(run && runtimeInvocationOutcome(run), 'failed');
+    assert.strictEqual(run && runtimeInvocationFailureClass(run), 'tool_step_cap_reached');
     const terminal = (await runStore.readRuntimeEvents(session.id, run!.runId)).find(
       (event) => event.actions?.endInvocation,
     );
-    expect(terminal?.status).toBe('failed');
-    expect(terminal?.actions?.stateDelta).toMatchObject({
+    assert.strictEqual(terminal?.status, 'failed');
+    assert.partialDeepStrictEqual(terminal?.actions?.stateDelta, {
       stopReason: 'step_limit',
       failureClass: 'tool_step_cap_reached',
     });
@@ -10668,6 +12753,7 @@ describe('SessionManager permission mode updates', () => {
 
   test('does not let a late complete event overwrite a prior turn error', async () => {
     const store = new MemorySessionStore();
+    const runStore = new MemoryAgentRunStore();
     const backends = new BackendRegistry();
     backends.register(
       'ai-sdk',
@@ -10677,29 +12763,44 @@ describe('SessionManager permission mode updates', () => {
           { type: 'complete', stopReason: 'end_turn' },
         ]),
     );
-    const manager = new SessionManager({ store, backends, newId: nextId(), now: nextNow(10_500) });
+    const manager = new SessionManager({
+      store,
+      runStore,
+      runtimeEventStore: runStore,
+      backends,
+      newId: nextId(),
+      now: nextNow(10_500),
+    });
     const session = await manager.createSession(makeInput());
 
     await drain(manager.sendMessage(session.id, { turnId: 'turn-1', text: 'hello' }));
 
-    const states = (await store.readMessages(session.id)).filter(
+    const states = (await manager.getMessages(session.id)).filter(
       (message) => message.type === 'turn_state' && message.turnId === 'turn-1',
     );
-    expect(states.map((state) => (state.type === 'turn_state' ? state.status : ''))).toEqual([
-      'running',
-      'failed',
-    ]);
-    const [turn] = await store.listTurns(session.id);
-    expect(turn?.status).toBe('failed');
-    expect(turn?.errorClass).toBe('tool_failed');
+    assert.deepStrictEqual(
+      states.map((state) => (state.type === 'turn_state' ? state.status : '')),
+      ['failed'],
+    );
+    const [turn] = await manager.listTurns(session.id);
+    assert.strictEqual(turn?.status, 'failed');
+    assert.strictEqual(turn?.errorClass, 'tool_failed');
   });
 
   test('stopSession records renderer abort source for diagnostics', async () => {
     const store = new MemorySessionStore();
+    const runStore = new MemoryAgentRunStore();
     const backends = new BackendRegistry();
     const gate = makeGate();
     backends.register('ai-sdk', (ctx) => new TestBackend(ctx, gate));
-    const manager = new SessionManager({ store, backends, newId: nextId(), now: nextNow(12_500) });
+    const manager = new SessionManager({
+      store,
+      runStore,
+      runtimeEventStore: runStore,
+      backends,
+      newId: nextId(),
+      now: nextNow(12_500),
+    });
     const session = await manager.createSession(makeInput());
 
     const iterator = manager
@@ -10708,15 +12809,9 @@ describe('SessionManager permission mode updates', () => {
     await iterator.next();
     await manager.stopSession(session.id, { source: 'stop_button' });
 
-    const [turn] = await store.listTurns(session.id);
-    expect(turn?.status).toBe('aborted');
-    expect(turn?.abortSource).toBe('renderer.stop_button');
-    const abortNote = (await store.readMessages(session.id)).find(
-      (message) => message.type === 'system_note' && message.kind === 'abort',
-    );
-    expect(abortNote?.type).toBe('system_note');
-    if (abortNote?.type !== 'system_note') throw new Error('abort note missing');
-    expect(abortNote.data).toEqual({ source: 'renderer.stop_button' });
+    const [turn] = await manager.listTurns(session.id);
+    assert.strictEqual(turn?.status, 'aborted');
+    assert.strictEqual(turn?.abortSource, 'renderer.stop_button');
   });
 
   test('stopSession persists abortSource on a terminal RuntimeEvent emitted during backend stop', async () => {
@@ -10745,30 +12840,33 @@ describe('SessionManager permission mode updates', () => {
     const pendingAbort = iterator.next();
     const stopPromise = manager.stopSession(session.id, { source: 'stop_button' });
     const abort = await pendingAbort;
-    expect(abort.value?.type).toBe('abort');
+    assert.strictEqual(abort.value?.type, 'abort');
     backend?.allowStopReturn();
     await stopPromise;
     while (!(await iterator.next()).done) {}
 
-    const [run] = await runStore.listSessionRuns(session.id);
+    const [run] = await runStore.listSessionInvocations(session.id);
     const runtimeEvents = await runStore.readRuntimeEvents(session.id, run!.runId);
     const terminalEvents = runtimeEvents.filter((event) => event.status === 'aborted');
-    expect(terminalEvents).toHaveLength(1);
-    expect(terminalEvents[0]?.actions?.stateDelta?.abortSource).toBe('renderer.stop_button');
+    assert.strictEqual(terminalEvents.length, 1);
+    assert.strictEqual(terminalEvents[0]?.actions?.stateDelta?.abortSource, 'renderer.stop_button');
     const messages = await manager.getMessages(session.id);
-    expect(messages.some((message) => message.type === 'user' && message.turnId === 'turn-1')).toBe(
+    assert.strictEqual(
+      messages.some((message) => message.type === 'user' && message.turnId === 'turn-1'),
       true,
     );
-    expect(messages.find((message) => message.type === 'turn_state')).toEqual({
-      type: 'turn_state',
-      id: terminalEvents[0]?.id,
-      turnId: 'turn-1',
-      ts: 2,
-      status: 'aborted',
-      abortedAt: 2,
-      abortSource: 'renderer.stop_button',
-      partialOutputRetained: false,
-    });
+    assert.deepStrictEqual(
+      messages.find((message) => message.type === 'turn_state'),
+      {
+        type: 'turn_state',
+        id: terminalEvents[0]?.id,
+        turnId: 'turn-1',
+        ts: 2,
+        status: 'aborted',
+        abortedAt: 2,
+        abortSource: 'renderer.stop_button',
+      },
+    );
   });
 
   test('sendMessage does not emit or persist backend events after the first terminal event', async () => {
@@ -10798,29 +12896,37 @@ describe('SessionManager permission mode updates', () => {
     const emitted = await collectSessionEvents(
       manager.sendMessage(session.id, { turnId: 'turn-1', text: 'hello' }),
     );
-    const [run] = await runStore.listSessionRuns(session.id);
+    const [run] = await runStore.listSessionInvocations(session.id);
     const runtimeEvents = await runStore.readRuntimeEvents(session.id, run!.runId);
-    const turnStates = (await store.readMessages(session.id)).filter(
+    const turnStates = (await manager.getMessages(session.id)).filter(
       (message) =>
         message.type === 'turn_state' &&
         message.turnId === 'turn-1' &&
         message.status !== 'running',
     );
 
-    expect(emitted.map((event) => event.type)).toEqual(['text_delta', 'abort']);
-    expect(
+    assert.deepStrictEqual(
+      emitted.map((event) => event.type),
+      ['text_delta', 'abort'],
+    );
+    assert.deepStrictEqual(
       runtimeEvents
         .filter((event) => event.role === 'model' && event.content?.kind === 'text')
         .map((event) => (event.content?.kind === 'text' ? event.content.text : '')),
-    ).toEqual(['before']);
+      ['before'],
+    );
     const abortedEvents = runtimeEvents.filter((event) => event.status === 'aborted');
-    expect(abortedEvents).toHaveLength(1);
-    expect(abortedEvents[0]?.actions?.stateDelta?.abortSource).toBe('user_stop');
-    expect(run?.status).toBe('cancelled');
-    expect(run?.abortSource).toBe('user_stop');
-    expect(turnStates).toHaveLength(1);
-    expect(turnStates[0]?.type === 'turn_state' ? turnStates[0].status : undefined).toBe('aborted');
-    expect(turnStates[0]?.type === 'turn_state' ? turnStates[0].abortSource : undefined).toBe(
+    assert.strictEqual(abortedEvents.length, 1);
+    assert.strictEqual(abortedEvents[0]?.actions?.stateDelta?.abortSource, 'user_stop');
+    assert.strictEqual(run && runtimeInvocationOutcome(run), 'cancelled');
+    assert.strictEqual(run?.terminalEvent?.actions?.stateDelta?.abortSource, 'user_stop');
+    assert.strictEqual(turnStates.length, 1);
+    assert.strictEqual(
+      turnStates[0]?.type === 'turn_state' ? turnStates[0].status : undefined,
+      'aborted',
+    );
+    assert.strictEqual(
+      turnStates[0]?.type === 'turn_state' ? turnStates[0].abortSource : undefined,
       'user_stop',
     );
   });
@@ -10843,26 +12949,31 @@ describe('SessionManager permission mode updates', () => {
     const emitted = await collectSessionEvents(
       manager.sendMessage(session.id, { turnId: 'turn-1', text: 'hello' }),
     );
-    const [run] = await runStore.listSessionRuns(session.id);
+    const [run] = await runStore.listSessionInvocations(session.id);
     const runtimeEvents = await runStore.readRuntimeEvents(session.id, run!.runId);
-    const turnStates = (await store.readMessages(session.id)).filter(
+    const turnStates = (await manager.getMessages(session.id)).filter(
       (message) =>
         message.type === 'turn_state' &&
         message.turnId === 'turn-1' &&
         message.status !== 'running',
     );
 
-    expect(emitted.map((event) => event.type)).toEqual(['text_delta', 'complete']);
-    expect(run?.status).toBe('completed');
-    expect(
+    assert.deepStrictEqual(
+      emitted.map((event) => event.type),
+      ['text_delta', 'complete'],
+    );
+    assert.strictEqual(run && runtimeInvocationOutcome(run), 'completed');
+    assert.deepStrictEqual(
       runtimeEvents
         .filter((event) => event.role === 'model' && event.content?.kind === 'text')
         .map((event) => (event.content?.kind === 'text' ? event.content.text : '')),
-    ).toEqual(['before']);
-    expect(runtimeEvents.filter((event) => event.status === 'completed')).toHaveLength(1);
-    expect(runtimeEvents.filter((event) => event.status === 'failed')).toHaveLength(0);
-    expect(turnStates).toHaveLength(1);
-    expect(turnStates[0]?.type === 'turn_state' ? turnStates[0].status : undefined).toBe(
+      ['before'],
+    );
+    assert.strictEqual(runtimeEvents.filter((event) => event.status === 'completed').length, 1);
+    assert.strictEqual(runtimeEvents.filter((event) => event.status === 'failed').length, 0);
+    assert.strictEqual(turnStates.length, 1);
+    assert.strictEqual(
+      turnStates[0]?.type === 'turn_state' ? turnStates[0].status : undefined,
       'completed',
     );
   });
@@ -10894,16 +13005,13 @@ describe('SessionManager permission mode updates', () => {
     await iterator.next();
     await iterator.next();
 
-    expect((await store.readHeader(session.id)).status).toBe('aborted');
-    const [turn] = await store.listTurns(session.id);
-    expect(turn?.status).toBe('aborted');
-    expect(turn?.abortSource).toBe('renderer.stop_button');
-    const [run] = await runStore.listSessionRuns(session.id);
-    expect(run?.status).toBe('cancelled');
-    expect(run?.failureClass).toBeUndefined();
-    const events = (await runStore.readEvents(session.id, run!.runId)).map((event) => event.type);
-    expect(events).toContain('run_cancelled');
-    expect(events.includes('run_failed')).toBe(false);
+    assert.strictEqual((await store.readHeader(session.id)).status, 'aborted');
+    const [turn] = await manager.listTurns(session.id);
+    assert.strictEqual(turn?.status, 'aborted');
+    assert.strictEqual(turn?.abortSource, 'renderer.stop_button');
+    const [run] = await runStore.listSessionInvocations(session.id);
+    assert.strictEqual(run && runtimeInvocationOutcome(run), 'cancelled');
+    assert.strictEqual(run && runtimeInvocationFailureClass(run), undefined);
   });
 
   test('durable run ledger records lifecycle trace events and redacts obvious secrets', async () => {
@@ -10923,143 +13031,19 @@ describe('SessionManager permission mode updates', () => {
 
     await drain(manager.sendMessage(session.id, { turnId: 'turn-1', text: 'hello' }));
 
-    const [run] = await runStore.listSessionRuns(session.id);
-    expect(run?.backendKind).toBe('ai-sdk');
-    expect(run?.llmConnectionSlug).toBe('fake');
-    expect(run?.modelId).toBe('fake-model');
-    expect(run?.permissionMode).toBe('ask');
-    expect(run?.status).toBe('completed');
+    const [run] = await runStore.listSessionInvocations(session.id);
+    assert.partialDeepStrictEqual(run?.opening.route, {
+      provenance: 'unknown',
+      backendKind: 'ai-sdk',
+      llmConnectionSlug: 'fake',
+      modelId: 'fake-model',
+    });
+    assert.strictEqual(run?.opening.configuration.permissionMode, 'ask');
+    assert.strictEqual(run && runtimeInvocationOutcome(run), 'completed');
     const events = await runStore.readEvents(session.id, run!.runId);
-    expect(events.map((event) => event.type)).toContain('model_stream_started');
-    expect(events.map((event) => event.type)).toContain('model_stream_completed');
-    expect(events.map((event) => event.type)).toContain('run_completed');
-    expect(JSON.stringify(events).includes('sk-live-secret-token-value')).toBe(false);
-  });
-
-  test('required capture and later attempt still write after an attempt append fails', async () => {
-    const store = new MemorySessionStore();
-    const attemptFailureRecorded = makeGate();
-    const captureOutcomes: string[] = [];
-    let failAttemptOnce = true;
-    const runStore = new MemoryAgentRunStore({
-      beforeAgentRunEventAppend: async (_sessionId, _runId, event) => {
-        if (event.type === 'provider_request_attempt_recorded' && failAttemptOnce) {
-          failAttemptOnce = false;
-          throw new Error('diagnostic attempt append failed');
-        }
-        if (event.type === 'trace_write_failed') attemptFailureRecorded.release();
-      },
-    });
-    const backends = new BackendRegistry();
-    backends.register(
-      'ai-sdk',
-      (ctx) =>
-        new ProviderCaptureAfterAttemptFailureBackend(
-          ctx,
-          attemptFailureRecorded.promise,
-          captureOutcomes,
-        ),
-    );
-    const manager = new SessionManager({
-      store,
-      runStore,
-      runtimeEventStore: runStore,
-      backends,
-      newId: nextId(),
-      now: nextNow(12_762),
-    });
-    const session = await manager.createSession(makeInput());
-
-    await drain(manager.sendMessage(session.id, { turnId: 'turn-1', text: 'hello' }));
-
-    expect(captureOutcomes).toEqual(['fulfilled']);
-    const [run] = await runStore.listSessionRuns(session.id);
-    const events = await runStore.readEvents(session.id, run!.runId);
-    expect(events.some((event) => event.type === 'provider_request_captured')).toBe(true);
-    expect(events.some((event) => event.id === 'attempt-2')).toBe(true);
-  });
-
-  test('carries a provider attempt failure latch into the terminal run header', async () => {
-    const store = new MemorySessionStore();
-    let failAttemptAppend = true;
-    let failFailureLatch = true;
-    let failFailureSentinel = true;
-    const runStore = new MemoryAgentRunStore({
-      beforeAgentRunUpdate: async (_sessionId, _runId, patch) => {
-        if (patch.traceWriteError && failFailureLatch) {
-          failFailureLatch = false;
-          throw new Error('trace failure latch update failed');
-        }
-      },
-      beforeAgentRunEventAppend: async (_sessionId, _runId, event) => {
-        if (event.type === 'provider_request_attempt_recorded' && failAttemptAppend) {
-          failAttemptAppend = false;
-          throw new Error('provider attempt append failed');
-        }
-        if (event.type === 'trace_write_failed' && failFailureSentinel) {
-          failFailureSentinel = false;
-          throw new Error('trace failure sentinel append failed');
-        }
-      },
-    });
-    const backends = new BackendRegistry();
-    backends.register('ai-sdk', (ctx) => new ProviderRequestTraceBackend(ctx));
-    const manager = new SessionManager({
-      store,
-      runStore,
-      runtimeEventStore: runStore,
-      backends,
-      newId: nextId(),
-      now: nextNow(12_763),
-    });
-    const session = await manager.createSession(makeInput());
-
-    await drain(manager.sendMessage(session.id, { turnId: 'turn-1', text: 'hello' }));
-
-    const [run] = await runStore.listSessionRuns(session.id);
-    expect(run?.status).toBe('completed');
-    expect(run?.traceWriteError).toMatch(
-      /append provider request attempt: provider attempt append failed/,
-    );
-    const events = await runStore.readEvents(session.id, run!.runId);
-    expect(events.some((event) => event.type === 'trace_write_failed')).toBe(false);
-  });
-
-  test('finalizes the run when a required provider capture append fails', async () => {
-    const store = new MemorySessionStore();
-    let providerDispatches = 0;
-    let failCaptureOnce = true;
-    const runStore = new MemoryAgentRunStore({
-      beforeAgentRunEventAppend: async (_sessionId, _runId, event) => {
-        if (event.type === 'provider_request_captured' && failCaptureOnce) {
-          failCaptureOnce = false;
-          throw new Error('required capture append failed');
-        }
-      },
-    });
-    const backends = new BackendRegistry();
-    backends.register(
-      'ai-sdk',
-      (ctx) => new ProviderCaptureGateBackend(ctx, () => (providerDispatches += 1)),
-    );
-    const manager = new SessionManager({
-      store,
-      runStore,
-      runtimeEventStore: runStore,
-      backends,
-      newId: nextId(),
-      now: nextNow(12_764),
-    });
-    const session = await manager.createSession(makeInput());
-
-    await drain(manager.sendMessage(session.id, { turnId: 'turn-1', text: 'hello' })).catch(
-      () => {},
-    );
-
-    expect(providerDispatches).toBe(0);
-    const [run] = await runStore.listSessionRuns(session.id);
-    expect(run?.status).toBe('failed');
-    expect(run?.completedAt).toBeDefined();
+    assert.ok(events.map((event) => event.type).includes('model_stream_started'));
+    assert.ok(events.map((event) => event.type).includes('model_stream_completed'));
+    assert.strictEqual(JSON.stringify(events).includes('sk-live-secret-token-value'), false);
   });
 
   test('history compact cleanup includes continuation events without including child agent events', async () => {
@@ -11195,8 +13179,8 @@ describe('SessionManager permission mode updates', () => {
     );
     await cleanupCalled.promise;
 
-    expect(observedEventIds).toContain('cleanup-continuation-text');
-    expect(observedEventIds).not.toContain('cleanup-child-text');
+    assert.ok(observedEventIds.includes('cleanup-continuation-text'));
+    assert.ok(!observedEventIds.includes('cleanup-child-text'));
   });
 
   test('persists an explicit same-coverage successor checkpoint', async () => {
@@ -11225,31 +13209,32 @@ describe('SessionManager permission mode updates', () => {
       manager.sendMessage(session.id, { turnId: 'same-coverage-replacement', text: 'hello again' }),
     );
 
-    expect(writeOutcomes).toEqual([
+    assert.deepStrictEqual(writeOutcomes, [
       'same-coverage-initial:fulfilled',
       'same-coverage-replacement:fulfilled',
     ]);
     const checkpoints: HistoryCompactCheckpoint[] = [];
-    for (const run of await runStore.listSessionRuns(session.id)) {
+    for (const run of await runStore.listSessionInvocations(session.id)) {
       for (const event of await runStore.readEvents(session.id, run.runId)) {
         if (event.type === 'history_compact_checkpoint_recorded') {
           checkpoints.push(event.data?.checkpoint as HistoryCompactCheckpoint);
         }
       }
     }
-    expect(checkpoints).toHaveLength(2);
-    expect(checkpoints[1]?.previousCheckpointId).toBe(checkpoints[0]?.checkpointId);
-    expect(checkpoints[1]?.coverage).toEqual(checkpoints[0]?.coverage);
+    assert.strictEqual(checkpoints.length, 2);
+    assert.strictEqual(checkpoints[1]?.previousCheckpointId, checkpoints[0]?.checkpointId);
+    assert.deepStrictEqual(checkpoints[1]?.coverage, checkpoints[0]?.coverage);
   });
 
   test('rejects checkpoint recording after the current AgentRun store becomes unavailable', async () => {
     const store = new MemorySessionStore();
-    const runStoreUnavailable = makeGate();
     const writeOutcomes: string[] = [];
+    // The store goes unavailable partway through the run, right before the
+    // checkpoint write asks it for anything.
+    let runStoreUnavailable = false;
     const runStore = new MemoryAgentRunStore({
-      beforeAgentRunEventAppend: async (_sessionId, _runId, event) => {
-        if (event.type === 'run_started') throw new Error('run ledger append failed');
-        if (event.type === 'trace_write_failed') runStoreUnavailable.release();
+      beforeAgentRunEventAppend: async () => {
+        if (runStoreUnavailable) throw new Error('run ledger append failed');
       },
     });
     const backends = new BackendRegistry();
@@ -11258,7 +13243,9 @@ describe('SessionManager permission mode updates', () => {
       (ctx) =>
         new CheckpointRecorderContractProbeBackend(
           ctx,
-          async () => runStoreUnavailable.promise,
+          async () => {
+            runStoreUnavailable = true;
+          },
           writeOutcomes,
         ),
     );
@@ -11274,7 +13261,7 @@ describe('SessionManager permission mode updates', () => {
 
     await drain(manager.sendMessage(session.id, { turnId: 'store-unavailable', text: 'hello' }));
 
-    expect(writeOutcomes).toEqual(['store-unavailable:rejected']);
+    assert.deepStrictEqual(writeOutcomes, ['store-unavailable:rejected']);
   });
 
   test('recovers a missing projection before rejecting a shorter cold-start checkpoint', async () => {
@@ -11312,8 +13299,7 @@ describe('SessionManager permission mode updates', () => {
           content: { kind: 'text', text: `source ${index}` },
         }),
       ),
-      summary: 'durable checkpoint before projection loss',
-      summaryFormat: 'legacy_freeform',
+      summary: sectionedSummary('durable checkpoint before projection loss'),
     });
     const durableEvent = makeRunEvent({
       sessionId: session.id,
@@ -11341,10 +13327,10 @@ describe('SessionManager permission mode updates', () => {
       }),
     );
 
-    expect(writeOutcomes).toEqual(['cold-stale-after-projection-loss:rejected']);
-    expect(runStore.repairedProjection?.id).toBe(durableEvent.id);
+    assert.deepStrictEqual(writeOutcomes, ['cold-stale-after-projection-loss:rejected']);
+    assert.strictEqual(runStore.repairedProjection?.id, durableEvent.id);
     const checkpointCoverage: number[] = [];
-    for (const run of await runStore.listSessionRuns(session.id)) {
+    for (const run of await runStore.listSessionInvocations(session.id)) {
       for (const event of await runStore.readEvents(session.id, run.runId)) {
         if (event.type === 'history_compact_checkpoint_recorded') {
           checkpointCoverage.push(
@@ -11353,14 +13339,22 @@ describe('SessionManager permission mode updates', () => {
         }
       }
     }
-    expect(checkpointCoverage).toEqual([10]);
+    assert.deepStrictEqual(checkpointCoverage, [10]);
   });
 
-  test('startup recovery marks persisted running turns as failed instead of leaving them stuck', async () => {
+  test('startup recovery unsticks a legacy transcript Session and its import settles the turns', async () => {
     const store = new MemorySessionStore();
+    const runStore = new MemoryAgentRunStore();
     const backends = new BackendRegistry();
     backends.register('ai-sdk', (ctx) => new TestBackend(ctx));
-    const manager = new SessionManager({ store, backends, newId: nextId(), now: nextNow(12_800) });
+    const manager = new SessionManager({
+      store,
+      runStore,
+      runtimeEventStore: runStore,
+      backends,
+      newId: nextId(),
+      now: nextNow(12_800),
+    });
     const running = await manager.createSession(makeInput({ status: 'running' }));
     const waiting = await manager.createSession(makeInput({ status: 'waiting_for_user' }));
     const activeStuck = await manager.createSession(makeInput({ status: 'active' }));
@@ -11375,7 +13369,6 @@ describe('SessionManager permission mode updates', () => {
         turnId: 'running-turn',
         ts: 11,
         status: 'running',
-        partialOutputRetained: false,
       },
     ]);
     await store.appendMessages(waiting.id, [
@@ -11386,7 +13379,6 @@ describe('SessionManager permission mode updates', () => {
         turnId: 'waiting-turn',
         ts: 21,
         status: 'running',
-        partialOutputRetained: false,
       },
     ]);
     await store.appendMessages(activeStuck.id, [
@@ -11403,7 +13395,6 @@ describe('SessionManager permission mode updates', () => {
         turnId: 'active-stuck-turn',
         ts: 31,
         status: 'running',
-        partialOutputRetained: false,
       },
     ]);
     await store.appendMessages(failedThenCompleted.id, [
@@ -11420,7 +13411,6 @@ describe('SessionManager permission mode updates', () => {
         turnId: 'failed-completed-turn',
         ts: 33,
         status: 'running',
-        partialOutputRetained: false,
       },
       {
         type: 'turn_state',
@@ -11429,7 +13419,6 @@ describe('SessionManager permission mode updates', () => {
         ts: 34,
         status: 'failed',
         errorClass: 'tool_failed',
-        partialOutputRetained: false,
       },
       {
         type: 'turn_state',
@@ -11437,7 +13426,6 @@ describe('SessionManager permission mode updates', () => {
         turnId: 'failed-completed-turn',
         ts: 35,
         status: 'completed',
-        partialOutputRetained: false,
       },
     ]);
     await store.appendMessages(activeDone.id, [
@@ -11448,76 +13436,61 @@ describe('SessionManager permission mode updates', () => {
         turnId: 'active-turn',
         ts: 31,
         status: 'completed',
-        partialOutputRetained: false,
       },
     ]);
 
+    // These Sessions predate the ledger: their transcript is all they have.
+    for (const seeded of [running, waiting, activeStuck, failedThenCompleted, activeDone]) {
+      store.markPreLedgerSession(seeded.id);
+    }
+
+    // Recovery owns only what it can still decide without a ledger: a header
+    // left mid-turn by a crash. Nothing here re-reads the transcript to guess a
+    // turn's outcome — the import below is the one path that converts it.
     const recovered = await manager.recoverInterruptedSessions();
 
-    expect(recovered).toEqual([running.id, waiting.id, activeStuck.id, failedThenCompleted.id]);
-    expect((await store.readHeader(running.id)).status).toBe('active');
-    expect((await store.readHeader(waiting.id)).status).toBe('active');
-    expect((await store.readHeader(activeStuck.id)).status).toBe('active');
-    expect((await store.readHeader(failedThenCompleted.id)).status).toBe('active');
-    expect((await store.readHeader(activeDone.id)).status).toBe('active');
-    const runningTurn = (await store.listTurns(running.id)).find(
-      (turn) => turn.turnId === 'running-turn',
+    assert.deepStrictEqual(recovered, [running.id, waiting.id]);
+    assert.strictEqual((await store.readHeader(running.id)).status, 'active');
+    assert.strictEqual((await store.readHeader(waiting.id)).status, 'active');
+    assert.strictEqual((await store.readHeader(activeStuck.id)).status, 'active');
+    assert.strictEqual((await store.readHeader(failedThenCompleted.id)).status, 'active');
+    assert.strictEqual((await store.readHeader(activeDone.id)).status, 'active');
+
+    const turnOf = async (sessionId: string, turnId: string) =>
+      (await manager.listTurns(sessionId)).find((turn) => turn.turnId === turnId);
+    // A turn the transcript never recorded an ending for converts to the
+    // failure it actually was, rather than to an inferred restart class.
+    for (const [sessionId, turnId] of [
+      [running.id, 'running-turn'],
+      [waiting.id, 'waiting-turn'],
+      [activeStuck.id, 'active-stuck-turn'],
+    ] as const) {
+      const turn = await turnOf(sessionId, turnId);
+      assert.strictEqual(turn?.status, 'failed');
+      assert.strictEqual(turn?.errorClass, 'missing_terminal_event');
+    }
+    // A recorded ending is imported as recorded, last state wins.
+    assert.strictEqual(
+      (await turnOf(failedThenCompleted.id, 'failed-completed-turn'))?.status,
+      'completed',
     );
-    const waitingTurn = (await store.listTurns(waiting.id)).find(
-      (turn) => turn.turnId === 'waiting-turn',
-    );
-    const activeStuckTurn = (await store.listTurns(activeStuck.id)).find(
-      (turn) => turn.turnId === 'active-stuck-turn',
-    );
-    const failedThenCompletedTurn = (await store.listTurns(failedThenCompleted.id)).find(
-      (turn) => turn.turnId === 'failed-completed-turn',
-    );
-    const activeTurn = (await store.listTurns(activeDone.id)).find(
-      (turn) => turn.turnId === 'active-turn',
-    );
-    expect(runningTurn?.status).toBe('failed');
-    expect(runningTurn?.errorClass).toBe('app_restarted');
-    expect(waitingTurn?.status).toBe('failed');
-    expect(waitingTurn?.errorClass).toBe('app_restarted');
-    expect(activeStuckTurn?.status).toBe('failed');
-    expect(activeStuckTurn?.errorClass).toBe('app_restarted');
-    expect(failedThenCompletedTurn?.status).toBe('failed');
-    expect(failedThenCompletedTurn?.errorClass).toBe('tool_failed');
-    expect(activeTurn?.status).toBe('completed');
+    assert.strictEqual((await turnOf(activeDone.id, 'active-turn'))?.status, 'completed');
   });
 
-  test('startup recovery derives the interrupted outcome sink from the runtime store', async () => {
+  test('startup recovery seals dispatched tools as unknown without inventing durable results', async () => {
     const store = new MemorySessionStore();
     const runStore = new MemoryAgentRunStore();
     const backends = new BackendRegistry();
     backends.register('ai-sdk', (ctx) => new TestBackend(ctx));
-    let sessionId = '';
-    let outcomeCommitFailuresRemaining = 3;
-    let outcomeCommitAttempts = 0;
-    const runtimeCommitSink: RuntimeCommitSink = {
-      commitToolPrepared: async () => {
-        throw new Error('not used during recovery');
-      },
-      commitToolOutcome: async (input) => {
-        outcomeCommitAttempts += 1;
-        if (outcomeCommitFailuresRemaining > 0) {
-          outcomeCommitFailuresRemaining -= 1;
-          throw new Error('transient outcome commit failure');
-        }
-        await runStore.appendRuntimeEvent(sessionId, 'run-1', input.runtimeEvent);
-        return { created: true, runtimeEventSeq: 4 };
-      },
-    };
     const manager = new SessionManager({
       store,
       runStore,
-      runtimeEventStore: Object.assign(runStore, runtimeCommitSink),
+      runtimeEventStore: runStore,
       backends,
       newId: nextId(),
       now: nextNow(12_825),
     });
     const session = await manager.createSession(makeInput({ status: 'running' }));
-    sessionId = session.id;
     await seedRunningTurn(store, session.id, 'turn-1');
     await seedRun(
       runStore,
@@ -11527,6 +13500,7 @@ describe('SessionManager permission mode updates', () => {
         turnId: 'turn-1',
         status: 'running',
         toolMode: 'code_mode',
+        toolBoundaryProtocol: 't1_after_preflight_v1',
       }),
       [
         makeRunEvent({
@@ -11538,7 +13512,7 @@ describe('SessionManager permission mode updates', () => {
         }),
       ],
     );
-    const code = { code: 'return await tools.Read({ path: "a.ts" })' };
+    const command = { command: 'echo interrupted' };
     await runStore.appendRuntimeEvent(
       session.id,
       'run-1',
@@ -11548,7 +13522,6 @@ describe('SessionManager permission mode updates', () => {
         role: 'user',
         author: 'user',
         content: { kind: 'text', text: 'inspect' },
-        actions: { runtimeProtocol: { toolBoundary: 't1_after_preflight_v1' } },
       }),
     );
     await runStore.appendRuntimeEvent(
@@ -11561,7 +13534,7 @@ describe('SessionManager permission mode updates', () => {
         author: 'agent',
         origin: 'provider',
         modelVisibility: 'visible',
-        content: { kind: 'function_call', id: 'exec-1', name: 'exec', args: code },
+        content: { kind: 'function_call', id: 'exec-1', name: 'Bash', args: command },
         refs: { operationId: 'outer-op', toolCallId: 'exec-1' },
       }),
     );
@@ -11576,8 +13549,8 @@ describe('SessionManager permission mode updates', () => {
             protocol: 't1_after_preflight_v1',
             operationId: 'outer-op',
             providerToolCallId: 'exec-1',
-            toolName: 'exec',
-            canonicalArgsHash: canonicalToolArgsHash('exec', code),
+            toolName: 'Bash',
+            canonicalArgsHash: canonicalToolArgsHash('Bash', command),
             recoveryMode: 'never_auto_retry',
           },
         },
@@ -11587,36 +13560,26 @@ describe('SessionManager permission mode updates', () => {
 
     await manager.recoverInterruptedSessions();
 
-    assert.equal((await runStore.readRun(session.id, 'run-1')).status, 'running');
-    assert.equal(outcomeCommitAttempts, 2);
+    const runtimeEvents = await runStore.readRuntimeEvents(session.id, 'run-1');
+    const recovery = resolveRuntimeRecovery(runtimeEvents);
     assert.equal(
-      (await runStore.readRuntimeEvents(session.id, 'run-1')).some(
-        (event) => event.content?.kind === 'function_response',
-      ),
+      runtimeEvents.some((event) => event.content?.kind === 'function_response'),
       false,
     );
-
-    await manager.recoverInterruptedSessions();
-
-    assert.equal(outcomeCommitAttempts, 4);
-    const runtimeEvents = await runStore.readRuntimeEvents(session.id, 'run-1');
-    const response = runtimeEvents.find(
-      (event) => event.content?.kind === 'function_response' && event.content.id === 'exec-1',
-    );
-    assert.equal(response?.content?.kind, 'function_response');
-    assert.equal(response?.content?.kind === 'function_response' && response.content.isError, true);
     assert.deepEqual(
-      response?.content?.kind === 'function_response' ? response.content.result : undefined,
-      {
-        kind: 'json',
-        value: {
-          kind: 'code_mode',
-          status: 'interrupted',
-          message: 'Code Mode execution was interrupted by runtime recovery.',
-        },
-      },
+      recovery.decisions.map(({ toolCallId, status, reason }) => ({
+        toolCallId,
+        status,
+        reason,
+      })),
+      [{ toolCallId: 'exec-1', status: 'indeterminate', reason: 'dispatch_without_response' }],
     );
-    assert.equal((await runStore.readRun(session.id, 'run-1')).status, 'failed');
+    const terminalEvent = runtimeEvents.find(isTerminalRuntimeEvent);
+    assert.equal(terminalEvent?.status, 'failed');
+    const invocation = await readInvocation(runStore, session.id, 'run-1');
+    assert.ok(invocation.terminalEvent);
+    assert.equal(runtimeInvocationFailureClass(invocation), 'outcome_unknown');
+    assert.equal(runtimeInvocationOutcome(invocation), 'failed');
   });
 
   test('startup recovery does not leave stale permission waits stuck', async () => {
@@ -11662,16 +13625,19 @@ describe('SessionManager permission mode updates', () => {
 
     await manager.recoverInterruptedSessions();
 
-    expect((await store.readHeader(session.id)).status).toBe('active');
-    const [turn] = await store.listTurns(session.id);
-    expect(turn?.status).toBe('failed');
+    assert.strictEqual((await store.readHeader(session.id)).status, 'active');
+    const [turn] = await manager.listTurns(session.id);
+    assert.strictEqual(turn?.status, 'failed');
     // This turn owned the pending request, so its failure names the closure
     // rather than the bare restart.
-    expect(turn?.errorClass).toBe('sandbox_boundary_closed_by_restart');
-    const [run] = await runStore.listSessionRuns(session.id);
-    expect(run?.status).toBe('failed');
-    expect(run?.failureClass).toBe('sandbox_boundary_closed_by_restart');
-    expect(await store.listPendingSandboxBoundaryRequests(session.id)).toEqual([]);
+    assert.strictEqual(turn?.errorClass, 'sandbox_boundary_closed_by_restart');
+    const [run] = await runStore.listSessionInvocations(session.id);
+    assert.strictEqual(run && runtimeInvocationOutcome(run), 'failed');
+    assert.strictEqual(
+      run && runtimeInvocationFailureClass(run),
+      'sandbox_boundary_closed_by_restart',
+    );
+    assert.deepStrictEqual(await store.listPendingSandboxBoundaryRequests(session.id), []);
   });
 
   test('startup recovery keeps the generic restart class for an answered boundary request', async () => {
@@ -11734,729 +13700,8 @@ describe('SessionManager permission mode updates', () => {
 
     await manager.recoverInterruptedSessions();
 
-    const [turn] = await store.listTurns(session.id);
-    expect(turn?.errorClass).toBe('app_restarted');
-  });
-
-  test('branchFromTurn marks side conversations without changing ordinary branches', async () => {
-    const store = new MemorySessionStore();
-    const runStore = new MemoryAgentRunStore();
-    const backends = new BackendRegistry();
-    backends.register(
-      'ai-sdk',
-      (ctx) => new EventBackend(ctx, [{ type: 'complete', stopReason: 'end_turn' }]),
-    );
-    const manager = new SessionManager({
-      store,
-      runStore,
-      runtimeEventStore: runStore,
-      backends,
-      newId: nextId(),
-      now: nextNow(15_500),
-    });
-    const session = await manager.createSession(makeInput({ name: 'Parent', labels: ['kept'] }));
-    await drain(manager.sendMessage(session.id, { turnId: 'source', text: 'context' }));
-
-    const ordinary = await manager.branchFromTurn(session.id, {
-      sourceTurnId: 'source',
-      name: 'Ordinary',
-    });
-    const side = await manager.branchFromTurn(session.id, {
-      sourceTurnId: 'source',
-      name: 'Side',
-      sideConversation: true,
-    });
-
-    expect(ordinary.labels).toEqual(['kept']);
-    expect(side.labels).toEqual(['kept', SIDE_CONVERSATION_SESSION_LABEL]);
-  });
-
-  test('conversation copies inherit the authoritative execution boundary', async () => {
-    const store = new AtomicBoundaryMemorySessionStore();
-    const runStore = new MemoryAgentRunStore();
-    const backends = new BackendRegistry();
-    backends.register(
-      'ai-sdk',
-      (ctx) => new EventBackend(ctx, [{ type: 'complete', stopReason: 'end_turn' }]),
-    );
-    const manager = new SessionManager({
-      store,
-      runStore,
-      runtimeEventStore: runStore,
-      backends,
-      newId: nextId(),
-      now: nextNow(15_050),
-    });
-    const boundaries: ExecutionBoundary[] = [
-      {
-        kind: 'managed',
-        revision: 4,
-        profile: applySandboxBoundaryExpansion(createWorkspaceWritePermissionProfile(), {
-          filesystem: {
-            entries: [{ path: '/approved/release.txt', access: 'write', scope: 'exact' }],
-          },
-        }),
-      },
-      { kind: 'external', revision: 3 },
-    ];
-
-    for (const [index, boundary] of boundaries.entries()) {
-      const source = await manager.createSession(makeInput({ name: `Source ${index}` }));
-      await drain(manager.sendMessage(source.id, { turnId: 'first', text: 'keep' }));
-      await drain(manager.sendMessage(source.id, { turnId: 'second', text: 'replace' }));
-      store.forceBoundary(source.id, boundary);
-
-      const branch = await manager.branchFromTurn(source.id, { sourceTurnId: 'first' });
-      const revision = await manager.reviseBeforeTurn(source.id, { sourceTurnId: 'second' });
-
-      for (const copy of [branch, revision]) {
-        expect(await store.readExecutionBoundary(copy.id)).toEqual({
-          ...boundary,
-          revision: 0,
-        });
-      }
-    }
-  });
-
-  test('branch and revision sessions rewrite tool operation authority facts', async () => {
-    const store = new MemorySessionStore();
-    const runStore = new MemoryAgentRunStore();
-    const backends = new BackendRegistry();
-    const manager = new SessionManager({
-      store,
-      runStore,
-      runtimeEventStore: runStore,
-      backends,
-      newId: nextId(),
-      now: nextNow(15_100),
-    });
-    const session = await manager.createSession(makeInput({ name: 'Authority source' }));
-    const header = await store.readHeader(session.id);
-    await seedRuntimeRun(
-      runStore,
-      makeRunHeader({
-        sessionId: session.id,
-        runId: 'authority-source-run',
-        turnId: 'authority-source-turn',
-        status: 'completed',
-        cwd: header.cwd,
-        createdAt: 1,
-        updatedAt: 3,
-        completedAt: 3,
-      }),
-      [
-        runtimeEvent({
-          id: 'authority-source-user',
-          sessionId: session.id,
-          invocationId: 'authority-source-invocation',
-          runId: 'authority-source-run',
-          turnId: 'authority-source-turn',
-          ts: 1,
-          role: 'user',
-          author: 'user',
-          content: { kind: 'text', text: 'authority-bearing history' },
-        }),
-        runtimeEvent({
-          id: 'authority-source-dispatch',
-          sessionId: session.id,
-          invocationId: 'authority-source-invocation',
-          runId: 'authority-source-run',
-          turnId: 'authority-source-turn',
-          ts: 2,
-          role: 'system',
-          author: 'system',
-          actions: {
-            toolDispatch: {
-              protocol: 't1_after_preflight_v1',
-              operationId: 'authority-operation',
-              providerToolCallId: 'authority-call',
-              toolName: 'Write',
-              canonicalArgsHash: `sha256:${'a'.repeat(64)}`,
-              recoveryMode: 'reconcile',
-            },
-          },
-          refs: { toolCallId: 'authority-call', operationId: 'authority-operation' },
-        }),
-        runtimeEvent({
-          id: 'authority-source-terminal',
-          sessionId: session.id,
-          invocationId: 'authority-source-invocation',
-          runId: 'authority-source-run',
-          turnId: 'authority-source-turn',
-          ts: 3,
-          status: 'completed',
-          actions: { endInvocation: true },
-        }),
-      ],
-    );
-    await seedRuntimeRun(
-      runStore,
-      makeRunHeader({
-        sessionId: session.id,
-        runId: 'authority-later-run',
-        turnId: 'authority-later-turn',
-        status: 'completed',
-        cwd: header.cwd,
-        createdAt: 4,
-        updatedAt: 5,
-        completedAt: 5,
-      }),
-      [
-        runtimeEvent({
-          id: 'authority-later-user',
-          sessionId: session.id,
-          invocationId: 'authority-later-invocation',
-          runId: 'authority-later-run',
-          turnId: 'authority-later-turn',
-          ts: 4,
-          role: 'user',
-          author: 'user',
-          content: { kind: 'text', text: 'later boundary' },
-        }),
-        runtimeEvent({
-          id: 'authority-later-terminal',
-          sessionId: session.id,
-          invocationId: 'authority-later-invocation',
-          runId: 'authority-later-run',
-          turnId: 'authority-later-turn',
-          ts: 5,
-          status: 'completed',
-          actions: { endInvocation: true },
-        }),
-      ],
-    );
-
-    const copies = [
-      await manager.branchFromTurn(session.id, {
-        sourceTurnId: 'authority-source-turn',
-        name: 'Tool branch',
-      }),
-      await manager.branchBeforeTurn(session.id, {
-        sourceTurnId: 'authority-later-turn',
-        name: 'Tool branch before later turn',
-      }),
-      await manager.reviseBeforeTurn(session.id, {
-        sourceTurnId: 'authority-later-turn',
-      }),
-    ];
-    for (const copy of copies) {
-      const [targetRun] = await runStore.listSessionRuns(copy.id);
-      assert.ok(targetRun);
-      const targetEvents = await runStore.readRuntimeEvents(copy.id, targetRun.runId);
-      const dispatch = targetEvents.find((event) => event.actions?.toolDispatch);
-      const targetOperationId = dispatch?.actions?.toolDispatch?.operationId;
-      assert.ok(targetOperationId);
-      assert.notEqual(targetOperationId, 'authority-operation');
-      assert.equal(dispatch?.refs?.operationId, targetOperationId);
-      assert.equal(targetRun.sessionId, copy.id);
-    }
-  });
-
-  test('fails before creating branch or revision sessions for child continuation authority', async () => {
-    const store = new MemorySessionStore();
-    const runStore = new MemoryAgentRunStore();
-    const manager = new SessionManager({
-      store,
-      runStore,
-      runtimeEventStore: runStore,
-      backends: new BackendRegistry(),
-      newId: nextId(),
-      now: nextNow(15_150),
-    });
-    const session = await manager.createSession(makeInput({ name: 'Legacy continuation' }));
-    const header = await store.readHeader(session.id);
-    await seedRuntimeRun(
-      runStore,
-      makeRunHeader({
-        sessionId: session.id,
-        runId: 'continuation-parent-run',
-        turnId: 'continuation-parent-turn',
-        status: 'completed',
-        cwd: header.cwd,
-        createdAt: 1,
-        updatedAt: 2,
-        completedAt: 2,
-      }),
-      [
-        runtimeEvent({
-          id: 'continuation-parent-user',
-          sessionId: session.id,
-          invocationId: 'continuation-parent-invocation',
-          runId: 'continuation-parent-run',
-          turnId: 'continuation-parent-turn',
-          ts: 1,
-          role: 'user',
-          author: 'user',
-          content: { kind: 'text', text: 'retain parent and child closure' },
-        }),
-        runtimeEvent({
-          id: 'continuation-parent-terminal',
-          sessionId: session.id,
-          invocationId: 'continuation-parent-invocation',
-          runId: 'continuation-parent-run',
-          turnId: 'continuation-parent-turn',
-          ts: 2,
-          status: 'completed',
-          actions: { endInvocation: true },
-        }),
-      ],
-    );
-    await seedRuntimeRun(
-      runStore,
-      makeRunHeader({
-        sessionId: session.id,
-        runId: 'legacy-continuation-run',
-        turnId: 'legacy-child-turn',
-        parentRunId: 'continuation-parent-run',
-        agentId: 'child-agent',
-        status: 'completed',
-        cwd: header.cwd,
-        continuationSource: {
-          sourceInvocationId: 'legacy-source-invocation',
-          sourceRunId: 'legacy-source-run',
-          sourceTurnId: 'legacy-source-turn',
-          sourceRuntimeEventHighWater: 1,
-        },
-        createdAt: 3,
-        updatedAt: 4,
-        completedAt: 4,
-      }),
-      [
-        runtimeEvent({
-          id: 'legacy-continuation-user',
-          sessionId: session.id,
-          invocationId: 'legacy-continuation-run',
-          runId: 'legacy-continuation-run',
-          turnId: 'legacy-child-turn',
-          ts: 3,
-          role: 'user',
-          author: 'user',
-          content: { kind: 'text', text: 'legacy continuation history' },
-        }),
-        runtimeEvent({
-          id: 'legacy-continuation-terminal',
-          sessionId: session.id,
-          invocationId: 'legacy-continuation-run',
-          runId: 'legacy-continuation-run',
-          turnId: 'legacy-child-turn',
-          ts: 4,
-          status: 'completed',
-          actions: { endInvocation: true },
-        }),
-      ],
-    );
-    await seedRuntimeRun(
-      runStore,
-      makeRunHeader({
-        sessionId: session.id,
-        runId: 'continuation-later-run',
-        turnId: 'continuation-later-turn',
-        status: 'completed',
-        cwd: header.cwd,
-        createdAt: 5,
-        updatedAt: 6,
-        completedAt: 6,
-      }),
-      [
-        runtimeEvent({
-          id: 'continuation-later-user',
-          sessionId: session.id,
-          invocationId: 'continuation-later-invocation',
-          runId: 'continuation-later-run',
-          turnId: 'continuation-later-turn',
-          ts: 5,
-          role: 'user',
-          author: 'user',
-          content: { kind: 'text', text: 'later boundary' },
-        }),
-        runtimeEvent({
-          id: 'continuation-later-terminal',
-          sessionId: session.id,
-          invocationId: 'continuation-later-invocation',
-          runId: 'continuation-later-run',
-          turnId: 'continuation-later-turn',
-          ts: 6,
-          status: 'completed',
-          actions: { endInvocation: true },
-        }),
-      ],
-    );
-
-    const attempts = [
-      () =>
-        manager.branchFromTurn(session.id, {
-          sourceTurnId: 'continuation-parent-turn',
-          name: 'Blocked child continuation branch',
-        }),
-      () =>
-        manager.branchBeforeTurn(session.id, {
-          sourceTurnId: 'continuation-later-turn',
-          name: 'Blocked child continuation branch before',
-        }),
-      () =>
-        manager.reviseBeforeTurn(session.id, {
-          sourceTurnId: 'continuation-later-turn',
-        }),
-    ];
-    for (const attempt of attempts) {
-      await expectRejects(attempt(), /typed identity rewriting/i);
-    }
-    expect((await store.list()).map((candidate) => candidate.id)).toEqual([session.id]);
-  });
-
-  test('hydrates an inherited running ShellRun with its source-session owner', async () => {
-    const store = new MemorySessionStore();
-    const runStore = new MemoryAgentRunStore();
-    const backends = new BackendRegistry();
-    const ref = 'maka://runtime/background-tasks/pty-parent';
-    const sourceSnapshot: ShellRunSnapshotResult = {
-      kind: 'shell_run',
-      ref,
-      mode: 'pty',
-      status: 'running',
-      cwd: '/tmp/workspace',
-      cmd: 'interactive',
-      startedAt: 1,
-      updatedAt: 2,
-      revision: 2,
-      output: {
-        mode: 'pty',
-        screen: 'ready',
-        scrollback: '',
-        cols: 80,
-        rows: 24,
-        cursor: { x: 5, y: 0, visible: true },
-        alternateScreen: false,
-        truncated: false,
-        redacted: false,
-      },
-    };
-    let ownerAvailable = true;
-    const shellRuns = {
-      async listSessionUpdates() {
-        return [];
-      },
-      async getSessionUpdate() {
-        return undefined;
-      },
-      async inspectResource(sessionId: string, candidateRef: string) {
-        if (ownerAvailable && candidateRef === ref && sessionId === 'session-1')
-          return sourceSnapshot;
-        const error = new Error('missing') as NodeJS.ErrnoException;
-        error.code = 'ENOENT';
-        throw error;
-      },
-    } as unknown as ShellRunProcessManager;
-    const manager = new SessionManager({
-      store,
-      runStore,
-      runtimeEventStore: runStore,
-      backends,
-      shellRuns,
-      newId: nextId(),
-      now: nextNow(15_250),
-    });
-    const parent = await manager.createSession(makeInput({ name: 'Parent' }));
-    await seedRuntimeRun(
-      runStore,
-      makeRunHeader({
-        sessionId: parent.id,
-        runId: 'source-run',
-        turnId: 'source',
-        status: 'completed',
-        createdAt: 1,
-        updatedAt: 4,
-        completedAt: 4,
-      }),
-      [
-        runtimeEvent({
-          id: 'user-1',
-          sessionId: parent.id,
-          runId: 'source-run',
-          turnId: 'source',
-          ts: 1,
-          role: 'user',
-          author: 'user',
-          content: { kind: 'text', text: 'start' },
-        }),
-        runtimeEvent({
-          id: 'call-1',
-          sessionId: parent.id,
-          runId: 'source-run',
-          turnId: 'source',
-          ts: 2,
-          role: 'model',
-          author: 'agent',
-          content: {
-            kind: 'function_call',
-            id: 'bash-1',
-            name: 'Bash',
-            args: { command: 'interactive', run_in_background: true, pty: true },
-          },
-          refs: { toolCallId: 'bash-1' },
-        }),
-        runtimeEvent({
-          id: 'result-1',
-          sessionId: parent.id,
-          runId: 'source-run',
-          turnId: 'source',
-          ts: 3,
-          role: 'tool',
-          author: 'tool',
-          content: {
-            kind: 'function_response',
-            id: 'bash-1',
-            name: 'Bash',
-            result: {
-              kind: 'shell_run',
-              ref,
-              mode: 'pty',
-              status: 'running',
-              cwd: '/tmp/workspace',
-              cmd: 'interactive',
-              startedAt: 1,
-              updatedAt: 1,
-              revision: 1,
-            },
-            isError: false,
-          },
-          refs: { toolCallId: 'bash-1' },
-        }),
-        runtimeEvent({
-          id: 'complete-1',
-          sessionId: parent.id,
-          runId: 'source-run',
-          turnId: 'source',
-          ts: 4,
-          role: 'system',
-          author: 'system',
-          status: 'completed',
-          actions: { endInvocation: true },
-        }),
-      ],
-    );
-    await seedRuntimeRun(
-      runStore,
-      makeRunHeader({
-        sessionId: parent.id,
-        runId: 'later-run',
-        turnId: 'later',
-        status: 'completed',
-        createdAt: 5,
-        updatedAt: 6,
-        completedAt: 6,
-      }),
-      [
-        runtimeEvent({
-          id: 'later-user',
-          sessionId: parent.id,
-          runId: 'later-run',
-          turnId: 'later',
-          ts: 5,
-          role: 'user',
-          author: 'user',
-          content: { kind: 'text', text: 'later' },
-        }),
-        runtimeEvent({
-          id: 'later-complete',
-          sessionId: parent.id,
-          runId: 'later-run',
-          turnId: 'later',
-          ts: 6,
-          role: 'system',
-          author: 'system',
-          status: 'completed',
-          actions: { endInvocation: true },
-        }),
-      ],
-    );
-    const child = await manager.branchFromTurn(parent.id, {
-      sourceTurnId: 'source',
-      name: 'Child',
-    });
-    const revision = await manager.reviseBeforeTurn(parent.id, { sourceTurnId: 'later' });
-
-    const updates = await manager.listShellRunUpdates(child.id);
-
-    expect(updates).toHaveLength(1);
-    expect(updates[0]?.sessionId).toBe(child.id);
-    expect(updates[0]?.ownership).toEqual({
-      kind: 'source_owned',
-      sourceSessionId: parent.id,
-      ownerSessionId: parent.id,
-    });
-    expect(updates[0]?.sourceToolCallId).toBe('bash-1');
-    expect(updates[0]?.result).toEqual(sourceSnapshot);
-    expect(await manager.getShellRunUpdate(child.id, sourceSnapshot.ref)).toEqual(updates[0]);
-    expect(
-      await manager.getShellRunUpdate(child.id, 'maka://runtime/background-tasks/missing-shell'),
-    ).toBeNull();
-
-    const revisionUpdates = await manager.listShellRunUpdates(revision.id);
-    expect(revisionUpdates).toHaveLength(1);
-    expect(revisionUpdates[0]?.ownership).toEqual({
-      kind: 'source_owned',
-      sourceSessionId: parent.id,
-      ownerSessionId: parent.id,
-    });
-    expect(revisionUpdates[0]?.result).toEqual(sourceSnapshot);
-
-    ownerAvailable = false;
-    await store.remove(parent.id);
-    const danglingUpdates = await manager.listShellRunUpdates(child.id);
-    expect(danglingUpdates).toHaveLength(1);
-    expect(danglingUpdates[0]?.sessionId).toBe(child.id);
-    expect(danglingUpdates[0]?.ownership).toEqual({
-      kind: 'source_unavailable',
-      sourceSessionId: parent.id,
-    });
-    expect(danglingUpdates[0]?.result.status).toBe('running');
-    expect(danglingUpdates[0]?.result.output).toBe(undefined);
-    expect(await manager.getShellRunUpdate(child.id, sourceSnapshot.ref)).toEqual(
-      danglingUpdates[0],
-    );
-  });
-
-  test('reviseBeforeTurn creates an in-conversation version without ordinary branch lineage', async () => {
-    const store = new MemorySessionStore();
-    const runStore = new MemoryAgentRunStore();
-    const backends = new BackendRegistry();
-    backends.register(
-      'ai-sdk',
-      (ctx) => new EventBackend(ctx, [{ type: 'complete', stopReason: 'end_turn' }]),
-    );
-    const manager = new SessionManager({
-      store,
-      runStore,
-      runtimeEventStore: runStore,
-      backends,
-      newId: nextId(),
-      now: nextNow(16_700),
-    });
-    const session = await manager.createSession(
-      makeInput({
-        name: 'Conversation',
-        projectId: 'project-1',
-        collaborationMode: 'plan',
-        orchestrationMode: 'swarm',
-      }),
-    );
-    await manager.setFlagged(session.id, true);
-    await drain(manager.sendMessage(session.id, { turnId: 'first', text: 'keep me' }));
-    await drain(manager.sendMessage(session.id, { turnId: 'second', text: 'replace me' }));
-
-    const version2 = await manager.reviseBeforeTurn(session.id, { sourceTurnId: 'second' });
-
-    expect(version2.name).toBe('Conversation');
-    expect(version2.projectId).toBe('project-1');
-    expect(version2.isFlagged).toBe(true);
-    expect(version2.collaborationMode).toBe('plan');
-    expect(version2.orchestrationMode).toBe('swarm');
-    expect(version2.parentSessionId).toBeUndefined();
-    expect(version2.branchOfTurnId).toBeUndefined();
-    expect(version2.revisionRootSessionId).toBe(session.id);
-    expect(version2.revisionParentSessionId).toBe(session.id);
-    expect(version2.revisionOfTurnId).toBe('second');
-    expect(version2.revisionIndex).toBe(2);
-    expect(version2.revisionState).toBe('preparing');
-    expect((await store.readHeader(version2.id)).collaborationMode).toBe('plan');
-    expect((await store.readHeader(version2.id)).orchestrationMode).toBe('swarm');
-    await drain(
-      manager.sendMessage(
-        version2.id,
-        { turnId: 'edited-second', text: 'replacement' },
-        {
-          onRunStarted: async () => {
-            await manager.commitRevisionVersion(version2.id);
-          },
-        },
-      ),
-    );
-    expect((await store.readHeader(version2.id)).revisionState).toBe('committed');
-    const messages = await store.readMessages(version2.id);
-    expect(messages.some((message) => (message as { turnId?: string }).turnId === 'first')).toBe(
-      true,
-    );
-    expect(messages.some((message) => (message as { turnId?: string }).turnId === 'second')).toBe(
-      false,
-    );
-
-    const version3 = await manager.reviseBeforeTurn(version2.id, { sourceTurnId: 'first' });
-    expect(version3.projectId).toBe('project-1');
-    expect(version3.revisionRootSessionId).toBe(session.id);
-    expect(version3.revisionParentSessionId).toBe(version2.id);
-    expect(version3.revisionIndex).toBe(3);
-    expect(version3.revisionState).toBe('preparing');
-    expect(version3.parentSessionId).toBeUndefined();
-  });
-
-  test('startup recovery removes empty preparing revisions and commits admitted edits', async () => {
-    const store = new MemorySessionStore();
-    const runStore = new MemoryAgentRunStore();
-    const backends = new BackendRegistry();
-    backends.register(
-      'ai-sdk',
-      (ctx) => new EventBackend(ctx, [{ type: 'complete', stopReason: 'end_turn' }]),
-    );
-    const manager = new SessionManager({
-      store,
-      runStore,
-      runtimeEventStore: runStore,
-      backends,
-      newId: nextId(),
-      now: nextNow(16_900),
-    });
-    const root = await manager.createSession(makeInput({ name: 'Recovery root' }));
-    await drain(manager.sendMessage(root.id, { turnId: 'first', text: 'original' }));
-
-    const empty = await manager.reviseBeforeTurn(root.id, { sourceTurnId: 'first' });
-    expect(empty.revisionState).toBe('preparing');
-    await manager.recoverInterruptedSessions();
-    let removedError: unknown;
-    try {
-      await store.readHeader(empty.id);
-    } catch (error) {
-      removedError = error;
-    }
-    expect(removedError instanceof Error ? removedError.message : String(removedError)).toContain(
-      'Unknown session',
-    );
-
-    const admitted = await manager.reviseBeforeTurn(root.id, { sourceTurnId: 'first' });
-    await drain(manager.sendMessage(admitted.id, { turnId: 'edited', text: 'edited prompt' }));
-    expect((await store.readHeader(admitted.id)).revisionState).toBe('preparing');
-    await manager.recoverInterruptedSessions();
-    expect((await store.readHeader(admitted.id)).revisionState).toBe('committed');
-  });
-
-  test('branchBeforeTurn rejects an unknown turn', async () => {
-    const store = new MemorySessionStore();
-    const runStore = new MemoryAgentRunStore();
-    const backends = new BackendRegistry();
-    backends.register(
-      'ai-sdk',
-      (ctx) => new EventBackend(ctx, [{ type: 'complete', stopReason: 'end_turn' }]),
-    );
-    const manager = new SessionManager({
-      store,
-      runStore,
-      runtimeEventStore: runStore,
-      backends,
-      newId: nextId(),
-      now: nextNow(16_800),
-    });
-    const session = await manager.createSession(makeInput({ name: 'Parent' }));
-    await drain(manager.sendMessage(session.id, { turnId: 'only', text: 'the one prompt' }));
-
-    let branchError: unknown;
-    try {
-      await manager.branchBeforeTurn(session.id, { sourceTurnId: 'nope' });
-    } catch (error) {
-      branchError = error;
-    }
-    expect(branchError instanceof Error ? branchError.message : String(branchError)).toContain(
-      'Cannot branch before unknown turn',
-    );
+    const [turn] = await manager.listTurns(session.id);
+    assert.strictEqual(turn?.errorClass, 'app_restarted');
   });
 });
 
@@ -12464,13 +13709,6 @@ async function drainAll(iterable: AsyncIterable<SessionEvent>): Promise<SessionE
   const events: SessionEvent[] = [];
   for await (const event of iterable) events.push(event);
   return events;
-}
-
-async function waitUntil(predicate: () => boolean | Promise<boolean>): Promise<void> {
-  for (let i = 0; i < 500 && !(await predicate()); i += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 2));
-  }
-  expect(await predicate()).toBe(true);
 }
 
 /** Mock model: first request calls the Probe tool, second finishes with text. */
@@ -12528,7 +13766,6 @@ async function steeringDeliverySession(
     createTestAiSdkBackend({
       sessionId: ctx.sessionId,
       header: ctx.header,
-      appendMessage: async () => {},
       connection: {
         slug: 'mock-main',
         providerType: 'anthropic',
@@ -12591,7 +13828,7 @@ class GatedSteeringBackend implements AgentBackend {
     this.gates.set(input.turnId, gate);
     this.pullDone.set(input.turnId, afterPull);
     await gate.promise;
-    const leases = input.pullSteering?.() ?? [];
+    const leases = (await input.pullSteering?.()) ?? [];
     const record = this.pulls.get(input.turnId) ?? [];
     record.push(leases.map((lease) => lease.content.text));
     this.pulls.set(input.turnId, record);
@@ -12642,7 +13879,170 @@ class GatedSteeringBackend implements AgentBackend {
   async dispose(): Promise<void> {}
 }
 
+/**
+ * A Session with Plan authority whose active execution carries the given step
+ * statuses, plus the two writes the terminal settlement can make. Operation
+ * receipts stay empty here: the store that records them is exercised on its
+ * production implementation below.
+ */
+async function mountPlanSettlement(
+  sessionId: string,
+  steps: ReadonlyArray<readonly [string, PlanStepStatus]>,
+): Promise<{
+  manager: SessionManager;
+  sessionId: string;
+  updates: UpdatePlanExecutionInput[];
+  interrupts: Array<{ sessionId: string; reason: string; operationId: string | undefined }>;
+  runtimeKernel: DelegatingRuntimeKernel;
+}> {
+  const store = new MemorySessionStore();
+  const runtimeKernel = new DelegatingRuntimeKernel();
+  const updates: UpdatePlanExecutionInput[] = [];
+  const interrupts: Array<{
+    sessionId: string;
+    reason: string;
+    operationId: string | undefined;
+  }> = [];
+  const planState: PlanSessionState = {
+    ...emptyPlanSessionState(sessionId),
+    storeVersion: 2,
+    activeExecutionId: 'execution-1',
+    executions: [
+      {
+        executionId: 'execution-1',
+        planId: 'plan-1',
+        proposalId: 'proposal-1',
+        sessionId,
+        status: 'active',
+        steps: steps.map(([id, status], index) => ({
+          id,
+          title: `Step ${index + 1}`,
+          description: `Do step ${index + 1}.`,
+          status,
+          updatedAt: 2,
+        })),
+        startedAt: 1,
+        updatedAt: 2,
+      },
+    ],
+  };
+  const manager = new SessionManager({
+    store,
+    backends: new BackendRegistry(),
+    newId: nextId(),
+    now: nextNow(1),
+    runtimeKernel,
+    planStore: {
+      readState: async () => structuredClone(planState),
+      readOperationReceipt: async () => undefined,
+      interruptActiveExecution: async (target: string, reason: string, operationId?: string) => {
+        interrupts.push({ sessionId: target, reason, operationId });
+        return {
+          event: {
+            id: operationId ?? 'interrupt-operation',
+            sessionId: target,
+            ts: 3,
+            storeVersion: 3,
+            type: 'plan_execution_interrupted',
+            executionId: 'execution-1',
+            reason,
+          } satisfies PlanEvent,
+          state: { ...structuredClone(planState), activeExecutionId: undefined, storeVersion: 3 },
+        };
+      },
+      updateExecution: async (input: UpdatePlanExecutionInput) => {
+        updates.push(input);
+        return {
+          event: {
+            id: input.operationId ?? 'update-operation',
+            sessionId: input.sessionId,
+            ts: 3,
+            storeVersion: 3,
+            type: 'plan_execution_completed',
+            executionId: input.executionId,
+            steps: structuredClone(planState.executions[0]!.steps),
+          } satisfies PlanEvent,
+          state: { ...structuredClone(planState), activeExecutionId: undefined, storeVersion: 3 },
+        };
+      },
+    } as unknown as PlanStore,
+  });
+  await manager.createSession(makeInput());
+  return { manager, sessionId, updates, interrupts, runtimeKernel };
+}
+
+/**
+ * A production Plan store on a temporary storage root holding one approved
+ * proposal and the execution it started, plus the Session Manager that settles
+ * it. The settlement retry is keyed by the store's own operation receipt, so the
+ * cases that assert it run against the real store rather than a stub.
+ */
+async function mountRealPlanSettlement(): Promise<{
+  manager: SessionManager;
+  store: InteractivePlanStoreWriter;
+  sessionId: string;
+  executionId: string;
+  runtimeKernel: DelegatingRuntimeKernel;
+  close(): Promise<void>;
+}> {
+  const root = await mkdtemp(join(tmpdir(), 'maka-plan-settlement-'));
+  const capability = await resolveStorageRoot({ path: root, kind: 'interactive' });
+  const owner = await tryAcquireInteractiveRootOwner(capability);
+  assert.ok(owner, 'Unable to acquire the interactive storage root');
+  if (!owner) throw new Error('Unable to acquire the interactive storage root');
+  const store = await openInteractivePlanStoreForWrite(owner.lease);
+  const runtimeKernel = new DelegatingRuntimeKernel();
+  const manager = new SessionManager({
+    store: new MemorySessionStore(),
+    backends: new BackendRegistry(),
+    newId: nextId(),
+    now: nextNow(1),
+    runtimeKernel,
+    planStore: store,
+  });
+  const session = await manager.createSession(makeInput());
+  const submitted = await store.submitProposal({
+    sessionId: session.id,
+    turnId: 'turn-plan-1',
+    title: 'Ship the plan request',
+    steps: [
+      { id: 'step-1', title: 'Step 1', description: 'Do step 1.' },
+      { id: 'step-2', title: 'Step 2', description: 'Do step 2.' },
+    ],
+  });
+  assert.equal(submitted.event.type, 'plan_submitted');
+  const approved = await store.approveProposal({
+    sessionId: session.id,
+    proposalId: submitted.event.proposal.proposalId,
+    expectedRevision: submitted.event.proposal.revision,
+    expectedStoreVersion: submitted.state.storeVersion,
+    operationId: 'turn-plan-1',
+  });
+  assert.equal(approved.event.type, 'plan_approved');
+  return {
+    manager,
+    store,
+    sessionId: session.id,
+    executionId: approved.event.execution.executionId,
+    runtimeKernel,
+    close: async () => {
+      store.close();
+      await owner.close();
+      await rm(root, { recursive: true, force: true });
+    },
+  };
+}
+
 class DelegatingRuntimeKernel implements RuntimeKernelLike {
+  async *runCoordinationOperation(
+    _sessionId: string,
+    _input: Parameters<RuntimeKernelLike['startTurn']>[1],
+    _options: unknown,
+    execute: Parameters<RuntimeKernelLike['runCoordinationOperation']>[3],
+  ): AsyncIterable<SessionEvent> {
+    await execute();
+  }
+
   readonly starts: Array<{
     sessionId: string;
     input: Parameters<RuntimeKernelLike['startTurn']>[1];
@@ -12888,15 +14288,27 @@ class CountingFinalTextBackend extends FinalTextTestBackend {
 class CompactingTestBackend extends TestBackend {
   constructor(
     ctx: BackendFactoryContext,
-    private readonly compactCalls: Array<{ turnId: string; runtimeContextCount: number }>,
+    private readonly compactCalls: Array<{
+      turnId: string;
+      runtimeContextCount: number;
+      sourceRoutes?: Array<{ runId: string; connectionId?: string; modelId: string }>;
+    }>,
   ) {
     super(ctx);
   }
 
-  async compactHistory(input: { turnId: string; runtimeContext: readonly RuntimeEvent[] }) {
+  async compactHistory(input: BackendCompactHistoryInput) {
     this.compactCalls.push({
       turnId: input.turnId,
       runtimeContextCount: input.runtimeContext.length,
+      sourceRoutes: (input.runtimeContextInvocations ?? []).map((run) => ({
+        runId: run.runId,
+        ...(run.opening.route.provenance === 'runtime' &&
+        run.opening.route.backendKind !== 'plugin-executor'
+          ? { connectionId: run.opening.route.llmConnectionId }
+          : {}),
+        modelId: run.opening.route.modelId,
+      })),
     });
     return compactHistoryResult();
   }
@@ -12969,6 +14381,15 @@ class BlockingCompactBackend extends TestBackend {
 class FailOpenCompactingBackend extends TestBackend {
   async compactHistory(_input: { turnId: string; runtimeContext: readonly RuntimeEvent[] }) {
     return compactHistoryFailOpenResult();
+  }
+}
+
+class ThrowingCompactingBackend extends TestBackend {
+  async compactHistory(_input: {
+    turnId: string;
+    runtimeContext: readonly RuntimeEvent[];
+  }): Promise<never> {
+    throw new Error('backend compaction exploded');
   }
 }
 
@@ -13430,192 +14851,6 @@ class TraceBackend implements AgentBackend {
   async dispose(): Promise<void> {}
 }
 
-class ProviderRequestTraceBackend implements AgentBackend {
-  readonly kind = 'ai-sdk' as const;
-  readonly sessionId: string;
-
-  constructor(private readonly ctx: BackendFactoryContext) {
-    this.sessionId = ctx.sessionId;
-  }
-
-  async *send(input: BackendSendInput): AsyncIterable<SessionEvent> {
-    await this.ctx.recordProviderRequestCapture?.({
-      schemaVersion: 2,
-      traceId: 'provider-trace-1',
-      captureId: 'capture-1',
-      turnId: input.turnId,
-      step: 0,
-      providerId: 'fake',
-      modelId: 'fake-model',
-      requestHash: 'sha256:request',
-      requestPayloadWithoutProviderOptionsHash: 'sha256:shared-request',
-      requestBytes: 100,
-      segments: [],
-      artifactId: 'artifact-capture',
-    });
-    await this.ctx.recordProviderRequestAttempt?.({
-      traceId: 'provider-trace-1',
-      attemptId: 'attempt-1',
-      turnId: input.turnId,
-      step: 0,
-      attempt: 1,
-      captureId: 'capture-1',
-      captureArtifactId: 'artifact-capture',
-      providerId: 'fake',
-      modelId: 'fake-model',
-      requestHash: 'sha256:request',
-      requestBytes: 100,
-      segments: Array.from({ length: 75 }, (_, index) => ({
-        kind: 'message' as const,
-        index,
-        cacheable: true,
-        hash: `sha256:${index}`,
-        bytes: 1,
-      })),
-      startedAt: 1,
-      completedAt: 2,
-      status: 'completed',
-      finishReason: 'stop',
-      latencyMs: 1,
-    });
-    yield {
-      type: 'complete',
-      id: `${input.turnId}-complete`,
-      turnId: input.turnId,
-      ts: 3,
-      stopReason: 'end_turn',
-    };
-  }
-
-  async stop(): Promise<void> {}
-  async respondToSandboxBoundary(_decision: SandboxBoundaryResponse): Promise<void> {}
-  async dispose(): Promise<void> {}
-}
-
-class ProviderCaptureGateBackend implements AgentBackend {
-  readonly kind = 'ai-sdk' as const;
-  readonly sessionId: string;
-
-  constructor(
-    private readonly ctx: BackendFactoryContext,
-    private readonly dispatch: () => void,
-  ) {
-    this.sessionId = ctx.sessionId;
-  }
-
-  async *send(input: BackendSendInput): AsyncIterable<SessionEvent> {
-    await this.ctx.recordProviderRequestCapture?.({
-      schemaVersion: 2,
-      traceId: 'provider-trace-gated',
-      captureId: 'capture-gated',
-      turnId: input.turnId,
-      step: 0,
-      providerId: 'fake',
-      modelId: 'fake-model',
-      requestHash: 'sha256:gated',
-      requestPayloadWithoutProviderOptionsHash: 'sha256:shared-gated',
-      requestBytes: 100,
-      segments: [],
-      artifactId: 'artifact-gated',
-    });
-    this.dispatch();
-    yield {
-      type: 'complete',
-      id: `${input.turnId}-complete`,
-      turnId: input.turnId,
-      ts: 3,
-      stopReason: 'end_turn',
-    };
-  }
-
-  async stop(): Promise<void> {}
-  async respondToSandboxBoundary(_decision: SandboxBoundaryResponse): Promise<void> {}
-  async dispose(): Promise<void> {}
-}
-
-class ProviderCaptureAfterAttemptFailureBackend implements AgentBackend {
-  readonly kind = 'ai-sdk' as const;
-  readonly sessionId: string;
-
-  constructor(
-    private readonly ctx: BackendFactoryContext,
-    private readonly attemptFailureRecorded: Promise<void>,
-    private readonly captureOutcomes: string[],
-  ) {
-    this.sessionId = ctx.sessionId;
-  }
-
-  async *send(input: BackendSendInput): AsyncIterable<SessionEvent> {
-    await this.ctx.recordProviderRequestAttempt?.({
-      traceId: 'provider-trace-1',
-      attemptId: 'attempt-1',
-      turnId: input.turnId,
-      step: 0,
-      attempt: 1,
-      captureId: 'capture-1',
-      captureArtifactId: 'artifact-capture-1',
-      providerId: 'fake',
-      modelId: 'fake-model',
-      requestHash: 'sha256:request-1',
-      requestBytes: 100,
-      segments: [],
-      startedAt: 1,
-      completedAt: 2,
-      status: 'completed',
-      latencyMs: 1,
-    });
-    await this.attemptFailureRecorded;
-    try {
-      await this.ctx.recordProviderRequestCapture?.({
-        schemaVersion: 2,
-        traceId: 'provider-trace-1',
-        captureId: 'capture-2',
-        turnId: input.turnId,
-        step: 1,
-        providerId: 'fake',
-        modelId: 'fake-model',
-        requestHash: 'sha256:request-2',
-        requestPayloadWithoutProviderOptionsHash: 'sha256:shared-request-2',
-        requestBytes: 120,
-        segments: [],
-        artifactId: 'artifact-capture-2',
-      });
-      this.captureOutcomes.push('fulfilled');
-    } catch {
-      this.captureOutcomes.push('rejected');
-    }
-    await this.ctx.recordProviderRequestAttempt?.({
-      traceId: 'provider-trace-1',
-      attemptId: 'attempt-2',
-      turnId: input.turnId,
-      step: 1,
-      attempt: 1,
-      captureId: 'capture-2',
-      captureArtifactId: 'artifact-capture-2',
-      providerId: 'fake',
-      modelId: 'fake-model',
-      requestHash: 'sha256:request-2',
-      requestBytes: 120,
-      segments: [],
-      startedAt: 2,
-      completedAt: 3,
-      status: 'completed',
-      latencyMs: 1,
-    });
-    yield {
-      type: 'complete',
-      id: `${input.turnId}-complete`,
-      turnId: input.turnId,
-      ts: 3,
-      stopReason: 'end_turn',
-    };
-  }
-
-  async stop(): Promise<void> {}
-  async respondToSandboxBoundary(_decision: SandboxBoundaryResponse): Promise<void> {}
-  async dispose(): Promise<void> {}
-}
-
 class HistoryCompactCheckpointBackend implements AgentBackend {
   readonly kind = 'ai-sdk' as const;
   readonly sessionId: string;
@@ -13641,8 +14876,7 @@ class HistoryCompactCheckpointBackend implements AgentBackend {
           content: { kind: 'text', text: 'source' },
         },
       ],
-      summary: 'persist the bounded checkpoint',
-      summaryFormat: 'legacy_freeform',
+      summary: sectionedSummary('persist the bounded checkpoint'),
     });
     this.ctx.recordHistoryCompactCheckpoint?.(
       { ...checkpoint, checkpointId: 'hcheckpoint-test' },
@@ -13694,8 +14928,7 @@ class SameCoverageCheckpointReplacementProbeBackend implements AgentBackend {
         buildHistoryCompactCheckpoint({
           sessionId: this.sessionId,
           coveredRuntimeEvents,
-          summary: `${input.turnId} summary`,
-          summaryFormat: 'legacy_freeform',
+          summary: sectionedSummary(`${input.turnId} summary`),
           ...(current ? { previousCheckpointId: current.checkpointId } : {}),
         }),
         input.turnId,
@@ -13753,8 +14986,7 @@ class CheckpointRecorderContractProbeBackend implements AgentBackend {
         buildHistoryCompactCheckpoint({
           sessionId: this.sessionId,
           coveredRuntimeEvents,
-          summary: `${input.turnId} checkpoint`,
-          summaryFormat: 'legacy_freeform',
+          summary: sectionedSummary(`${input.turnId} checkpoint`),
         }),
         input.turnId,
       );
@@ -13779,17 +15011,24 @@ class CheckpointRecorderContractProbeBackend implements AgentBackend {
 class MemorySessionStore implements SessionStore {
   private headers = new Map<string, SessionHeader>();
   private messages = new Map<string, StoredMessage[]>();
-  private executionBoundaries = new Map<string, ExecutionBoundary>();
+  protected readonly executionBoundaries = new Map<string, ExecutionBoundary>();
   private sandboxBoundaryRequests = new Map<string, SandboxBoundaryRequest>();
   readonly failReadMessagesFor = new Set<string>();
   readonly failNextReadMessagesFor = new Map<string, number>();
   readonly failListTurnsFor = new Set<string>();
   readonly failUpdateHeaderFor = new Set<string>();
-  failNextAppendMessage: ((message: StoredMessage) => boolean) | undefined;
-  failAfterNextAppendMessage: ((message: StoredMessage) => boolean) | undefined;
   disposeCount = 0;
   nextReadHeaderGate: { started: Gate; release: Gate } | undefined;
   nextGraphOperatorProvisionGate: { started: Gate; release: Gate } | undefined;
+
+  /** A Session written before the header carried a transcript ledger version. */
+  markPreLedgerSession(sessionId: string): void {
+    const header = this.headers.get(sessionId);
+    if (!header) throw new Error(`Unknown session ${sessionId}`);
+    const { transcriptLedgerVersion: _version, ...legacy } = header;
+    void _version;
+    this.headers.set(sessionId, legacy);
+  }
 
   async createSubagent(
     input: CreateSessionInput,
@@ -13881,15 +15120,18 @@ class MemorySessionStore implements SessionStore {
       ...(input.revisionIndex !== undefined ? { revisionIndex: input.revisionIndex } : {}),
       ...(input.revisionState ? { revisionState: input.revisionState } : {}),
       hasUnread: false,
-      backend: 'ai-sdk',
+      backend: input.executorId ? 'plugin-executor' : 'ai-sdk',
+      ...(input.executorId ? { executorId: input.executorId } : {}),
       ...(input.llmConnectionId === undefined ? {} : { llmConnectionId: input.llmConnectionId }),
       llmConnectionSlug: input.llmConnectionSlug,
       connectionLocked: input.subagentParent !== undefined,
       model: input.model ?? 'fake-model',
       ...(input.thinkingLevel !== undefined ? { thinkingLevel: input.thinkingLevel } : {}),
       permissionMode: input.permissionMode,
+      ...(input.toolMode !== undefined ? { toolMode: input.toolMode } : {}),
       collaborationMode: input.collaborationMode ?? 'agent',
       orchestrationMode: input.orchestrationMode ?? 'default',
+      transcriptLedgerVersion: 1,
       schemaVersion: 1,
     };
     this.headers.set(header.id, header);
@@ -13901,31 +15143,6 @@ class MemorySessionStore implements SessionStore {
         : createGenesisExecutionBoundary(header.permissionMode),
     );
     return header;
-  }
-
-  async setExecutionBoundaryKind(
-    sessionId: string,
-    kind: 'managed' | 'bypass',
-    projection?: {
-      permissionMode: SessionHeader['permissionMode'];
-      labels?: readonly string[];
-    },
-  ) {
-    const current = await this.readHeader(sessionId);
-    const permissionMode =
-      projection?.permissionMode ??
-      (kind === 'bypass'
-        ? 'bypass'
-        : current.permissionMode === 'bypass'
-          ? 'ask'
-          : current.permissionMode);
-    await this.updateHeader(sessionId, {
-      permissionMode,
-      ...(projection?.labels ? { labels: [...projection.labels] } : {}),
-    });
-    const boundary = createGenesisExecutionBoundary(permissionMode);
-    this.executionBoundaries.set(sessionId, boundary);
-    return boundary;
   }
 
   async readExecutionBoundary(sessionId: string): Promise<ExecutionBoundary> {
@@ -13960,6 +15177,22 @@ class MemorySessionStore implements SessionStore {
     );
   }
 
+  async hasExplicitSandboxBoundaryDenial(
+    identities: readonly { sessionId: string; runId: string; turnId: string }[],
+  ): Promise<boolean> {
+    return [...this.sandboxBoundaryRequests.values()].some(
+      (request) =>
+        request.status === 'denied' &&
+        request.outcomeReason === 'client_denied' &&
+        identities.some(
+          (identity) =>
+            identity.sessionId === request.sessionId &&
+            identity.runId === request.runId &&
+            identity.turnId === request.turnId,
+        ),
+    );
+  }
+
   async settleSandboxBoundaryRequest(
     input: SettleSandboxBoundaryRequest,
   ): Promise<SandboxBoundarySettlement> {
@@ -13972,7 +15205,9 @@ class MemorySessionStore implements SessionStore {
             ...request,
             status: input.decision === 'allow' ? ('approved' as const) : ('denied' as const),
             settledAt: 2,
-            ...(input.closureReason ? { outcomeReason: input.closureReason } : {}),
+            ...(input.decision === 'deny'
+              ? { outcomeReason: input.closureReason ?? 'client_denied' }
+              : {}),
           }
         : request;
     this.sandboxBoundaryRequests.set(key, settled);
@@ -14015,6 +15250,23 @@ class MemorySessionStore implements SessionStore {
     return [...(this.messages.get(sessionId) ?? [])];
   }
 
+  async readMessagesAfter(
+    sessionId: string,
+    request: { afterSequence?: number; maxMessages: number },
+  ): Promise<{
+    records: readonly { sequence: number; message: StoredMessage }[];
+    highWaterSequence: number | null;
+  }> {
+    const all = await this.readMessages(sessionId);
+    return {
+      records: all
+        .map((message, sequence) => ({ sequence, message }))
+        .filter(({ sequence }) => sequence > (request.afterSequence ?? -1))
+        .slice(0, request.maxMessages),
+      highWaterSequence: all.length > 0 ? all.length - 1 : null,
+    };
+  }
+
   async listTurns(sessionId: string): Promise<TurnRecord[]> {
     if (this.failListTurnsFor.has(sessionId)) throw new Error(`Cannot list turns for ${sessionId}`);
     return deriveTurnRecords(await this.readMessages(sessionId));
@@ -14025,15 +15277,7 @@ class MemorySessionStore implements SessionStore {
   }
 
   async appendMessages(sessionId: string, messages: StoredMessage[]): Promise<void> {
-    if (this.failNextAppendMessage && messages.some(this.failNextAppendMessage)) {
-      this.failNextAppendMessage = undefined;
-      throw new Error('append message failed');
-    }
     this.messages.set(sessionId, [...(this.messages.get(sessionId) ?? []), ...messages]);
-    if (this.failAfterNextAppendMessage && messages.some(this.failAfterNextAppendMessage)) {
-      this.failAfterNextAppendMessage = undefined;
-      throw new Error('append message failed');
-    }
   }
 
   async updateHeader(sessionId: string, patch: Partial<SessionHeader>): Promise<SessionHeader> {
@@ -14062,7 +15306,16 @@ class MemorySessionStore implements SessionStore {
 
 class VersionedConfigurationMemorySessionStore extends MemorySessionStore {
   private readonly revisions = new Map<string, number>();
+  private readonly forcedBoundaries = new Map<string, ExecutionBoundary>();
   nextConfigurationUpdateGate: { started: Gate; release: Gate } | undefined;
+
+  forceBoundary(sessionId: string, boundary: ExecutionBoundary): void {
+    this.forcedBoundaries.set(sessionId, boundary);
+  }
+
+  override async readExecutionBoundary(sessionId: string): Promise<ExecutionBoundary> {
+    return this.forcedBoundaries.get(sessionId) ?? super.readExecutionBoundary(sessionId);
+  }
 
   override async create(
     input: CreateSessionInput,
@@ -14081,6 +15334,16 @@ class VersionedConfigurationMemorySessionStore extends MemorySessionStore {
     };
   }
 
+  override async updateHeader(
+    sessionId: string,
+    patch: Partial<SessionHeader>,
+  ): Promise<SessionHeader> {
+    if (Object.hasOwn(patch, 'permissionMode')) {
+      throw new Error('permissionMode must be projected by the configuration transition');
+    }
+    return super.updateHeader(sessionId, patch);
+  }
+
   async updateSessionConfiguration(
     sessionId: string,
     input: SessionConfigurationStoreUpdate,
@@ -14095,14 +15358,7 @@ class VersionedConfigurationMemorySessionStore extends MemorySessionStore {
     if (revision !== input.expectedVersion) {
       throw new Error('injected configuration revision conflict');
     }
-    await super.setExecutionBoundaryKind(
-      sessionId,
-      input.configuration.permissionMode === 'bypass' ? 'bypass' : 'managed',
-      {
-        permissionMode: input.configuration.permissionMode,
-        labels: input.configuration.labels,
-      },
-    );
+    // Only configuration authority may project permissionMode into the header.
     const header = await super.updateHeader(sessionId, {
       ...input.configuration,
       labels: [...input.configuration.labels],
@@ -14114,6 +15370,11 @@ class VersionedConfigurationMemorySessionStore extends MemorySessionStore {
           }
         : {}),
     });
+    this.executionBoundaries.set(
+      sessionId,
+      createGenesisExecutionBoundary(input.configuration.permissionMode),
+    );
+    this.forcedBoundaries.delete(sessionId);
     this.revisions.set(sessionId, revision + 1);
     return { header, revision: revision + 1, committedAt: revision + 1 };
   }
@@ -14127,82 +15388,9 @@ class VersionedConfigurationMemorySessionStore extends MemorySessionStore {
     if (revision !== expectedRevision) {
       throw new SessionConfigurationRevisionConflictError(expectedRevision, revision);
     }
-    const header = await super.updateHeader(sessionId, patch);
+    const header = await this.updateHeader(sessionId, patch);
     this.revisions.set(sessionId, revision + 1);
     return { header, revision: revision + 1, committedAt: revision + 1 };
-  }
-}
-
-class AtomicBoundaryMemorySessionStore extends MemorySessionStore {
-  failAppends = false;
-  readonly boundaryCalls: Array<{
-    sessionId: string;
-    kind: 'managed' | 'bypass';
-    projection:
-      | {
-          permissionMode: SessionHeader['permissionMode'];
-          labels?: readonly string[];
-        }
-      | undefined;
-  }> = [];
-  private readonly boundaries = new Map<string, ExecutionBoundary>();
-  private projectingBoundary = false;
-
-  forceBoundary(sessionId: string, boundary: ExecutionBoundary): void {
-    this.boundaries.set(sessionId, boundary);
-  }
-
-  override async readExecutionBoundary(sessionId: string): Promise<ExecutionBoundary> {
-    return this.boundaries.get(sessionId) ?? super.readExecutionBoundary(sessionId);
-  }
-
-  async setExecutionBoundaryKind(
-    sessionId: string,
-    kind: 'managed' | 'bypass',
-    projection?: {
-      permissionMode: SessionHeader['permissionMode'];
-      labels?: readonly string[];
-    },
-  ) {
-    this.boundaryCalls.push({ sessionId, kind, projection });
-    const current = await this.readHeader(sessionId);
-    const permissionMode =
-      projection?.permissionMode ??
-      (kind === 'bypass'
-        ? 'bypass'
-        : current.permissionMode === 'bypass'
-          ? 'ask'
-          : current.permissionMode);
-    this.projectingBoundary = true;
-    try {
-      await super.updateHeader(sessionId, {
-        permissionMode,
-        ...(projection?.labels ? { labels: [...projection.labels] } : {}),
-      });
-    } finally {
-      this.projectingBoundary = false;
-    }
-    const boundary = {
-      ...createGenesisExecutionBoundary(permissionMode),
-      revision: 1,
-    };
-    this.boundaries.set(sessionId, boundary);
-    return boundary;
-  }
-
-  override async updateHeader(
-    sessionId: string,
-    patch: Partial<SessionHeader>,
-  ): Promise<SessionHeader> {
-    if (!this.projectingBoundary && Object.hasOwn(patch, 'permissionMode')) {
-      throw new Error('permissionMode must be projected by the boundary transition');
-    }
-    return super.updateHeader(sessionId, patch);
-  }
-
-  override async appendMessage(sessionId: string, message: StoredMessage): Promise<void> {
-    if (this.failAppends) throw new Error('audit append failed');
-    return super.appendMessage(sessionId, message);
   }
 }
 
@@ -14212,9 +15400,9 @@ class MemoryAgentRunStore
   readonly continuationAuthorityCapability = RUNTIME_CONTINUATION_AUTHORITY_V1;
   listSessionRunsCalls = 0;
   readEventsCalls = 0;
-  private headers = new Map<string, AgentRunHeader>();
   private events = new Map<string, AgentRunEvent[]>();
   private runtimeEvents = new Map<string, RuntimeEvent[]>();
+  private runtimeEventEntries: RuntimeEvent[] = [];
   private continuationClaims = new Map<string, ContinuationClaimV1>();
   private continuationStartKinds = new Map<string, 'runtime_admission' | 'claim_repair'>();
   private runtimeEventAppendCount = 0;
@@ -14229,8 +15417,6 @@ class MemoryAgentRunStore
       failRuntimeEventAppendAfter?: number;
       failRuntimeEventReads?: boolean;
       failContinuationClaimReads?: boolean;
-      failUpdateRunOnce?: boolean;
-      failUpdateRunStatusOnce?: AgentRunHeader['status'];
       failContinuationCreate?: boolean;
       beforeListSessionRuns?: (sessionId: string) => Promise<void> | void;
       beforeRuntimeEventRead?: (sessionId: string, runId: string) => Promise<void> | void;
@@ -14240,68 +15426,14 @@ class MemoryAgentRunStore
         event: RuntimeEvent,
         options?: { durable?: boolean },
       ) => Promise<void> | void;
-      beforeRunRead?: (sessionId: string, runId: string) => Promise<void> | void;
       beforeAgentRunEventAppend?: (
         sessionId: string,
         runId: string,
         event: AgentRunEvent,
       ) => Promise<void> | void;
       beforeAgentRunEventRead?: (sessionId: string, runId: string) => Promise<void> | void;
-      beforeAgentRunUpdate?: (
-        sessionId: string,
-        runId: string,
-        patch: Partial<AgentRunHeader>,
-      ) => Promise<void> | void;
     } = {},
   ) {}
-
-  async createRun(header: AgentRunHeader): Promise<AgentRunHeader> {
-    if (this.options.failContinuationCreate && header.continuationSource) {
-      throw new Error('continuation claim create failed');
-    }
-    this.headers.set(key(header.sessionId, header.runId), { ...header });
-    return { ...header };
-  }
-
-  async updateRun(
-    sessionId: string,
-    runId: string,
-    patch: Partial<AgentRunHeader>,
-  ): Promise<AgentRunHeader> {
-    await this.options.beforeAgentRunUpdate?.(sessionId, runId, patch);
-    if (this.options.failUpdateRunOnce) {
-      this.options.failUpdateRunOnce = false;
-      throw new Error('update run failed');
-    }
-    if (patch.status && patch.status === this.options.failUpdateRunStatusOnce) {
-      this.options.failUpdateRunStatusOnce = undefined;
-      throw new Error('update run failed');
-    }
-    const current = await this.readRun(sessionId, runId);
-    const next = { ...current, ...patch, sessionId, runId };
-    this.headers.set(key(sessionId, runId), next);
-    return { ...next };
-  }
-
-  async readRun(sessionId: string, runId: string): Promise<AgentRunHeader> {
-    await this.options.beforeRunRead?.(sessionId, runId);
-    const header = this.headers.get(key(sessionId, runId));
-    if (!header) {
-      const error = new Error(`Unknown run ${runId}`) as NodeJS.ErrnoException;
-      error.code = 'ENOENT';
-      throw error;
-    }
-    return { ...header };
-  }
-
-  async listSessionRuns(sessionId: string): Promise<AgentRunHeader[]> {
-    this.listSessionRunsCalls += 1;
-    await this.options.beforeListSessionRuns?.(sessionId);
-    return Array.from(this.headers.values())
-      .filter((header) => header.sessionId === sessionId)
-      .sort((a, b) => a.createdAt - b.createdAt || a.runId.localeCompare(b.runId))
-      .map((header) => ({ ...header }));
-  }
 
   seedRootTurnAdmission(
     sessionId: string,
@@ -14315,7 +15447,12 @@ class MemoryAgentRunStore
     sessionId: string,
     turnId: string,
   ): Promise<
-    { runId: string; userMessageId: string | null; execution: RootExecutionDescriptor } | undefined
+    | {
+        runId: string;
+        userMessageId: string | null;
+        execution: RootExecutionDescriptor;
+      }
+    | undefined
   > {
     return this.rootTurnAdmissions.get(key(sessionId, turnId));
   }
@@ -14348,11 +15485,29 @@ class MemoryAgentRunStore
       this.options.failRuntimeEventAppendAfter = undefined;
       throw new Error('runtime event append failed');
     }
+    const existing = this.runtimeEvents.get(key(sessionId, runId)) ?? [];
+    // Same identity, same event: the store writes an id once, so a retry of an
+    // interrupted append lands on what is already there instead of a copy.
+    if (event.partial !== true && existing.some((candidate) => candidate.id === event.id)) return;
+    assertDoubleRunNotSealed(existing, event);
+    this.seedRuntimeEvent(sessionId, runId, event);
+  }
+
+  /**
+   * Put an event into the ledger underneath the seal.
+   *
+   * A test that needs a ledger shape the store would refuse to write has to
+   * assemble it below the store, not through the API whose contract forbids it.
+   */
+  seedRuntimeEvent(sessionId: string, runId: string, event: RuntimeEvent): void {
     const eventKey = key(sessionId, runId);
     this.runtimeEvents.set(eventKey, [
       ...(this.runtimeEvents.get(eventKey) ?? []),
       copyRuntimeEvent(event),
     ]);
+    if (event.partial !== true && !this.runtimeEventEntries.some(({ id }) => id === event.id)) {
+      this.runtimeEventEntries.push(copyRuntimeEvent(event));
+    }
   }
 
   async ensureTerminalRuntimeEventDurable(
@@ -14385,6 +15540,16 @@ class MemoryAgentRunStore
       .filter((event) => event.partial !== true)
       .map(copyRuntimeEvent);
   }
+
+  async readSessionRuntimeEventEntries(sessionId: string) {
+    return this.runtimeEventEntries
+      .filter((event) => event.sessionId === sessionId)
+      .map((event, index) => ({ ordinal: index + 1, event: copyRuntimeEvent(event) }));
+  }
+
+  // Ordinals here are positions in the append log, read off it every time, so
+  // there is nothing stored for a resequence to move.
+  async resequenceSessionEventOrdinals(_sessionId: string): Promise<void> {}
 
   replaceRuntimeEvent(
     sessionId: string,
@@ -14425,6 +15590,9 @@ class MemoryAgentRunStore
   }
 
   async claimContinuation(input: { claim: ContinuationClaimV1 }) {
+    if (this.options.failContinuationCreate) {
+      throw new Error('continuation claim create failed');
+    }
     const claim = decodeContinuationClaim(input.claim);
     const existing = this.continuationClaims.get(claim.boundaryDigest);
     if (existing) return { kind: 'existing' as const, claim: existing };
@@ -14523,6 +15691,15 @@ class MemoryAgentRunStore
     );
     return ordered.map((item) => item.event);
   }
+
+  async listSessionInvocations(sessionId: string): Promise<RuntimeInvocationRecord[]> {
+    this.listSessionRunsCalls += 1;
+    await this.options.beforeListSessionRuns?.(sessionId);
+    return runtimeInvocationsFromSessionEvents(
+      sessionId,
+      await this.readSessionRuntimeEvents(sessionId),
+    );
+  }
 }
 
 class ContinuationClaimBarrierRunStore extends MemoryAgentRunStore {
@@ -14549,8 +15726,8 @@ class ContinuationClaimBarrierRunStore extends MemoryAgentRunStore {
     this.releaseContinuationClaimReadWaiter?.();
   }
 
-  override async listSessionRuns(sessionId: string): Promise<AgentRunHeader[]> {
-    const snapshot = await super.listSessionRuns(sessionId);
+  override async listSessionInvocations(sessionId: string): Promise<RuntimeInvocationRecord[]> {
+    const snapshot = await super.listSessionInvocations(sessionId);
     if (!this.continuationClaimBarrierArmed) return snapshot;
     this.continuationClaimBarrierArmed = false;
     this.markContinuationClaimRead?.();
@@ -14656,23 +15833,13 @@ class ProviderRetryProgressBackend implements AgentBackend {
 }
 
 class ReverseOrderedAgentRunStore extends MemoryAgentRunStore {
-  override async listSessionRuns(sessionId: string): Promise<AgentRunHeader[]> {
-    return (await super.listSessionRuns(sessionId)).reverse();
+  override async listSessionInvocations(sessionId: string): Promise<RuntimeInvocationRecord[]> {
+    return (await super.listSessionInvocations(sessionId)).reverse();
   }
 }
 
 class OrderingAgentRunStore extends MemoryAgentRunStore {
   operations: string[] = [];
-
-  override async updateRun(
-    sessionId: string,
-    runId: string,
-    patch: Partial<AgentRunHeader>,
-  ): Promise<AgentRunHeader> {
-    const next = await super.updateRun(sessionId, runId, patch);
-    if (patch.status === 'completed') this.operations.push('completedRunHeader');
-    return next;
-  }
 
   override async appendRuntimeEvent(
     sessionId: string,
@@ -14691,10 +15858,15 @@ class MissingCheckpointProjectionAgentRunStore extends MemoryAgentRunStore {
     return undefined;
   }
 
+  async readEventLedgerRevision(): Promise<string> {
+    return 'missing-checkpoint-projection-test-revision';
+  }
+
   async repairEventProjection(
     _sessionId: string,
     _type: AgentRunEvent['type'],
     event: AgentRunEvent | null,
+    _options: { ifLedgerRevision: string; replaceEventId?: string },
   ): Promise<void> {
     this.repairedProjection = event;
   }
@@ -14702,6 +15874,7 @@ class MissingCheckpointProjectionAgentRunStore extends MemoryAgentRunStore {
 
 class MemoryRuntimeEventStore implements RuntimeEventStore {
   private runtimeEvents = new Map<string, RuntimeEvent[]>();
+  private runtimeEventEntries: RuntimeEvent[] = [];
 
   constructor(
     private readonly options: {
@@ -14712,11 +15885,25 @@ class MemoryRuntimeEventStore implements RuntimeEventStore {
 
   async appendRuntimeEvent(sessionId: string, runId: string, event: RuntimeEvent): Promise<void> {
     if (this.options.failRuntimeEventAppends) throw new Error('runtime event append failed');
+    assertDoubleRunNotSealed(this.runtimeEvents.get(key(sessionId, runId)) ?? [], event);
+    this.seedRuntimeEvent(sessionId, runId, event);
+  }
+
+  /**
+   * Put an event into the ledger underneath the seal.
+   *
+   * A test that needs a ledger shape the store would refuse to write has to
+   * assemble it below the store, not through the API whose contract forbids it.
+   */
+  seedRuntimeEvent(sessionId: string, runId: string, event: RuntimeEvent): void {
     const eventKey = key(sessionId, runId);
     this.runtimeEvents.set(eventKey, [
       ...(this.runtimeEvents.get(eventKey) ?? []),
       copyRuntimeEvent(event),
     ]);
+    if (event.partial !== true && !this.runtimeEventEntries.some(({ id }) => id === event.id)) {
+      this.runtimeEventEntries.push(copyRuntimeEvent(event));
+    }
   }
 
   async ensureTerminalRuntimeEventDurable(
@@ -14741,6 +15928,16 @@ class MemoryRuntimeEventStore implements RuntimeEventStore {
     return (this.runtimeEvents.get(key(sessionId, runId)) ?? []).map(copyRuntimeEvent);
   }
 
+  async readSessionRuntimeEventEntries(sessionId: string) {
+    return this.runtimeEventEntries
+      .filter((event) => event.sessionId === sessionId)
+      .map((event, index) => ({ ordinal: index + 1, event: copyRuntimeEvent(event) }));
+  }
+
+  // Ordinals here are positions in the append log, read off it every time, so
+  // there is nothing stored for a resequence to move.
+  async resequenceSessionEventOrdinals(_sessionId: string): Promise<void> {}
+
   async readSessionRuntimeEvents(sessionId: string): Promise<RuntimeEvent[]> {
     const ordered: Array<{ event: RuntimeEvent; runId: string; eventIndex: number }> = [];
     for (const [eventKey, events] of this.runtimeEvents.entries()) {
@@ -14758,6 +15955,13 @@ class MemoryRuntimeEventStore implements RuntimeEventStore {
         a.event.id.localeCompare(b.event.id),
     );
     return ordered.map((item) => item.event);
+  }
+
+  async listSessionInvocations(sessionId: string): Promise<RuntimeInvocationRecord[]> {
+    return runtimeInvocationsFromSessionEvents(
+      sessionId,
+      await this.readSessionRuntimeEvents(sessionId),
+    );
   }
 }
 
@@ -14801,7 +16005,7 @@ function hostedRootAuthority(): RuntimeHostedRootAuthority {
   return {
     bindRun: (identity) => ({
       ...identity,
-      pull: () => [],
+      pull: async () => [],
       ack: () => {},
       nack: () => {},
       release: () => {},
@@ -14816,6 +16020,7 @@ function hostedRootAuthority(): RuntimeHostedRootAuthority {
       }
     },
     stopRoot: async () => {},
+    stopRootRun: async () => {},
     stopSession: async () => {},
   };
 }
@@ -14828,6 +16033,25 @@ function makeInput(overrides: Partial<CreateSessionInput> = {}): CreateSessionIn
     permissionMode: 'ask',
     name: 'Session',
     labels: [],
+    ...overrides,
+  };
+}
+
+function configurationForHeader(
+  header: SessionHeader,
+  overrides: Partial<SessionConfigurationTransitionRequest['configuration']> = {},
+): SessionConfigurationTransitionRequest['configuration'] {
+  return {
+    backend: header.backend,
+    executorId: header.executorId,
+    ...(header.llmConnectionId === undefined ? {} : { llmConnectionId: header.llmConnectionId }),
+    llmConnectionSlug: header.llmConnectionSlug,
+    connectionLocked: header.connectionLocked,
+    model: header.model,
+    thinkingLevel: header.thinkingLevel,
+    permissionMode: header.permissionMode,
+    collaborationMode: header.collaborationMode ?? 'agent',
+    orchestrationMode: header.orchestrationMode ?? 'default',
     ...overrides,
   };
 }
@@ -14937,7 +16161,7 @@ function graphRunnableIntentForClaim(claim: AgentGraphIntentClaim): AgentGraphRu
   };
 }
 
-async function createQueuedGraphScenario(firstAbortSignal?: AbortSignal) {
+async function createQueuedGraphScenario(firstAbortSignal?: AbortSignal, successorGate?: Gate) {
   const store = new MemorySessionStore();
   const runStore = new MemoryAgentRunStore();
   const backends = new BackendRegistry();
@@ -14947,6 +16171,10 @@ async function createQueuedGraphScenario(firstAbortSignal?: AbortSignal) {
   let backend!: TestBackend;
   backends.register('ai-sdk', (ctx) => {
     backend = new (class extends TestBackend {
+      override async *send(input: BackendSendInput): AsyncIterable<SessionEvent> {
+        if (input.turnId === 'graph-turn-2') await successorGate?.promise;
+        yield* super.send(input);
+      }
       override async stop(
         reason: 'user_stop' | 'redirect',
         mode: BackendStopMode = 'immediate',
@@ -15034,7 +16262,7 @@ function testTool(name: string): MakaTool {
   };
 }
 
-function makeRunHeader(overrides: Partial<AgentRunHeader> = {}): AgentRunHeader {
+function makeRunHeader(overrides: Partial<TestRunHeader> = {}): TestRunHeader {
   return {
     runId: 'run-1',
     sessionId: 'session-1',
@@ -15051,10 +16279,244 @@ function makeRunHeader(overrides: Partial<AgentRunHeader> = {}): AgentRunHeader 
   };
 }
 
+/**
+ * The facts a test states about a run it is seeding.
+ *
+ * Deliberately not a stored record: `seedInvocationFromHeader` turns it into
+ * the opening fact and, when the test says the run ended, the terminal event
+ * that ends it. Nothing keeps this shape after the seed.
+ */
+interface TestRunHeader {
+  runId: string;
+  sessionId: string;
+  turnId: string;
+  invocationId?: string;
+  status: 'created' | 'running' | 'waiting_for_user' | 'completed' | 'failed' | 'cancelled';
+  backendKind: PersistedBackendKind;
+  llmConnectionId?: string;
+  llmConnectionSlug: string;
+  modelId: string;
+  providerStateIdentity?: `sha256:${string}`;
+  cwd: string;
+  workspaceIdentity?: string;
+  permissionMode: PermissionMode;
+  collaborationMode?: 'agent' | 'plan';
+  orchestrationMode?: 'default' | 'graph' | 'swarm';
+  orchestrationSource?: 'session' | 'turn_override';
+  agentSwarmAuthorization?: 'none' | 'session_mode' | 'turn_override';
+  toolMode?: ToolMode;
+  toolBoundaryProtocol?: 't1_after_preflight_v1';
+  createdAt: number;
+  updatedAt: number;
+  completedAt?: number;
+  failureClass?: string;
+  failureMessage?: string;
+  abortSource?: 'stop_button' | 'graph_supervisor';
+  goalId?: string;
+  scheduledTaskId?: string;
+  legacyAutomationId?: string;
+  agentGraphWakeId?: string;
+  agentGraphWakeAttemptId?: string;
+  parentRunId?: string;
+  parentTurnId?: string;
+  parentSessionId?: string;
+  resumedFromRunId?: string;
+  retriedFromRunId?: string;
+  retriedFromTurnId?: string;
+  regeneratedFromTurnId?: string;
+  branchOfTurnId?: string;
+  agentId?: string;
+  agentName?: string;
+  continuationSource?: {
+    sourceInvocationId: string;
+    sourceRunId: string;
+    sourceTurnId: string;
+    sourceRuntimeEventHighWater: number;
+    claimId?: string;
+    boundaryDigest?: `sha256:${string}`;
+  };
+}
+
+/** The root authority the seeded header names, defaulting to the user. */
+function testInvocationRoot(header: TestRunHeader): RuntimeInvocationRootAuthority {
+  if (header.goalId) return { kind: 'goal', goalId: header.goalId };
+  if (header.scheduledTaskId) {
+    return { kind: 'scheduled_task', scheduledTaskId: header.scheduledTaskId };
+  }
+  if (header.legacyAutomationId) {
+    return { kind: 'legacy_automation', legacyAutomationId: header.legacyAutomationId };
+  }
+  if (header.agentGraphWakeId && header.agentGraphWakeAttemptId) {
+    return {
+      kind: 'agent_graph_supervisor_wake',
+      wakeId: header.agentGraphWakeId,
+      attemptId: header.agentGraphWakeAttemptId,
+    };
+  }
+  return { kind: 'user' };
+}
+
+/** Everything the header says about lineage, with the absent edges left out. */
+function testInvocationLineage(header: TestRunHeader): RuntimeInvocationLineage {
+  return {
+    ...(header.parentRunId ? { parentRunId: header.parentRunId } : {}),
+    ...(header.parentTurnId ? { parentTurnId: header.parentTurnId } : {}),
+    ...(header.parentSessionId ? { parentSessionId: header.parentSessionId } : {}),
+    ...(header.resumedFromRunId ? { resumedFromRunId: header.resumedFromRunId } : {}),
+    ...(header.retriedFromRunId ? { retriedFromRunId: header.retriedFromRunId } : {}),
+    ...(header.retriedFromTurnId ? { retriedFromTurnId: header.retriedFromTurnId } : {}),
+    ...(header.regeneratedFromTurnId
+      ? { regeneratedFromTurnId: header.regeneratedFromTurnId }
+      : {}),
+    ...(header.branchOfTurnId ? { branchOfTurnId: header.branchOfTurnId } : {}),
+    ...(header.agentId ? { agentId: header.agentId } : {}),
+    ...(header.agentName ? { agentName: header.agentName } : {}),
+  };
+}
+
+function testInvocationOpening(header: TestRunHeader): RuntimeEventInvocationOpenedContent {
+  const lineage = testInvocationLineage(header);
+  return {
+    kind: 'invocation_opened',
+    protocol: 'invocation_opened_v1',
+    route:
+      header.llmConnectionId === undefined || header.backendKind === 'plugin-executor'
+        ? {
+            provenance: 'unknown',
+            backendKind: header.backendKind,
+            llmConnectionSlug: header.llmConnectionSlug,
+            modelId: header.modelId,
+          }
+        : {
+            provenance: 'runtime',
+            backendKind: header.backendKind,
+            llmConnectionId: header.llmConnectionId,
+            llmConnectionSlug: header.llmConnectionSlug,
+            modelId: header.modelId,
+            ...(header.providerStateIdentity
+              ? { providerStateIdentity: header.providerStateIdentity }
+              : {}),
+          },
+    configuration: {
+      cwd: header.cwd,
+      permissionMode: header.permissionMode,
+      collaborationMode: header.collaborationMode ?? 'agent',
+      orchestrationMode: header.orchestrationMode ?? 'default',
+      orchestrationSource: header.orchestrationSource ?? 'session',
+      toolMode: header.toolMode ?? DEFAULT_TOOL_MODE,
+      ...(header.agentSwarmAuthorization
+        ? { agentSwarmAuthorization: header.agentSwarmAuthorization }
+        : {}),
+      ...(header.workspaceIdentity ? { workspaceIdentity: header.workspaceIdentity } : {}),
+    },
+    root: testInvocationRoot(header),
+    source: header.continuationSource
+      ? { kind: 'continuation', ...header.continuationSource }
+      : { kind: 'fresh' },
+    ...(Object.keys(lineage).length > 0 ? { lineage } : {}),
+  };
+}
+
+/**
+ * Open the invocation the header describes, and close it when the header says
+ * the run ended. Seeding writes events because events are all there is.
+ */
+async function seedInvocationOpening(
+  store: Pick<RuntimeEventStore, 'appendRuntimeEvent'>,
+  header: TestRunHeader,
+): Promise<void> {
+  const opened = buildInvocationOpenedEvent({
+    id: `${header.runId}-invocation-opened`,
+    run: runIdentityOf(header),
+    openedAt: header.createdAt,
+    opening: testInvocationOpening(header),
+  });
+  await store.appendRuntimeEvent(header.sessionId, header.runId, {
+    ...opened,
+    ...(header.toolBoundaryProtocol
+      ? { actions: { runtimeProtocol: { toolBoundary: header.toolBoundaryProtocol } } }
+      : {}),
+  });
+}
+
+/** The one event that ends the run, when the header says the run ended. */
+async function seedInvocationTerminal(
+  store: Pick<RuntimeEventStore, 'appendRuntimeEvent'>,
+  header: TestRunHeader,
+): Promise<void> {
+  if (header.status !== 'completed' && header.status !== 'failed' && header.status !== 'cancelled')
+    return;
+  await store.appendRuntimeEvent(header.sessionId, header.runId, {
+    id: `${header.runId}-terminal`,
+    ...runIdentityOf(header),
+    ts: header.completedAt ?? header.updatedAt,
+    partial: false,
+    role: 'system',
+    author: 'system',
+    status: header.status === 'cancelled' ? 'aborted' : header.status,
+    // The failure class and abort source live where every reader looks for
+    // them: on the terminal event's own state delta.
+    actions: {
+      endInvocation: true,
+      ...(header.failureClass || header.abortSource
+        ? {
+            stateDelta: {
+              ...(header.failureClass ? { failureClass: header.failureClass } : {}),
+              ...(header.abortSource ? { abortSource: header.abortSource } : {}),
+            },
+          }
+        : {}),
+    },
+    ...(header.failureMessage
+      ? { content: { kind: 'error' as const, message: header.failureMessage } }
+      : {}),
+  });
+}
+
+function runIdentityOf(header: TestRunHeader): {
+  sessionId: string;
+  invocationId: string;
+  runId: string;
+  turnId: string;
+} {
+  return {
+    sessionId: header.sessionId,
+    invocationId: header.invocationId ?? header.runId,
+    runId: header.runId,
+    turnId: header.turnId,
+  };
+}
+
+async function seedInvocationFromHeader(
+  store: Pick<RuntimeEventStore, 'appendRuntimeEvent'>,
+  header: TestRunHeader,
+): Promise<TestRunHeader> {
+  await seedInvocationOpening(store, header);
+  await seedInvocationTerminal(store, header);
+  return header;
+}
+
+/** The one invocation that opened this run. */
+async function readInvocation(
+  store: Pick<RuntimeEventStore, 'listSessionInvocations'>,
+  sessionId: string,
+  runId: string,
+): Promise<RuntimeInvocationRecord> {
+  const found = (await store.listSessionInvocations(sessionId)).find(
+    (candidate) => candidate.runId === runId,
+  );
+  if (!found) {
+    const error = new Error(`Unknown run ${runId}`) as NodeJS.ErrnoException;
+    error.code = 'ENOENT';
+    throw error;
+  }
+  return found;
+}
+
 function makeRunEvent(overrides: Partial<EmittedAgentRunEvent> = {}): EmittedAgentRunEvent {
   return {
-    type: 'run_started',
-    id: `${overrides.runId ?? 'run-1'}-${overrides.type ?? 'run_started'}-${overrides.ts ?? 10}`,
+    type: 'turn_started',
+    id: `${overrides.runId ?? 'run-1'}-${overrides.type ?? 'turn_started'}-${overrides.ts ?? 10}`,
     runId: 'run-1',
     sessionId: 'session-1',
     turnId: 'turn-1',
@@ -15088,6 +16550,8 @@ async function seedRuntimeReadTurn(input: {
   userText: string;
   assistantText: string;
   legacyIdPrefix: string;
+  /** Says something else in the transcript store, so a reader proves its source. */
+  legacyUserText?: string;
 }): Promise<{ legacyMessages: StoredMessage[]; projectedMessages: StoredMessage[] }> {
   const header = makeRunHeader({
     sessionId: input.sessionId,
@@ -15139,7 +16603,7 @@ async function seedRuntimeReadTurn(input: {
       id: `${input.legacyIdPrefix}-user`,
       turnId: input.turnId,
       ts: 101,
-      text: input.userText,
+      text: input.legacyUserText ?? input.userText,
     },
     {
       type: 'assistant',
@@ -15155,7 +16619,6 @@ async function seedRuntimeReadTurn(input: {
       turnId: input.turnId,
       ts: 103,
       status: 'completed',
-      partialOutputRetained: true,
     },
   ];
   const projectedMessages: StoredMessage[] = [
@@ -15180,7 +16643,6 @@ async function seedRuntimeReadTurn(input: {
       turnId: input.turnId,
       ts: 103,
       status: 'completed',
-      partialOutputRetained: true,
     },
   ];
   await input.store.appendMessages(input.sessionId, legacyMessages);
@@ -15197,7 +16659,7 @@ async function seedRuntimeReadTurnWithHeader(input: {
   userText: string;
   assistantText: string;
   legacyIdPrefix: string;
-  header: Partial<AgentRunHeader>;
+  header: Partial<TestRunHeader>;
   tsBase: number;
 }): Promise<void> {
   const header = makeRunHeader({
@@ -15276,39 +16738,59 @@ async function seedRuntimeReadTurnWithHeader(input: {
         : {}),
       ...(input.header.branchOfTurnId ? { branchOfTurnId: input.header.branchOfTurnId } : {}),
       ...(input.header.parentSessionId ? { parentSessionId: input.header.parentSessionId } : {}),
-      partialOutputRetained: true,
     },
   ]);
   await seedRuntimeRun(input.runStore, header, events);
 }
 
 async function seedRun(
-  runStore: AgentRunStore,
-  header: AgentRunHeader,
+  runStore: AgentRunStore & RuntimeEventStore,
+  header: TestRunHeader,
   events: EmittedAgentRunEvent[],
 ): Promise<void> {
-  await runStore.createRun(header);
+  await seedInvocationFromHeader(runStore, header);
   for (const event of events) {
     await runStore.appendEvent(header.sessionId, header.runId, event);
   }
 }
 
+/**
+ * Seed one invocation whose ledger the test writes itself.
+ *
+ * The opening always comes first, and it opens the invocation the test's own
+ * events name, so nothing the test writes lands outside the run it seeded. The
+ * terminal event comes from the header only when the test did not already state
+ * one, so a run never ends twice.
+ */
 async function seedRuntimeRun(
-  runStore: AgentRunStore & RuntimeEventStore,
-  header: AgentRunHeader,
+  runStore: RuntimeEventStore,
+  header: TestRunHeader,
   events: RuntimeEvent[],
 ): Promise<void> {
-  await runStore.createRun(header);
+  const seeded: TestRunHeader = {
+    ...header,
+    invocationId:
+      header.invocationId ??
+      events.find((event) => event.runId === header.runId)?.invocationId ??
+      header.runId,
+  };
+  await seedInvocationOpening(runStore, seeded);
   for (const event of events) {
-    await runStore.appendRuntimeEvent(header.sessionId, header.runId, event);
+    await runStore.appendRuntimeEvent(seeded.sessionId, seeded.runId, event);
+  }
+  if (!events.some((event) => event.status !== undefined)) {
+    await seedInvocationTerminal(runStore, seeded);
   }
 }
 
 function runtimeEvent(overrides: Partial<RuntimeEvent>): RuntimeEvent {
+  const runId = overrides.runId ?? 'run-1';
   return {
     id: 'rt-event',
-    invocationId: 'inv-1',
-    runId: 'run-1',
+    // One invocation per run unless a test says otherwise. A shared default
+    // would put two runs' events on one invocation, which is two endings.
+    invocationId: runId,
+    runId,
     sessionId: 'session-1',
     turnId: 'turn-1',
     ts: 100,
@@ -15321,7 +16803,7 @@ function runtimeEvent(overrides: Partial<RuntimeEvent>): RuntimeEvent {
 
 async function seedCanonicalPermissionRun(
   runStore: MemoryAgentRunStore,
-  header: AgentRunHeader,
+  header: TestRunHeader,
   includeLedgerRequest = true,
 ): Promise<void> {
   const events = [
@@ -15386,7 +16868,7 @@ async function seedCanonicalPermissionRun(
 }
 
 function canonicalPermissionRecord(
-  header: AgentRunHeader,
+  header: TestRunHeader,
   overrides: Partial<CanonicalPermissionOutcomeRecord> = {},
 ): CanonicalPermissionOutcomeRecord {
   return {
@@ -15427,6 +16909,8 @@ function testInteractionAuthority(): RuntimeInteractionAuthority {
       ...identity,
       acceptSandboxBoundaryRequest: async () => {},
       acceptUserQuestionRequest: async () => {},
+      acceptFormRequest: async () => {},
+      withdrawFormRequest: async () => {},
       close: async () => {},
       release: () => {},
     }),
@@ -15493,7 +16977,7 @@ async function seedBoundaryRestartSession(input: {
         sessionId: session.id,
         runId: 'run-1',
         turnId: 'turn-1',
-        type: 'run_started',
+        type: 'turn_started',
         ts: 11,
       }),
     ],
@@ -15514,16 +16998,9 @@ async function seedRunningTurn(
       turnId,
       ts: 10,
       status: 'running',
-      partialOutputRetained: false,
     },
   ]);
 }
-
-function nextId(): () => string {
-  let id = 0;
-  return () => `id-${++id}`;
-}
-
 function nextNow(start: number): () => number {
   let ts = start;
   return () => ++ts;
@@ -15557,7 +17034,7 @@ async function expectRejects(promise: Promise<unknown>, pattern: RegExp): Promis
   try {
     await promise;
   } catch (err) {
-    expect(err instanceof Error ? err.message : String(err)).toMatch(pattern);
+    assert.match(String(err instanceof Error ? err.message : String(err)), pattern);
     return;
   }
   throw new Error('Expected promise to reject');

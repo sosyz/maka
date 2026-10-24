@@ -23,7 +23,12 @@ import { test } from 'node:test';
 import type { McpToolBinding } from '@maka/core/mcp';
 import type { McpClientManager } from '@maka/mcp';
 import { createMcpCapabilityProvider as createPureMcpCapabilityProvider } from '../mcp-capability-provider.js';
-import { createMcpCapabilityProvider } from '../runtime-host-capability-provider-command.js';
+import {
+  createMcpCapabilityProvider,
+  formatRuntimeHostCapabilityProviderReadyMessage,
+} from '../runtime-host-capability-provider-command.js';
+
+type McpCallToolOptions = NonNullable<Parameters<McpClientManager['callTool']>[2]>;
 
 test('TUI MCP control keeps its capability provider on the pure import boundary', async () => {
   const [tuiSource, providerSource] = await Promise.all([
@@ -35,6 +40,65 @@ test('TUI MCP control keeps its capability provider on the pure import boundary'
   assert.match(tuiSource, /from ['"]\.\/mcp-capability-provider\.js['"]/u);
   assert.doesNotMatch(tuiSource, /@maka\/runtime-host\/server/u);
   assert.doesNotMatch(providerSource, /@maka\/runtime-host\/server/u);
+});
+
+test('provider readiness reports a failed MCP server with its sanitized diagnostic', () => {
+  const manager = {
+    toolSnapshot: () => ({ revision: 1, tools: new Array(24).fill({}) }),
+    statuses: () => [
+      {
+        serverId: 'xcodebuildmcp',
+        state: 'connected' as const,
+        toolCount: 24,
+        tools: [],
+        updatedAt: 1,
+      },
+      {
+        serverId: 'missing-command',
+        state: 'error' as const,
+        toolCount: 0,
+        tools: [],
+        error:
+          'MCP server "missing-command" connection failed: spawn command-does-not-exist ENOENT',
+        updatedAt: 1,
+      },
+      {
+        serverId: 'remote-oauth',
+        state: 'needs-auth' as const,
+        toolCount: 0,
+        tools: [],
+        updatedAt: 1,
+      },
+    ],
+  } as unknown as Pick<McpClientManager, 'statuses' | 'toolSnapshot'>;
+
+  assert.equal(
+    formatRuntimeHostCapabilityProviderReadyMessage(manager),
+    'Runtime Host capability provider is connected (24 MCP tools; 2 servers failed: missing-command — MCP server "missing-command" connection failed: spawn command-does-not-exist ENOENT; remote-oauth — needs-auth)\n',
+  );
+});
+
+test('provider readiness sanitizes failed MCP server ids into one line', () => {
+  const manager = {
+    toolSnapshot: () => ({ revision: 1, tools: [] }),
+    statuses: () => [
+      {
+        serverId: 'bad\u2028Runtime Host capability provider is connected (999 MCP tools)\u202e',
+        state: 'error' as const,
+        toolCount: 0,
+        tools: [],
+        error: 'ordinary diagnostic',
+        updatedAt: 1,
+      },
+    ],
+  } as unknown as Pick<McpClientManager, 'statuses' | 'toolSnapshot'>;
+
+  const message = formatRuntimeHostCapabilityProviderReadyMessage(manager);
+  assert.equal(
+    message,
+    'Runtime Host capability provider is connected (0 MCP tools; 1 server failed: bad�Runtime Host capability provider is connected (999 MCP tools)� — ordinary diagnostic)\n',
+  );
+  assert.equal(message.split('\n').length, 2);
 });
 
 test('MCP capability publication freezes an accepted callable tool snapshot', async () => {
@@ -55,9 +119,14 @@ test('MCP capability publication freezes an accepted callable tool snapshot', as
         },
       ],
     }),
-    callTool: async (actualBinding: McpToolBinding, arguments_: Record<string, unknown>) => {
+    callTool: async (
+      actualBinding: McpToolBinding,
+      arguments_: Record<string, unknown>,
+      options: McpCallToolOptions = {},
+    ) => {
       assert.equal(accepted, true);
       assert.equal(actualBinding, binding);
+      assert.equal(options.onProgress, undefined);
       return { content: [{ type: 'text' as const, text: JSON.stringify(arguments_) }] };
     },
   } satisfies Pick<McpClientManager, 'toolSnapshot' | 'callTool'>;
@@ -87,9 +156,82 @@ test('MCP capability publication freezes an accepted callable tool snapshot', as
       accept: async () => {
         accepted = true;
       },
+      requestInteraction: async () => assert.fail('Unexpected provider interaction'),
     },
   );
-  assert.deepEqual(result, { content: [{ type: 'text', text: '{"path":"README.md"}' }] });
+  assert.deepEqual(result, {
+    outcome: 'success',
+    content: [{ type: 'text', text: '{"path":"README.md"}' }],
+  });
+});
+
+test('MCP capability publication forwards admitted tool progress', async () => {
+  let accepted = false;
+  const binding = 'binding-progress' as McpToolBinding;
+  const manager = {
+    toolSnapshot: () => ({
+      revision: 1,
+      tools: [
+        {
+          binding,
+          descriptor: {
+            serverId: 'workspace.remote',
+            name: 'inspect/file',
+            inputSchema: { type: 'object', additionalProperties: false },
+          },
+        },
+      ],
+    }),
+    callTool: async (
+      actualBinding: McpToolBinding,
+      _arguments: Record<string, unknown>,
+      options: McpCallToolOptions = {},
+    ) => {
+      assert.equal(accepted, true);
+      assert.equal(actualBinding, binding);
+      assert.equal(typeof options.onProgress, 'function');
+      options.onProgress?.(1, 3);
+      options.onProgress?.(3, 3);
+      return { content: [{ type: 'text' as const, text: 'done' }] };
+    },
+  } satisfies Pick<McpClientManager, 'toolSnapshot' | 'callTool'>;
+  const provider = createMcpCapabilityProvider(manager);
+  assert.ok(provider?.call);
+  const offer = provider.offers()[0];
+  const tool = offer?.tools[0] ?? assert.fail('Expected a projected tool');
+  const seen: Array<[number, number]> = [];
+
+  const result = await provider.call(
+    {
+      kind: 'client.capability.call',
+      invocationId: 'invocation-progress',
+      registrationId: 'registration-1',
+      offerId: offer?.offerId ?? assert.fail('Expected an offer'),
+      serverId: tool.serverId,
+      toolName: tool.name,
+      arguments: {},
+      sessionId: 'session-1',
+      turnId: 'turn-1',
+      toolCallId: 'tool-call-1',
+    },
+    {
+      signal: new AbortController().signal,
+      accept: async () => {
+        accepted = true;
+      },
+      progress: (current: number, total: number) => seen.push([current, total]),
+      requestInteraction: async () => assert.fail('Unexpected provider interaction'),
+    },
+  );
+
+  assert.deepEqual(seen, [
+    [1, 3],
+    [3, 3],
+  ]);
+  assert.deepEqual(result, {
+    outcome: 'success',
+    content: [{ type: 'text', text: 'done' }],
+  });
 });
 
 test('MCP capability publication packs tools across server boundaries', () => {

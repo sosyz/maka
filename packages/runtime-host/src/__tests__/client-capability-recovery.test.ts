@@ -25,8 +25,28 @@ import {
   type ToolRecoveryMode,
 } from '@maka/core/runtime-event';
 import { canonicalToolArgsHash } from '@maka/core/tool-args-identity';
+import type { ExecutionRuntimeEventWriter } from '@maka/storage/execution-stores';
 import { createSqliteRuntimeStore } from '@maka/storage/sqlite-runtime-store';
 import { recoverClientCapabilityOutcomes } from '../server/client-capability-recovery.js';
+
+test('discovers unsettled Client Capabilities for all recovery Sessions in one read', async () => {
+  let calls = 0;
+  let observedSessionIds: readonly string[] | undefined;
+  const store = {
+    listUnsettledToolOperations: async (sessionIds: string | readonly string[]) => {
+      calls += 1;
+      observedSessionIds = typeof sessionIds === 'string' ? [sessionIds] : sessionIds;
+      return [];
+    },
+  } as unknown as ExecutionRuntimeEventWriter;
+
+  assert.equal(
+    await recoverClientCapabilityOutcomes(store, ['session-1', 'session-2'], () => 50),
+    0,
+  );
+  assert.equal(calls, 1);
+  assert.deepEqual(observedSessionIds, ['session-1', 'session-2']);
+});
 
 test('successor recovery durably settles dispatched Client Capabilities as outcome_unknown', async () => {
   const store = createSqliteRuntimeStore(':memory:');
@@ -35,6 +55,17 @@ test('successor recovery durably settles dispatched Client Capabilities as outco
     await prepare(store, 'ordinary-operation', 'never_auto_retry');
     await prepare(store, 'other-session-operation', 'outcome_unknown', 'session-2');
 
+    assert.deepEqual(
+      (await store.listUnsettledToolOperations(['session-1', 'session-2'])).map(
+        ({ sessionId, operationId }) => [sessionId, operationId],
+      ),
+      [
+        ['session-1', 'capability-operation'],
+        ['session-1', 'ordinary-operation'],
+        ['session-2', 'other-session-operation'],
+      ],
+    );
+    assert.deepEqual(await store.listUnsettledToolOperations([]), []);
     assert.equal(await recoverClientCapabilityOutcomes(store, ['session-1'], () => 50), 1);
     const recovered = await store.readRuntimeEvents('session-1', 'capability-operation-run');
     assert.deepEqual(recovered.at(-1), {
@@ -60,6 +91,12 @@ test('successor recovery durably settles dispatched Client Capabilities as outco
           },
         },
         isError: true,
+        modelProjection: {
+          version: 1,
+          kind: 'text',
+          text: 'Error: outcome_unknown: the Host restarted after dispatching this Client Capability call. The client-side effect may have happened; do not retry it automatically.',
+          isError: true,
+        },
       },
       refs: {
         operationId: 'capability-operation',
@@ -132,6 +169,7 @@ async function prepare(
         toolName: 'client_tool',
         canonicalArgsHash,
         recoveryMode,
+        resultProjectionVersion: 1,
       },
     },
     refs: { operationId, toolCallId: providerToolCallId },

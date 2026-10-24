@@ -6,9 +6,13 @@
   "type": "module",
   "private": true,
   "exports": {
+    "./antigravity-program": "./dist/antigravity-program.js",
     "./adapter": "./dist/adapter/index.js",
     "./protocol": "./dist/protocol/index.js",
     "./client": "./dist/client/index.js",
+    "./client-capability-entity-id": "./dist/client-capability-entity-id.js",
+    "./webrtc-stun-policy": "./dist/webrtc-stun-policy.js",
+    "./peer-reachability": "./dist/peer-reachability/index.js",
     "./peer-mesh": "./dist/peer-mesh/index.js",
     "./operator": "./dist/operator/index.js",
     "./operator/update-package-evidence": "./dist/operator/update-package-evidence.js",
@@ -21,20 +25,28 @@
   "scripts": {
     "clean": "node ../../scripts/clean-paths.mjs dist tsconfig.tsbuildinfo",
     "build": "tsc -p tsconfig.json",
-    "benchmark:transcript": "node scripts/transcript-data-plane-benchmark.mjs",
+    "benchmark:session-copy": "node scripts/session-copy-cost-benchmark.mjs",
+    "benchmark:startup-profile": "node scripts/startup-profile.mjs",
+    "benchmark:hydration-e2e": "node scripts/hydration-e2e-benchmark.mjs",
+    "benchmark:checkpoint": "node scripts/session-checkpoint-benchmark.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run clean && npm run build && npm run test:dist",
-    "test:dist": "node --test \"dist/**/*.test.js\""
+    "test:dist": "node --test \"dist/**/*.test.js\" && npm run test:assistant",
+    "test:assistant": "node scripts/test-assistant.mjs"
   },
   "dependencies": {
+    "@agentclientprotocol/sdk": "1.5.0",
+    "@maka/acp-executor-plugin": "0.1.0",
+    "@maka/antigravity-acp-plugin": "0.1.0",
     "@maka/core": "0.1.0",
     "@maka/runtime": "0.1.0",
     "@maka/storage": "0.1.0",
+    "systeminformation": "^5.33.13",
     "ws": "^8.21.3",
-    "zod": "^4.4.3"
+    "yaml": "^2.9.1",
+    "zod": "^4.6.5"
   },
   "devDependencies": {
     "@types/ws": "^8.18.1",
-    "electron": "^43.4.1"
+    "electron": "^43.5.0"
   }
 }
